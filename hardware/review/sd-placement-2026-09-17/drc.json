@@ -1,0 +1,146 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-09-17T22:58:08+0900",
+    "kicad_version": "9.0.1",
+    "schematic_parity": [],
+    "source": "pico_lta042b010f_carrier.kicad_pcb",
+    "unconnected_items": [],
+    "violations": [
+        {
+            "description": "フットプリント 'D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp' が、ライブラリ 'Diode_THT' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント D4",
+                    "pos": {
+                        "x": 8.5,
+                        "y": 18.25
+                    },
+                    "uuid": "435d7375-079b-45a2-bbcf-be883733e3e7"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp' が、ライブラリ 'Diode_THT' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント D7",
+                    "pos": {
+                        "x": 15.75,
+                        "y": 31.25
+                    },
+                    "uuid": "5e752699-b315-409a-935f-13cef09b5e7a"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'A295_CTRPB_1' が、ライブラリ 'Custom' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント J2",
+                    "pos": {
+                        "x": 3.4,
+                        "y": 28.0
+                    },
+                    "uuid": "6b186f88-1a4a-4490-86de-0551f9a0f9f0"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' が、ライブラリ 'Resistor_THT' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント R11",
+                    "pos": {
+                        "x": 3.25,
+                        "y": 14.75
+                    },
+                    "uuid": "790e2e28-4b9d-4862-a66b-ea6d843e1e82"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' が、ライブラリ 'Resistor_THT' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント R10",
+                    "pos": {
+                        "x": 21.0,
+                        "y": 36.0
+                    },
+                    "uuid": "a3765428-620a-4b30-9f3c-8485dcc652c6"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' が、ライブラリ 'Resistor_THT' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント R9",
+                    "pos": {
+                        "x": 21.25,
+                        "y": 32.5
+                    },
+                    "uuid": "c698efbf-92ea-44cd-a4b4-72df2414672b"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp' が、ライブラリ 'Diode_THT' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント D6",
+                    "pos": {
+                        "x": 8.75,
+                        "y": 41.25
+                    },
+                    "uuid": "d60ba90c-8051-4805-82b9-216597c9f81b"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'RaspberryPi_Pico_W_SMD_HandSolder' が、ライブラリ 'Module' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント U1",
+                    "pos": {
+                        "x": 74.69,
+                        "y": 25.73
+                    },
+                    "uuid": "ec786062-d885-4364-b70f-6fb20bc0e4fb"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "フットプリント 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' が、ライブラリ 'Resistor_THT' のコピーと一致しません。",
+            "items": [
+                {
+                    "description": "フットプリント R16",
+                    "pos": {
+                        "x": 20.5,
+                        "y": 2.0
+                    },
+                    "uuid": "f9fa263f-5d46-447d-a4d1-652990c33a59"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_mismatch"
+        }
+    ]
+}

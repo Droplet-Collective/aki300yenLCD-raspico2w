@@ -1,0 +1,20 @@
+#VRML V2.0 utf8
+# Simplified carrier-board body for Akizuki AE-MICRO-SD-DIP.
+# Dimensions: 25.40 mm x 19.56 mm x 1.60 mm.
+
+Transform {
+    translation 0 0 0.8
+    children [
+        Shape {
+            appearance Appearance {
+                material Material {
+                    diffuseColor 0.055 0.22 0.075
+                    ambientIntensity 0.35
+                    specularColor 0.08 0.08 0.08
+                    shininess 0.15
+                }
+            }
+            geometry Box { size 25.4 19.56 1.6 }
+        }
+    ]
+}
