@@ -14171,6 +14171,17 @@
 		(layer "Edge.Cuts")
 		(uuid "b6c63b8a-b66b-40d5-a873-8df9d831716a")
 	)
+	(gr_text "MADE BY fnc765 & GPT-5.6 Sol"
+		(at 37 18 0)
+		(layer "F.SilkS")
+		(uuid "065b1376-418b-4ff7-a745-34f3c002145a")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
 	(gr_text "13V"
 		(at 11.25 48.5 0)
 		(layer "F.SilkS")
@@ -14269,6 +14280,42 @@
 				(bold yes)
 			)
 			(justify left bottom)
+		)
+	)
+	(gr_text "REV A  2026-09-17"
+		(at 37.5 16 -0)
+		(layer "B.SilkS")
+		(uuid "b6834c44-b4fe-44c2-81ab-479c4f710b55")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+			(justify mirror)
+		)
+	)
+	(gr_text "PICO2W-LTA042B010F"
+		(at 37.5 14 -0)
+		(layer "B.SilkS")
+		(uuid "e197054f-fdb2-4fe3-ba5e-1b3bb948efa2")
+		(effects
+			(font
+				(size 1.2 1.2)
+				(thickness 0.18)
+			)
+			(justify mirror)
+		)
+	)
+	(gr_text "MADE BY fnc765 & GPT-5.6 Sol"
+		(at 38 18 -0)
+		(layer "B.SilkS")
+		(uuid "fe3752d6-50e9-4328-90d4-ab857db6d549")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+			(justify mirror)
 		)
 	)
 	(gr_text "NO COPPER ROUTING YET"
