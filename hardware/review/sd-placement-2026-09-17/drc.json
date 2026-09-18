@@ -1,12 +1,73 @@
 {
     "$schema": "https://schemas.kicad.org/drc.v1.json",
     "coordinate_units": "mm",
-    "date": "2026-09-18T00:10:28+0900",
+    "date": "2026-09-18T09:51:07+0900",
     "kicad_version": "9.0.1",
     "schematic_parity": [],
     "source": "pico_lta042b010f_carrier.kicad_pcb",
     "unconnected_items": [],
     "violations": [
+        {
+            "description": "アイテム禁止 (keepout area 'RF Copper Keep Out')",
+            "items": [
+                {
+                    "description": "フットプリント H3",
+                    "pos": {
+                        "x": 96.0,
+                        "y": 48.0
+                    },
+                    "uuid": "b30005e1-9fd3-4bab-8eab-1d3ba1e41d1f"
+                }
+            ],
+            "severity": "error",
+            "type": "items_not_allowed"
+        },
+        {
+            "description": "基板端でシルクスクリーンが切り取られている",
+            "items": [
+                {
+                    "description": "セグメント (Edge.Cuts 上)",
+                    "pos": {
+                        "x": 100.0,
+                        "y": 52.0
+                    },
+                    "uuid": "2c3bd11f-8513-441c-9f41-0873c972121a"
+                },
+                {
+                    "description": "セグメント of SD1 、f.silkscreen 上",
+                    "pos": {
+                        "x": 88.73,
+                        "y": 13.3
+                    },
+                    "uuid": "e42b1b33-3455-4909-819e-7e3328c7db4f"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_edge_clearance"
+        },
+        {
+            "description": "基板端でシルクスクリーンが切り取られている",
+            "items": [
+                {
+                    "description": "セグメント (Edge.Cuts 上)",
+                    "pos": {
+                        "x": 100.0,
+                        "y": 52.0
+                    },
+                    "uuid": "2c3bd11f-8513-441c-9f41-0873c972121a"
+                },
+                {
+                    "description": "セグメント of SD1 、f.silkscreen 上",
+                    "pos": {
+                        "x": 108.29,
+                        "y": 38.7
+                    },
+                    "uuid": "97da3cf9-c8e0-453c-bbe7-d2ed71d31468"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_edge_clearance"
+        },
         {
             "description": "フットプリント 'D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp' が、ライブラリ 'Diode_THT' のコピーと一致しません。",
             "items": [
