@@ -1,7 +1,7 @@
 {
     "$schema": "https://schemas.kicad.org/drc.v1.json",
     "coordinate_units": "mm",
-    "date": "2026-09-18T09:51:07+0900",
+    "date": "2026-09-18T10:28:24+0900",
     "kicad_version": "9.0.1",
     "schematic_parity": [],
     "source": "pico_lta042b010f_carrier.kicad_pcb",
@@ -202,6 +202,29 @@
             ],
             "severity": "warning",
             "type": "lib_footprint_mismatch"
+        },
+        {
+            "description": "シルクスクリーンのオーバーラップ",
+            "items": [
+                {
+                    "description": "円弧 of D8 、f.silkscreen 上",
+                    "pos": {
+                        "x": 21.77,
+                        "y": 6.5
+                    },
+                    "uuid": "15a71cca-3f51-4148-a9fa-2cdea1699c4b"
+                },
+                {
+                    "description": "基板上のテキスト '-13V' ( f.silkscreen 上)",
+                    "pos": {
+                        "x": 16.5,
+                        "y": 9.25
+                    },
+                    "uuid": "1f733c50-e026-4845-bdbd-09a6ac3d19d0"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
         }
     ]
 }
