@@ -1632,7 +1632,7 @@ def build_schematic() -> None:
         ("R11", "Device:R", "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical", (224.79, 93.98), 0, "10k 0.1%"),
         ("D5", "Device:LED", "LED_THT:LED_D3.0mm", (224.79, 106.68), 90, "GREEN LED 3mm"),
         ("C9", "Device:C_Polarized", "Capacitor_THT:CP_Radial_D5.0mm_P2.00mm", (242.57, 96.52), 0, "10uF 50V"),
-        ("D7", "Device:D_Schottky", "Diode_THT:D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp", (260.35, 104.14), 180, "1N5819"),
+        ("D7", "Device:D_Schottky", "Diode_THT:D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp", (260.35, 104.14), 0, "1N5819"),
         ("D6", "Device:D_Schottky", "Diode_THT:D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp", (247.65, 114.30), 90, "1N5819"),
         ("C11", "Device:C_Polarized", "Capacitor_THT:CP_Radial_D5.0mm_P2.00mm", (278.13, 114.30), 180, "10uF 50V"),
         ("D8", "Device:LED", "LED_THT:LED_D3.0mm", (299.72, 114.30), 270, "RED LED 3mm"),
@@ -2078,7 +2078,7 @@ def build_pcb(with_artwork: bool = True) -> None:
                 footprints[ref_match.group(1)] = block
     net_names = {match.group(2): match.group(1) for match in re.finditer(r'\(net\s+(\d+)\s+"([^"]*)"\)', source)}
     explicit = {
-        "D4": {"1": ("+13V8", "K"), "2": ("SW_NODE", "A")}, "D6": {"1": ("GND", "K"), "2": ("CPUMP_MID", "A")}, "D7": {"1": ("-13V8", "K"), "2": ("CPUMP_MID", "A")}, "D5": {"1": ("GND", "K"), "2": ("PWR_LED_P", "A")}, "D8": {"1": ("-13V8", "K"), "2": ("NEG_LED_N", "A")},
+        "D4": {"1": ("+13V8", "K"), "2": ("SW_NODE", "A")}, "D6": {"1": ("GND", "K"), "2": ("CPUMP_MID", "A")}, "D7": {"1": ("CPUMP_MID", "K"), "2": ("-13V8", "A")}, "D5": {"1": ("GND", "K"), "2": ("PWR_LED_P", "A")}, "D8": {"1": ("-13V8", "K"), "2": ("NEG_LED_N", "A")},
         "C9": {"1": ("SW_NODE", "+"), "2": ("CPUMP_MID", "-")},
         "J2": {"1": ("+5V", "VBUS"), "2": ("GND", "GND")},
     }
@@ -2111,7 +2111,7 @@ def build_pcb(with_artwork: bool = True) -> None:
         "R10": (KI_FOOTPRINTS / "Resistor_THT.pretty/R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical.kicad_mod", "Resistor_THT", "1k 0.1%", (64, -54), 90),
         "R11": (KI_FOOTPRINTS / "Resistor_THT.pretty/R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical.kicad_mod", "Resistor_THT", "10k 0.1%", (88, -89), 90),
         "R16": (KI_FOOTPRINTS / "Resistor_THT.pretty/R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical.kicad_mod", "Resistor_THT", "10k 0.1%", (78, -56), 90),
-        "L1": (KI_FOOTPRINTS / "Inductor_SMD.pretty/L_Taiyo-Yuden_NR-10050_9.8x10.0mm_HandSoldering.kicad_mod", "Inductor_SMD", "100uH", (89, 15), 0), "D4": (KI_FOOTPRINTS / "Diode_THT.pretty/D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp.kicad_mod", "Diode_THT", "1N5819", (106, 22), 180), "D6": (KI_FOOTPRINTS / "Diode_THT.pretty/D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp.kicad_mod", "Diode_THT", "1N5819", (102, 50), 90), "D7": (KI_FOOTPRINTS / "Diode_THT.pretty/D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp.kicad_mod", "Diode_THT", "1N5819", (115, 35), 180), "D5": (KI_FOOTPRINTS / "LED_THT.pretty/LED_D3.0mm.kicad_mod", "LED_THT", "GREEN LED 3mm", (116, 29), 90), "D8": (KI_FOOTPRINTS / "LED_THT.pretty/LED_D3.0mm.kicad_mod", "LED_THT", "RED LED 3mm", (106, 61), 90),
+        "L1": (KI_FOOTPRINTS / "Inductor_SMD.pretty/L_Taiyo-Yuden_NR-10050_9.8x10.0mm_HandSoldering.kicad_mod", "Inductor_SMD", "100uH", (89, 15), 0), "D4": (KI_FOOTPRINTS / "Diode_THT.pretty/D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp.kicad_mod", "Diode_THT", "1N5819", (106, 22), 180), "D6": (KI_FOOTPRINTS / "Diode_THT.pretty/D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp.kicad_mod", "Diode_THT", "1N5819", (102, 50), 90), "D7": (KI_FOOTPRINTS / "Diode_THT.pretty/D_DO-41_SOD81_P2.54mm_Vertical_KathodeUp.kicad_mod", "Diode_THT", "1N5819", (112.46, 35), 0), "D5": (KI_FOOTPRINTS / "LED_THT.pretty/LED_D3.0mm.kicad_mod", "LED_THT", "GREEN LED 3mm", (116, 29), 90), "D8": (KI_FOOTPRINTS / "LED_THT.pretty/LED_D3.0mm.kicad_mod", "LED_THT", "RED LED 3mm", (106, 61), 90),
         "C6": (KI_FOOTPRINTS / "Capacitor_THT.pretty/CP_Radial_D8.0mm_P3.50mm.kicad_mod", "Capacitor_THT", "220uF 35V", (78, 25), 0), "C8": (KI_FOOTPRINTS / "Capacitor_THT.pretty/CP_Radial_D5.0mm_P2.00mm.kicad_mod", "Capacitor_THT", "47uF 35V", (110, 23), 0), "C9": (KI_FOOTPRINTS / "Capacitor_THT.pretty/CP_Radial_D5.0mm_P2.00mm.kicad_mod", "Capacitor_THT", "10uF 50V", (101, 29), 0), "C11": (KI_FOOTPRINTS / "Capacitor_THT.pretty/CP_Radial_D5.0mm_P2.00mm.kicad_mod", "Capacitor_THT", "10uF 50V (+ to GND)", (115, 43), 0), "C7": (KI_FOOTPRINTS / "Capacitor_THT.pretty/C_Disc_D5.0mm_W2.5mm_P2.50mm.kicad_mod", "Capacitor_THT", "470pF 50V C0G", (82, 32), 0),
     }
     for index, ref in enumerate(["TP1", "TP2", "TP3", "TP4"]):
@@ -2751,7 +2751,7 @@ def build_pcb(with_artwork: bool = True) -> None:
             d8_anchor = (109.5, 55.938)
             fixed_via_path(net, (d8[2], d8[3]), d8_anchor, width)
             targets = [
-                next(item for item in endpoints if item[:2] == ("D7", "1")),
+                next(item for item in endpoints if item[:2] == ("D7", "2")),
                 d8_anchor,
             ]
             for target_item in targets:

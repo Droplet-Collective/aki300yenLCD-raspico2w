@@ -2829,7 +2829,7 @@
 		(instances (project "pico_lta042b010f_carrier" (path "/10000000-0000-4000-8000-000000000001" (reference "C9") (unit 1))))
 	)
 
-(symbol (lib_id "Device:D_Schottky") (at 199.39 43.18 180) (unit 1)
+(symbol (lib_id "Device:D_Schottky") (at 199.39 43.18 0) (unit 1)
 		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
 		(uuid "40000000-0000-4000-8000-000000000014")
 		(property "Reference" "D7" (at 199.39 38.1 0) (effects (font (size 1.27 1.27))))
