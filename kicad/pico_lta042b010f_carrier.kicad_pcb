@@ -1921,7 +1921,7 @@
 			(uuid "8fb48a4c-9ac7-469b-ad8b-ac05df39bf28")
 		)
 		(embedded_fonts no)
-		(model "C:\\Users\\choco\\Documents\\programming\\rust-ws\\raspberrypi+300yenLCD\\3dmodels\\AE-MICRO-SD-DIP_board.wrl"
+		(model "${KIPRJMOD}/3dmodels/AE-MICRO-SD-DIP_board.wrl"
 			(offset
 				(xyz 0 0 0)
 			)

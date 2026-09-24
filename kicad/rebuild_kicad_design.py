@@ -16,7 +16,7 @@ SRC_PRO = ROOT / "pico_lta042b010f_carrier.kicad_pro"
 OUT = Path(r"C:\Users\choco\AppData\Local\Temp\kicad-reviewed-candidate")
 KI_SYMBOLS = Path(r"C:\Program Files\KiCad\9.0\share\kicad\symbols")
 KI_FOOTPRINTS = Path(r"C:\Program Files\KiCad\9.0\share\kicad\footprints")
-PROJECT_FOOTPRINTS = ROOT / "hardware" / "footprints.pretty"
+PROJECT_FOOTPRINTS = ROOT / "footprints.pretty"
 
 # Keep electrical coordinates on the original 1.27 mm grid and translate
 # only the plotted sheet objects onto an A4 landscape page at the end.
@@ -2051,13 +2051,19 @@ def build_schematic() -> None:
         (ROOT / "fp-lib-table").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    out_footprints = OUT / "hardware" / "footprints.pretty"
+    out_footprints = OUT / "footprints.pretty"
     out_footprints.mkdir(parents=True, exist_ok=True)
     for footprint in PROJECT_FOOTPRINTS.glob("*.kicad_mod"):
         (out_footprints / footprint.name).write_text(
             footprint.read_text(encoding="utf-8"),
             encoding="utf-8",
         )
+    out_models = OUT / "3dmodels"
+    out_models.mkdir(parents=True, exist_ok=True)
+    for model in (ROOT / "3dmodels").glob("*"):
+        if model.is_file():
+            (out_models / model.name).write_bytes(model.read_bytes())
+
     (OUT / "pico_lta042b010f_carrier.kicad_pro").write_text(SRC_PRO.read_text(encoding="utf-8"), encoding="utf-8")
 
 
