@@ -1,8 +1,8 @@
 //! フレームバッファ管理
 //!
-//! 512×112 全フレーム方式: 各ライン = [107 BLACK | 400 active | 5 BLACK]
-//! 先頭16行 (V-blank) は常に BLACK。アクティブ描画は行16-111。
-//! DMA 転送時はフレーム全体 (112行) を一括転送可能。
+//! 509×113 全フレーム方式: 各ライン = [108 BLACK | 400 active | 1 BLACK]
+//! 先頭16行と末尾1行 (V-blank) は常に BLACK。アクティブ描画は行16-111。
+//! DMA 転送時はフレーム全体 (113行) を一括転送可能。
 
 #![allow(dead_code)]
 
@@ -13,19 +13,19 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
 /// ライン幅 (パディング込み)
-pub const LINE_WIDTH: usize = H_TOTAL as usize; // 512
+pub const LINE_WIDTH: usize = H_TOTAL as usize; // 509
 
 /// アクティブ高さ
 pub const ACTIVE_HEIGHT: usize = 96;
 
 /// フレーム全体のライン数 (V_TOTAL)
-pub const FRAME_LINES: usize = V_TOTAL as usize; // 112
+pub const FRAME_LINES: usize = V_TOTAL as usize; // 113
 
 /// アクティブ領域の Y オフセット (V-blank 行数: VSYNC 1行 + Vブランキング 15行)
 pub const ACTIVE_Y_OFFSET: usize = V_BACK_PORCH as usize; // 16
 
 /// フレームバッファサイズ (ワード数)
-pub const FB_SIZE: usize = LINE_WIDTH * FRAME_LINES; // 57,344
+pub const FB_SIZE: usize = LINE_WIDTH * FRAME_LINES; // 57,517
 
 /// 6ビット値のビット順を反転 (MSB↔LSB)
 ///
@@ -59,15 +59,16 @@ const MAX_Y: u32 = ACTIVE_HEIGHT as u32 - 1; // 95
 
 /// フレームバッファ
 ///
-/// 内部レイアウト: `[u32; 512 * 112]`
+/// 内部レイアウト: `[u32; 509 * 113]`
 /// 行 0-15: V-blank 領域 (常に BLACK)
-/// 行 16-111: アクティブ領域 (各ライン: `[107 BLACK] [400 active pixels] [5 BLACK]`)
+/// 行 16-111: アクティブ領域 (各ライン: `[108 BLACK] [400 active pixels] [1 BLACK]`)
+/// 行 112: V-blank 領域 (常に BLACK)
 ///
 /// 全領域は初期化時に BLACK で埋められ、
 /// `set_pixel()` / `clear()` はアクティブ領域 (行16-111) のみ操作する。
-/// `frame_data()` でフレーム全体 (112行) を DMA 転送用に取得可能。
+/// `frame_data()` でフレーム全体 (113行) を DMA 転送用に取得可能。
 ///
-/// メモリ使用量: 57,344 × 4 = 229,376 bytes (224 KB) / バッファ
+/// メモリ使用量: 57,517 × 4 = 230,068 bytes / バッファ
 pub struct FrameBuffer {
     pub data: [u32; FB_SIZE],
 }
@@ -109,7 +110,7 @@ impl FrameBuffer {
 
     /// DMA 転送用ライン参照を取得
     ///
-    /// ライン y (0..96) の 512 ワード全体を返す。
+    /// ライン y (0..96) の 509 ワード全体を返す。
     /// 内部的に ACTIVE_Y_OFFSET を加算してフレームバッファ内の正しい位置を参照する。
     #[inline]
     pub fn row_slice(&self, y: usize) -> &[u32] {
@@ -118,7 +119,7 @@ impl FrameBuffer {
         &self.data[start..start + LINE_WIDTH]
     }
 
-    /// DMA 転送用のフレーム全体データへの参照を返す（112行×512ワード）
+    /// DMA 転送用のフレーム全体データへの参照を返す（113行×509ワード）
     #[inline]
     pub fn frame_data(&self) -> &[u32] {
         &self.data[..]

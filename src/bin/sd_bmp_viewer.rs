@@ -20,7 +20,14 @@ use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection,
 };
+use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::Delay;
+use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
+use embassy_usb::msos::{
+    CompatibleIdFeatureDescriptor, PropertyData, RegistryPropertyFeatureDescriptor, windows_version,
+};
+use embassy_usb::types::{InterfaceNumber, StringIndex};
+use embassy_usb::{Builder as UsbBuilder, Config as UsbConfig, Handler, UsbDevice};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::pixelcolor::Rgb666;
@@ -28,23 +35,171 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::text::Text;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::spi::{ErrorType, Operation, SpiDevice};
-use embedded_sdmmc::{File, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{
+    Block, BlockCount, BlockDevice, BlockIdx, Error as FsError, File, Mode, SdCard, SdCardError,
+    TimeSource, Timestamp, VolumeIdx, VolumeManager,
+};
 use fixed::FixedU32;
 use fixed::types::extra::U8;
 use pico2w_300yen_lcd::lcd::framebuffer::*;
 use pico2w_300yen_lcd::lcd::timing::*;
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
+
+/*
+Adapted from rp-usb-reset 0.0.2 (https://github.com/sunipkm/rp-usb-reset).
+Copyright 2024 Sunip K. Mukherjee
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+// picotool が -f で検出する RP2 USB reset interface。SDK と同じ
+// vendor function (FF/00/01) と class request 01 を公開する。
+struct UsbResetHandler {
+    interface: InterfaceNumber,
+    description: StringIndex,
+}
+
+impl UsbResetHandler {
+    fn new(builder: &mut UsbBuilder<'static, UsbDriver<'static, USB>>) -> Self {
+        let mut function = builder.function(0xff, 0x00, 0x01);
+        let mut interface = function.interface();
+        let number = interface.interface_number();
+        let description = interface.string();
+        interface.alt_setting(0xff, 0x00, 0x01, Some(description));
+        Self {
+            interface: number,
+            description,
+        }
+    }
+}
+
+impl Handler for UsbResetHandler {
+    fn get_string(&mut self, index: StringIndex, _lang_id: u16) -> Option<&str> {
+        (index == self.description).then_some("rp2xxx-reset")
+    }
+
+    fn control_out(&mut self, request: Request, _data: &[u8]) -> Option<OutResponse> {
+        if request.request_type == RequestType::Class
+            && request.recipient == Recipient::Interface
+            && request.index == u8::from(self.interface) as u16
+            && request.request == 0x01
+        {
+            embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+            Some(OutResponse::Accepted)
+        } else {
+            None
+        }
+    }
+}
+
+fn usb_chip_serial() -> Option<&'static str> {
+    // Pico SDK の pico_get_unique_board_id_string と同じ RP2350 CHIP_INFO。
+    // ROM USB BOOTSEL の serial と一致させ、picotool --ser を維持する。
+    let mut info = [0u32; 9];
+    let words = unsafe { embassy_rp::rom_data::get_sys_info(info.as_mut_ptr(), info.len(), 1) };
+    if words != 4 || info[0] != 1 {
+        defmt::warn!("RP2350 CHIP_INFO unavailable: {}", words);
+        return None;
+    }
+    let chip_id = (u64::from(info[3]) << 32) | u64::from(info[2]);
+    static SERIAL: StaticCell<[u8; 16]> = StaticCell::new();
+    let serial = SERIAL.init([0; 16]);
+    for (index, digit) in serial.iter_mut().enumerate() {
+        let nibble = ((chip_id >> (60 - index * 4)) & 0xf) as u8;
+        *digit = b"0123456789ABCDEF"[nibble as usize];
+    }
+    core::str::from_utf8(serial).ok()
+}
+
+fn build_usb_device(
+    driver: UsbDriver<'static, USB>,
+) -> UsbDevice<'static, UsbDriver<'static, USB>> {
+    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static MSOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static CONTROL_BUFFER: StaticCell<[u8; 64]> = StaticCell::new();
+    static RESET_HANDLER: StaticCell<UsbResetHandler> = StaticCell::new();
+
+    let mut config = UsbConfig::new(0x2e8a, 0x0009);
+    // 単一の reset interface を WinUSB デバイスとしてバインドする。
+    config.device_class = 0xff;
+    config.device_sub_class = 0;
+    config.device_protocol = 1;
+    config.composite_with_iads = false;
+    config.device_release = 0x0020;
+    config.manufacturer = Some("Raspberry Pi");
+    config.product = Some("SD BMP Viewer");
+    config.serial_number = usb_chip_serial();
+    config.max_packet_size_0 = 64;
+    config.max_power = 100;
+
+    let mut builder = UsbBuilder::new(
+        driver,
+        config,
+        CONFIG_DESCRIPTOR.init([0; 256]),
+        BOS_DESCRIPTOR.init([0; 256]),
+        MSOS_DESCRIPTOR.init([0; 256]),
+        CONTROL_BUFFER.init([0; 64]),
+    );
+    builder.msos_descriptor(windows_version::WIN8_1, 0x20);
+    builder.msos_feature(CompatibleIdFeatureDescriptor::new("WINUSB", ""));
+    builder.msos_feature(RegistryPropertyFeatureDescriptor::new(
+        "DeviceInterfaceGUIDs",
+        PropertyData::RegMultiSz(&["{CDB3B5AD-293B-4663-AA36-1AAE46463776}"]),
+    ));
+    let reset_handler = RESET_HANDLER.init(UsbResetHandler::new(&mut builder));
+    builder.handler(reset_handler);
+    builder.build()
+}
+
+#[embassy_executor::task]
+async fn usb_task(mut device: UsbDevice<'static, UsbDriver<'static, USB>>) -> ! {
+    device.run().await
+}
 
 // ============================================================
 // SM1 フレームデータ (static 配置)
 // ============================================================
 
-/// SM1 の 1 フレーム分タイミングデータ (225 ワード)
-static SM1_FRAME_DATA: [u32; SM1_FRAME_SIZE] = sm1_frame_data();
+/// 実動例と同じ 1 NCLK の HSYNC パルスを使うビューア専用タイミング。
+/// VSYNC 行には残りカウントと通常ライン数、各通常行には残りカウントを送る。
+const VIEWER_SM1_FRAME_SIZE: usize = 2 + V_NORMAL_LINES as usize;
+
+const fn viewer_sm1_frame_data() -> [u32; VIEWER_SM1_FRAME_SIZE] {
+    let mut data = [0; VIEWER_SM1_FRAME_SIZE];
+    data[0] = H_TOTAL - 7; // VSYNC 行: set×2 + pull/mov×2 + loop(X+1)
+    data[1] = V_NORMAL_LINES - 1;
+    let mut line = 0;
+    while line < V_NORMAL_LINES as usize {
+        data[2 + line] = H_TOTAL - 6; // 通常行: set×2 + pull/mov + loop(X+1) + jmp
+        line += 1;
+    }
+    data
+}
+
+static SM1_FRAME_DATA: [u32; VIEWER_SM1_FRAME_SIZE] = viewer_sm1_frame_data();
 
 // CH2/CH3 が各フレーム終端で読み、CH0/CH1 の読み出し先を再設定する。
 static DMA_PIXEL_FRAME_ADDR: AtomicU32 = AtomicU32::new(0);
@@ -90,6 +245,26 @@ struct DisplayPeripherals {
 
 /// フレームバッファ (BSS 配置、ゼロ初期化)
 static mut FB_DATA: FrameBuffer = FrameBuffer::new();
+
+// 診断目盛りでは LCD 左端に x=98..99 の緑2画素、続いて x=100..103 の水色と
+// x=104..107 の青が見えた。実機の可視開始位置に合わせ、画像を10画素左へ置く。
+const VIEWER_VISIBLE_X: usize = 98;
+
+fn align_image_to_visible_area(frame: &mut FrameBuffer) {
+    let nominal_x = H_BLANK_BEFORE_ACTIVE as usize;
+    let width = H_ACTIVE as usize;
+    for y in 0..ACTIVE_HEIGHT {
+        let row_start = (ACTIVE_Y_OFFSET + y) * LINE_WIDTH;
+        let source = row_start + nominal_x;
+        let target = row_start + VIEWER_VISIBLE_X;
+        frame.data.copy_within(source..source + width, target);
+        // 画面外の残りは端の色で埋め、可視位置が数画素ずれても黒帯を出さない。
+        let first = frame.data[target];
+        let last = frame.data[target + width - 1];
+        frame.data[row_start..target].fill(first);
+        frame.data[target + width..row_start + LINE_WIDTH].fill(last);
+    }
+}
 
 // SD の SPI 配線は KiCad 基板の SD_DAT0/SD_CS/SD_CMD/SD_CLK と Pico 2W の
 // パッド 1/31/32/34 を参照。ハードウェア SPI のピン組み合わせではない。
@@ -217,7 +392,79 @@ impl TimeSource for FixedTime {
     }
 }
 
-type SdFile<'a> = File<'a, SdCard<BitBangSd, Delay>, FixedTime, 4, 4, 1>;
+// embedded-sdmmc は MBR のあるカードだけを受け付ける。先頭セクタが
+// FAT ブートセクタのカードでは、読み取り専用の仮想 MBR を 1 セクタ挿入する。
+struct ReadOnlyVolumeDevice {
+    card: SdCard<BitBangSd, Delay>,
+    card_blocks: u32,
+    superfloppy: bool,
+    fat32: bool,
+}
+
+impl BlockDevice for ReadOnlyVolumeDevice {
+    type Error = SdCardError;
+
+    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), Self::Error> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        if !self.superfloppy {
+            return self.card.read(blocks, start);
+        }
+        if start.0 == 0 {
+            let (mbr, rest) = blocks.split_first_mut().unwrap();
+            mbr.contents.fill(0);
+            mbr[450] = if self.fat32 { 0x0c } else { 0x0e };
+            mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
+            mbr[458..462].copy_from_slice(&self.card_blocks.to_le_bytes());
+            mbr[510] = 0x55;
+            mbr[511] = 0xaa;
+            if !rest.is_empty() {
+                self.card.read(rest, BlockIdx(0))?;
+            }
+            Ok(())
+        } else {
+            self.card.read(blocks, BlockIdx(start.0 - 1))
+        }
+    }
+
+    fn write(&self, _blocks: &[Block], _start: BlockIdx) -> Result<(), Self::Error> {
+        Err(SdCardError::WriteError)
+    }
+
+    fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
+        self.card_blocks
+            .checked_add(u32::from(self.superfloppy))
+            .map(BlockCount)
+            .ok_or(SdCardError::BadState)
+    }
+}
+
+fn is_fat_boot_sector(sector: &[u8; 512]) -> bool {
+    let bytes_per_sector = u16::from_le_bytes([sector[11], sector[12]]);
+    let reserved = u16::from_le_bytes([sector[14], sector[15]]);
+    let total16 = u16::from_le_bytes([sector[19], sector[20]]);
+    let total32 = u32::from_le_bytes([sector[32], sector[33], sector[34], sector[35]]);
+    sector[510..512] == [0x55, 0xaa]
+        && matches!(sector[0], 0xeb | 0xe9)
+        && bytes_per_sector == 512
+        && sector[13].is_power_of_two()
+        && reserved > 0
+        && sector[16] > 0
+        && (total16 != 0 || total32 != 0)
+}
+
+fn volume_error(error: FsError<SdCardError>) -> &'static str {
+    match error {
+        FsError::FormatError(message) => message,
+        FsError::DeviceError(SdCardError::TimeoutReadBuffer) => "SD SECTOR TIMEOUT",
+        FsError::DeviceError(SdCardError::CrcError(_, _)) => "SD SECTOR CRC ERROR",
+        FsError::DeviceError(_) => "SD SECTOR READ ERROR",
+        _ => "FAT VOLUME ERROR",
+    }
+}
+
+type SdFile<'a> = File<'a, ReadOnlyVolumeDevice, FixedTime, 4, 4, 1>;
 
 fn load_image(
     frame: &mut FrameBuffer,
@@ -227,13 +474,30 @@ fn load_image(
     clk: Peri<'static, PIN_28>,
 ) -> Result<(u32, u32), &'static str> {
     let sdcard = SdCard::new(BitBangSd::new(miso, cs, mosi, clk), Delay);
-    sdcard.num_bytes().map_err(|_| "SD INIT FAILED")?;
-    sdcard.spi(|bus| bus.slow = false);
+    let card_bytes = sdcard.num_bytes().map_err(|_| "SD INIT FAILED")?;
+    let card_blocks = u32::try_from(card_bytes / 512).map_err(|_| "SD CARD TOO LARGE")?;
+    let mut sector0 = [Block::new()];
+    sdcard
+        .read(&mut sector0, BlockIdx(0))
+        .map_err(|_| "SD SECTOR 0 ERROR")?;
+    let superfloppy = is_fat_boot_sector(&sector0[0].contents);
+    let fat32 = u16::from_le_bytes([sector0[0][22], sector0[0][23]]) == 0;
+    defmt::info!(
+        "SD card: {} blocks, direct FAT={}",
+        card_blocks,
+        superfloppy
+    );
 
-    let volume_mgr = VolumeManager::new(sdcard, FixedTime);
-    let volume = volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "FAT VOLUME ERROR")?;
+    // GPIO SPI はカードの読み取りが安定していることを実機で確認するまで
+    // 初期化時と同じ低速設定に保つ。
+    let device = ReadOnlyVolumeDevice {
+        card: sdcard,
+        card_blocks,
+        superfloppy,
+        fat32,
+    };
+    let volume_mgr = VolumeManager::new(device, FixedTime);
+    let volume = volume_mgr.open_volume(VolumeIdx(0)).map_err(volume_error)?;
     let root = volume.open_root_dir().map_err(|_| "ROOT DIR ERROR")?;
     let file = root
         .open_file_in_dir("IMAGE.BMP", Mode::ReadOnly)
@@ -361,13 +625,8 @@ async fn display_task(res: DisplayPeripherals, frame_addr: u32) {
     let prg_timing = pio_asm!(
         ".wrap_target",
         // VSYNC active line (1 line)
-        "    set pins, 0", // HSYNC=0, VSYNC=0
-        "    pull block",
-        "    mov x, osr",
-        "hsync_v0:",
-        "    jmp x-- hsync_v0",
-        //
-        "    set pins, 1", // HSYNC=1, VSYNC=0
+        "    set pins, 3", // HSYNC=1, VSYNC=1 (1 NCLK の水平パルス)
+        "    set pins, 2", // HSYNC=0, VSYNC=1 (垂直パルスは1行)
         "    pull block",
         "    mov x, osr",
         "rest_v0:",
@@ -379,13 +638,8 @@ async fn display_task(res: DisplayPeripherals, frame_addr: u32) {
         //
         // 通常ラインループ
         "normal_line:",
-        "    set pins, 2", // HSYNC=0, VSYNC=1
-        "    pull block",
-        "    mov x, osr",
-        "hsync_v1:",
-        "    jmp x-- hsync_v1",
-        //
-        "    set pins, 3", // HSYNC=1, VSYNC=1
+        "    set pins, 1", // HSYNC=1, VSYNC=0 (1 NCLK)
+        "    set pins, 0", // HSYNC=0, VSYNC=0 (待機レベル)
         "    pull block",
         "    mov x, osr",
         "rest_v1:",
@@ -567,7 +821,7 @@ async fn display_task(res: DisplayPeripherals, frame_addr: u32) {
         let ch1 = dma.ch(1);
         ch1.read_addr().write_value(SM1_FRAME_DATA.as_ptr() as u32);
         ch1.trans_count().write(|w| {
-            w.set_count(SM1_FRAME_SIZE as u32);
+            w.set_count(VIEWER_SM1_FRAME_SIZE as u32);
         });
 
         dma.multi_chan_trigger().write(|w| {
@@ -600,6 +854,7 @@ async fn main(spawner: Spawner) {
                 draw_error(frame, message);
             }
         }
+        align_image_to_visible_area(frame);
         frame.frame_data().as_ptr() as u32
     };
 
@@ -636,6 +891,9 @@ async fn main(spawner: Spawner) {
             frame_addr,
         ))
         .unwrap();
+
+    let usb = build_usb_device(UsbDriver::new(p.USB, Irqs));
+    spawner.spawn(usb_task(usb)).unwrap();
 
     core::future::pending::<()>().await;
 }
