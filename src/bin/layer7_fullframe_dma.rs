@@ -1,13 +1,9 @@
-//! Layer 7: 全フレーム一括DMA転送方式
+//! Layer 7: シングルバッファ全フレームDMA転送方式
 //!
 //! SM0（ピクセル+NCLK）とSM1（HSYNC/VSYNC）をそれぞれ別DMAチャネルで
-//! フレーム全体を一括転送し、行間のCPU介入を排除してジッターを解消する。
-//!
-//! # 合格基準
-//! - [ ] SM0/SM1 両DMAを MULTI_CHAN_TRIGGER で完全同時起動
-//! - [ ] 行間の CPU 介入がない (ジッタフリー)
-//! - [ ] テキスト・図形が正しく表示される
-//! - [ ] ティアリングがない
+//! フレーム全体を一括転送する。描画はDMA起動前に一度だけ行い、
+//! 以後は同じ読み取り専用バッファを60Hzで連続走査する。
+//! 動的描画を行うダブルバッファ版は layer7_double_buffer_dma に保存している。
 
 #![no_std]
 #![no_main]
@@ -22,9 +18,7 @@ use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection,
 };
 use embassy_rp::Peri;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
-use embassy_time::Instant;
+use embassy_time::Timer;
 use embedded_graphics::geometry::Size;
 use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -88,87 +82,11 @@ struct DisplayPeripherals {
 }
 
 // ============================================================
-// ダブルバッファ管理
+// シングルバッファ
 // ============================================================
 
-/// フレームバッファ A (BSS 配置、ゼロ初期化)
-static mut FB_A_DATA: FrameBuffer = FrameBuffer::new();
-
-/// フレームバッファ B (BSS 配置、ゼロ初期化)
-static mut FB_B_DATA: FrameBuffer = FrameBuffer::new();
-
-/// main → display_task: 描画完了した back バッファの所有権を送信
-static SWAP_CH: Channel<CriticalSectionRawMutex, &'static mut FrameBuffer, 1> = Channel::new();
-
-/// display_task → main: 使用済み front バッファの所有権を返却
-static RETURN_CH: Channel<CriticalSectionRawMutex, &'static mut FrameBuffer, 1> = Channel::new();
-
-// ============================================================
-// 計測統計 (lock-free)
-// ============================================================
-
-/// main 描画処理時間（CPUのみ）[ms] 最新値
-static DRAW_CPU_MS_LATEST: AtomicU32 = AtomicU32::new(0);
-
-/// main 描画処理時間（CPUのみ）[ms] 最大値
-static DRAW_CPU_MS_MAX: AtomicU32 = AtomicU32::new(0);
-
-/// main フレームループ全体時間（描画+待機）[ms] 最新値
-static FRAME_LOOP_MS_LATEST: AtomicU32 = AtomicU32::new(0);
-
-/// main フレームループ全体時間（描画+待機）[ms] 最大値
-static FRAME_LOOP_MS_MAX: AtomicU32 = AtomicU32::new(0);
-
-/// display_task フレーム境界処理時間 [us] 最新値
-static DISPLAY_BOUNDARY_SECTION_US_LATEST: AtomicU32 = AtomicU32::new(0);
-
-/// display_task フレーム境界処理時間 [us] 最大値
-static DISPLAY_BOUNDARY_SECTION_US_MAX: AtomicU32 = AtomicU32::new(0);
-/// PIO が空の TX FIFO を待って停止したフレーム数（起動時の停止は除外）
-static SM0_TX_STALL_FRAMES: AtomicU32 = AtomicU32::new(0);
-static SM1_TX_STALL_FRAMES: AtomicU32 = AtomicU32::new(0);
-
-const HUD_X: i32 = 230;
-const HUD_LINE1_Y: i32 = 12;
-const HUD_LINE2_Y: i32 = 24;
-const HUD_LINE3_Y: i32 = 36;
-const HUD_LINE4_Y: i32 = 48;
-const HUD_UPDATE_INTERVAL_FRAMES: u32 = 8;
-
-fn saturating_u64_to_u32(v: u64) -> u32 {
-    if v > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        v as u32
-    }
-}
-
-fn update_max_atomic(max: &AtomicU32, value: u32) {
-    let mut observed = max.load(Ordering::Relaxed);
-    while value > observed {
-        match max.compare_exchange_weak(observed, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(next_observed) => observed = next_observed,
-        }
-    }
-}
-
-fn write_u32_decimal<const N: usize>(mut value: u32, buf: &mut [u8; N]) -> &str {
-    let mut idx = N;
-    if value == 0 {
-        idx -= 1;
-        buf[idx] = b'0';
-    } else {
-        while value > 0 {
-            idx -= 1;
-            buf[idx] = b'0' + (value % 10) as u8;
-            value /= 10;
-        }
-    }
-
-    // Safety: buf[idx..] はASCII数字のみで構成される
-    unsafe { core::str::from_utf8_unchecked(&buf[idx..]) }
-}
+/// フレームバッファ (BSS 配置、ゼロ初期化)
+static mut FB_DATA: FrameBuffer = FrameBuffer::new();
 
 // ============================================================
 // display_task: 全フレーム一括 DMA 転送
@@ -177,7 +95,7 @@ fn write_u32_decimal<const N: usize>(mut value: u32, buf: &mut [u8; N]) -> &str 
 #[embassy_executor::task]
 async fn display_task(
     res: DisplayPeripherals,
-    mut front: &'static mut FrameBuffer,
+    frame: &'static FrameBuffer,
 ) {
     // DMA CH0/CH1 の所有権を保持（embassy による二重使用を防止）
     // PAC 直接操作で初回同時起動し、その後は DMA チェインで再起動するため
@@ -310,7 +228,7 @@ async fn display_task(
     // DMA 書き込み先アドレス (PIO0 TX FIFO) — ループ中不変
     let sm0_txf_addr = embassy_rp::pac::PIO0.txf(0).as_ptr() as u32;
     let sm1_txf_addr = embassy_rp::pac::PIO0.txf(1).as_ptr() as u32;
-    DMA_PIXEL_FRAME_ADDR.store(front.frame_data().as_ptr() as u32, Ordering::SeqCst);
+    DMA_PIXEL_FRAME_ADDR.store(frame.frame_data().as_ptr() as u32, Ordering::SeqCst);
     DMA_TIMING_FRAME_ADDR.store(SM1_FRAME_DATA.as_ptr() as u32, Ordering::SeqCst);
 
     // PAC で直接管理する4チャネルの完了フラグは display_task がポーリングする。
@@ -398,9 +316,9 @@ async fn display_task(
 
         let ch0 = dma.ch(0);
         ch0.read_addr()
-            .write_value(front.frame_data().as_ptr() as u32);
+            .write_value(frame.frame_data().as_ptr() as u32);
         ch0.trans_count().write(|w| {
-            w.set_count(front.frame_data().len() as u32);
+            w.set_count(frame.frame_data().len() as u32);
         });
 
         let ch1 = dma.ch(1);
@@ -415,70 +333,37 @@ async fn display_task(
         });
     });
 
+    // DMA連鎖が走査を続ける間、CPUは100msごとにTXSTALLだけを確認する。
+    // 起動直後の空FIFOによる停止を含む最初の標本は除外する。
     let mut first_stall_sample = true;
-    let mut staged_front: Option<&'static mut FrameBuffer> = None;
     loop {
-        // CH0 の完了フラグを待つ。CH2 は既に次フレームを起動している。
-        let dma = embassy_rp::pac::DMA;
-        loop {
-            if dma.intr(0).read() & 0b1 != 0 {
-                dma.intr(0).write_value(0b1);
-                break;
-            }
-            embassy_futures::yield_now().await;
-        }
-
-        let boundary_start = Instant::now();
-
-        // 前の境界で予約したバッファは、今回の CH2 再起動で使用開始済み。
-        if let Some(new_front) = staged_front.take() {
-            let old_front = core::mem::replace(&mut front, new_front);
-            RETURN_CH.send(old_front).await;
-        }
-
-        // 次のフレーム境界で CH2 が使うポインタを公開する。
-        if let Ok(new_front) = SWAP_CH.try_receive() {
-            DMA_PIXEL_FRAME_ADDR.store(new_front.frame_data().as_ptr() as u32, Ordering::SeqCst);
-            staged_front = Some(new_front);
-        }
-
-        // FDEBUG.TXSTALL は write-one-to-clear。初回は SM 起動時の空 FIFO による
-        // 停止を含むため集計せず、以後はフレームごとに停止の有無を数える。
+        Timer::after_millis(100).await;
         let fdebug = embassy_rp::pac::PIO0.fdebug();
         let stalled = fdebug.read().txstall() & 0b11;
         if stalled != 0 {
             fdebug.write(|w| w.set_txstall(stalled));
         }
-        if !first_stall_sample {
-            if stalled & 0b01 != 0 {
-                SM0_TX_STALL_FRAMES.fetch_add(1, Ordering::Relaxed);
-            }
-            if stalled & 0b10 != 0 {
-                SM1_TX_STALL_FRAMES.fetch_add(1, Ordering::Relaxed);
-            }
+        if !first_stall_sample && stalled != 0 {
+            defmt::warn!("PIO TXSTALL: SM0={} SM1={}", stalled & 1, (stalled >> 1) & 1);
         }
         first_stall_sample = false;
-        let boundary_us = saturating_u64_to_u32(boundary_start.elapsed().as_micros());
-        DISPLAY_BOUNDARY_SECTION_US_LATEST.store(boundary_us, Ordering::Relaxed);
-        update_max_atomic(&DISPLAY_BOUNDARY_SECTION_US_MAX, boundary_us);
     }
 }
 
 // ============================================================
-// main: embedded-graphics 描画タスク
+// main: 起動時に1回だけ描画
 // ============================================================
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // フレームバッファ初期化 (BSS 領域から &'static mut を取得)
-    // Safety: 各バッファは初期化後、一方が display_task に、他方が main に
-    // 排他的に渡される。以降は Channel を通じて所有権が移動するため安全。
-    let fb_a: &'static mut FrameBuffer = unsafe { &mut *addr_of_mut!(FB_A_DATA) };
-    let fb_b: &'static mut FrameBuffer = unsafe { &mut *addr_of_mut!(FB_B_DATA) };
+    // Safety: display_task 起動前は main だけがこのバッファにアクセスする。
+    // 描画後に不変参照として渡し、以後CPUは書き換えない。
+    let frame: &'static mut FrameBuffer = unsafe { &mut *addr_of_mut!(FB_DATA) };
+    draw_test_pattern(frame);
+    let frame: &'static FrameBuffer = frame;
 
-    // display_task 起動 (fb_a を初期 front として渡す)
     spawner
         .spawn(display_task(
             DisplayPeripherals {
@@ -509,228 +394,97 @@ async fn main(spawner: Spawner) {
                 dma_ch2: p.DMA_CH2,
                 dma_ch3: p.DMA_CH3,
             },
-            fb_a,
+            frame,
         ))
         .unwrap();
 
-    // メインタスク: embedded-graphics で描画
-    let mut back: &'static mut FrameBuffer = fb_b;
-    let mut hud_div: u32 = 0;
+    core::future::pending::<()>().await;
+}
 
+fn draw_test_pattern(frame: &mut FrameBuffer) {
     let text_style = MonoTextStyle::new(&FONT_6X10, Rgb666::WHITE);
+    DrawTarget::clear(frame, Rgb666::BLACK).unwrap();
 
-    let mut draw_cpu_latest_buf = [0u8; 10];
-    let mut draw_cpu_max_buf = [0u8; 10];
-    let mut frame_loop_latest_buf = [0u8; 10];
-    let mut frame_loop_max_buf = [0u8; 10];
-    let mut sm0_stall_buf = [0u8; 10];
-    let mut sm1_stall_buf = [0u8; 10];
+    Text::new(
+        "Hello, 300yen LCD!",
+        embedded_graphics::geometry::Point::new(10, 12),
+        text_style,
+    )
+    .draw(frame)
+    .unwrap();
+    Text::new(
+        "Single-buffer DMA",
+        embedded_graphics::geometry::Point::new(10, 26),
+        text_style,
+    )
+    .draw(frame)
+    .unwrap();
 
-    let mut draw_cpu_latest_text: &str = "0";
-    let mut draw_cpu_max_text: &str = "0";
-    let mut frame_loop_latest_text: &str = "0";
-    let mut frame_loop_max_text: &str = "0";
-    let mut sm0_stall_text: &str = "0";
-    let mut sm1_stall_text: &str = "0";
-
-    loop {
-        let frame_loop_start = Instant::now();
-
-        if hud_div == 0 {
-            let draw_cpu_latest = DRAW_CPU_MS_LATEST.load(Ordering::Relaxed);
-            let draw_cpu_max = DRAW_CPU_MS_MAX.load(Ordering::Relaxed);
-            let frame_loop_latest = FRAME_LOOP_MS_LATEST.load(Ordering::Relaxed);
-            let frame_loop_max = FRAME_LOOP_MS_MAX.load(Ordering::Relaxed);
-
-            draw_cpu_latest_text = write_u32_decimal(draw_cpu_latest, &mut draw_cpu_latest_buf);
-            draw_cpu_max_text = write_u32_decimal(draw_cpu_max, &mut draw_cpu_max_buf);
-            frame_loop_latest_text = write_u32_decimal(frame_loop_latest, &mut frame_loop_latest_buf);
-            frame_loop_max_text = write_u32_decimal(frame_loop_max, &mut frame_loop_max_buf);
-            sm0_stall_text = write_u32_decimal(
-                SM0_TX_STALL_FRAMES.load(Ordering::Relaxed),
-                &mut sm0_stall_buf,
-            );
-            sm1_stall_text = write_u32_decimal(
-                SM1_TX_STALL_FRAMES.load(Ordering::Relaxed),
-                &mut sm1_stall_buf,
-            );
-        }
-
-        let draw_cpu_start = Instant::now();
-
-        DrawTarget::clear(back, Rgb666::BLACK).unwrap();
-
-        // テキスト描画
-        Text::new(
-            "Hello, 300yen LCD!",
-            embedded_graphics::geometry::Point::new(10, 12),
-            text_style,
-        )
-        .draw(back)
+    Rectangle::new(
+        embedded_graphics::geometry::Point::new(10, 35),
+        Size::new(60, 30),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Rgb666::RED))
+    .draw(frame)
+    .unwrap();
+    Circle::new(embedded_graphics::geometry::Point::new(90, 35), 30)
+        .into_styled(PrimitiveStyle::with_fill(Rgb666::GREEN))
+        .draw(frame)
         .unwrap();
+    Rectangle::new(
+        embedded_graphics::geometry::Point::new(140, 35),
+        Size::new(60, 30),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Rgb666::BLUE))
+    .draw(frame)
+    .unwrap();
+    Line::new(
+        embedded_graphics::geometry::Point::new(10, 75),
+        embedded_graphics::geometry::Point::new(390, 75),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(Rgb666::WHITE, 1))
+    .draw(frame)
+    .unwrap();
 
-        Text::new(
-            "Full-frame DMA",
-            embedded_graphics::geometry::Point::new(10, 26),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-
-        // 赤い矩形
+    let colors = [
+        Rgb666::WHITE,
+        Rgb666::new(63, 63, 0),
+        Rgb666::new(0, 63, 63),
+        Rgb666::GREEN,
+        Rgb666::new(63, 0, 63),
+        Rgb666::RED,
+        Rgb666::BLUE,
+        Rgb666::BLACK,
+    ];
+    for (i, &color) in colors.iter().enumerate() {
         Rectangle::new(
-            embedded_graphics::geometry::Point::new(10, 35),
-            Size::new(60, 30),
+            embedded_graphics::geometry::Point::new(i as i32 * 50, 80),
+            Size::new(50, 16),
         )
-        .into_styled(PrimitiveStyle::with_fill(Rgb666::RED))
-        .draw(back)
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(frame)
         .unwrap();
-
-        // 緑の円
-        Circle::new(embedded_graphics::geometry::Point::new(90, 35), 30)
-            .into_styled(PrimitiveStyle::with_fill(Rgb666::GREEN))
-            .draw(back)
-            .unwrap();
-
-        // 青い矩形
-        Rectangle::new(
-            embedded_graphics::geometry::Point::new(140, 35),
-            Size::new(60, 30),
-        )
-        .into_styled(PrimitiveStyle::with_fill(Rgb666::BLUE))
-        .draw(back)
-        .unwrap();
-
-        // 白い線
-        Line::new(
-            embedded_graphics::geometry::Point::new(10, 75),
-            embedded_graphics::geometry::Point::new(390, 75),
-        )
-        .into_styled(PrimitiveStyle::with_stroke(Rgb666::WHITE, 1))
-        .draw(back)
-        .unwrap();
-
-        // カラーバー
-        let colors = [
-            Rgb666::WHITE,
-            Rgb666::new(63, 63, 0),
-            Rgb666::new(0, 63, 63),
-            Rgb666::GREEN,
-            Rgb666::new(63, 0, 63),
-            Rgb666::RED,
-            Rgb666::BLUE,
-            Rgb666::BLACK,
-        ];
-        for (i, &color) in colors.iter().enumerate() {
-            let x = i as i32 * 50;
-            Rectangle::new(
-                embedded_graphics::geometry::Point::new(x, 80),
-                Size::new(50, 16),
-            )
-            .into_styled(PrimitiveStyle::with_fill(color))
-            .draw(back)
-            .unwrap();
-        }
-
-        // 計測 HUD (右上固定、表示内容は間引き更新)
-        Text::new(
-            "CPUms L:",
-            embedded_graphics::geometry::Point::new(HUD_X, HUD_LINE1_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            draw_cpu_latest_text,
-            embedded_graphics::geometry::Point::new(HUD_X + 45, HUD_LINE1_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            " M:",
-            embedded_graphics::geometry::Point::new(HUD_X + 75, HUD_LINE1_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            draw_cpu_max_text,
-            embedded_graphics::geometry::Point::new(HUD_X + 93, HUD_LINE1_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-
-        Text::new(
-            "FRMms L:",
-            embedded_graphics::geometry::Point::new(HUD_X, HUD_LINE2_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            frame_loop_latest_text,
-            embedded_graphics::geometry::Point::new(HUD_X + 45, HUD_LINE2_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            " M:",
-            embedded_graphics::geometry::Point::new(HUD_X + 75, HUD_LINE2_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            frame_loop_max_text,
-            embedded_graphics::geometry::Point::new(HUD_X + 93, HUD_LINE2_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-
-        Text::new(
-            "SM0 stalls:",
-            embedded_graphics::geometry::Point::new(HUD_X, HUD_LINE3_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            sm0_stall_text,
-            embedded_graphics::geometry::Point::new(HUD_X + 66, HUD_LINE3_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            "SM1 stalls:",
-            embedded_graphics::geometry::Point::new(HUD_X, HUD_LINE4_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-        Text::new(
-            sm1_stall_text,
-            embedded_graphics::geometry::Point::new(HUD_X + 66, HUD_LINE4_Y),
-            text_style,
-        )
-        .draw(back)
-        .unwrap();
-
-        let draw_cpu_ms = saturating_u64_to_u32(draw_cpu_start.elapsed().as_millis());
-        DRAW_CPU_MS_LATEST.store(draw_cpu_ms, Ordering::Relaxed);
-        update_max_atomic(&DRAW_CPU_MS_MAX, draw_cpu_ms);
-
-        SWAP_CH.send(back).await;
-        back = RETURN_CH.receive().await;
-
-        let frame_loop_ms = saturating_u64_to_u32(frame_loop_start.elapsed().as_millis());
-        FRAME_LOOP_MS_LATEST.store(frame_loop_ms, Ordering::Relaxed);
-        update_max_atomic(&FRAME_LOOP_MS_MAX, frame_loop_ms);
-
-        hud_div = (hud_div + 1) % HUD_UPDATE_INTERVAL_FRAMES;
     }
+
+    Text::new(
+        "Single buffer",
+        embedded_graphics::geometry::Point::new(230, 12),
+        text_style,
+    )
+    .draw(frame)
+    .unwrap();
+    Text::new(
+        "60Hz DMA scan",
+        embedded_graphics::geometry::Point::new(230, 26),
+        text_style,
+    )
+    .draw(frame)
+    .unwrap();
+    Text::new(
+        "Static image",
+        embedded_graphics::geometry::Point::new(230, 40),
+        text_style,
+    )
+    .draw(frame)
+    .unwrap();
 }
