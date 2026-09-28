@@ -35,6 +35,8 @@ static_cell = "2"
 
 # Graphics (Layer 6 で使用)
 embedded-graphics = "0.8"
+embedded-hal = "1.0"
+embedded-sdmmc = { version = "0.10", default-features = false }
 
 [profile.dev]
 debug = 2
@@ -84,3 +86,7 @@ path = "src/bin/layer7_double_buffer_dma.rs"
 [[bin]]
 name = "layer7_single_buffer_dma"
 path = "src/bin/layer7_single_buffer_dma.rs"
+
+[[bin]]
+name = "sd_bmp_viewer"
+path = "src/bin/sd_bmp_viewer.rs"

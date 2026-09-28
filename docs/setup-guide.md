@@ -105,6 +105,7 @@ cargo run --bin <ターゲット名> --release
 | `layer7_fullframe_dma` | 単一バッファの正本。60 Hz DMA 走査と黄色い四角の往復動作 |
 | `layer7_single_buffer_dma` | 正本の動作確認済みコピー（独立サンプル） |
 | `layer7_double_buffer_dma` | 動作確認済みダブルバッファ版。計測 HUD 付き |
+| `sd_bmp_viewer` | SD カードの `IMAGE.BMP` を単一バッファで表示（[準備手順](sd-bmp-viewer.md)） |
 
 実行例:
 
