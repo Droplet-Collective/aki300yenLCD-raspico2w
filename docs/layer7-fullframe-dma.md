@@ -1,252 +1,61 @@
-# Layer 7: 全フレーム DMA 転送方式
+# Layer 7: 60 Hz 全フレーム DMA 走査
 
-## 概要
+## 現行の実装
 
-Layer 7 は SM0（ピクセル+NCLK）と SM1（HSYNC/VSYNC）の両方を独立した DMA チャネルで
-一括転送する方式である。1フレームあたりの CPU 介入をゼロにし、
-Layer 6 で発生していた横ジッターを根本的に解消する。
+| ビルド対象 | 役割 |
+|---|---|
+| `layer7_fullframe_dma` | **単一バッファの正本**。固定図形と左右に動く黄色い四角を表示 |
+| `layer7_single_buffer_dma` | 上記の実機確認済みコードを別ファイルに保存したサンプル |
+| `layer7_double_buffer_dma` | 以前に実機確認したダブルバッファ版のサンプル。計測 HUD を含む |
 
-あわせて LCD 右上に計測 HUD を表示し、`CPUms`（描画 CPU 時間）と
-`FRMms`（フレームループ時間）を **最新値 (L)** と **最大値 (M)** で確認できる。
-シリアルログに依存せず、画面上で継続観測できる。
+正本は [`src/bin/layer7_fullframe_dma.rs`](../src/bin/layer7_fullframe_dma.rs)。
+保存サンプルはそれぞれ独立した Cargo バイナリであり、正本を後から編集しても自動では更新されない。
 
-## 背景: Layer 6 の問題
+## 走査の仕組み
 
-Layer 6 では SM0 のピクセルデータを **1行ずつ DMA 転送** していた:
-
-```text
-SM0: DMA(行0) → CPU介入 → DMA(行1) → CPU介入 → DMA(行2) → ...
-SM1: CPU wait_push で逐次供給
-```
-
-行間の CPU 介入（DMA 再設定、SM1 への wait_push）で SM0 TX FIFO がアンダーランし、
-PIO が `out pins` で停止 → NCLK が一時停止 → **横方向のジッター**が発生していた。
-
-SM0 FIFO バッファ（8エントリ ≈ 2.3μs）で吸収できる範囲を超えるギャップが
-散発的に生じることが原因である。
-
-## Layer 7 アーキテクチャ
+- LCD の表示領域は 400 × 96 ピクセル。1 枚のバッファは 512 × 112 個の `u32` で、先頭 16 行が垂直ブランキング、各行が `107 黒 + 400 表示 + 5 黒`。
+- 1 枚の容量は 57,344 ワード、229,376 バイト（224 KiB）。RGB666 のピン並びに合わせたワードを保持する。
+- [`TARGET_FPS`](../src/lcd/timing.rs) は 60 Hz、目標 NCLK は 3,440,640 Hz。
+- PIO0 SM0 が RGB と NCLK、SM1 が HSYNC と VSYNC を出力する。初回は `MULTI_CHAN_TRIGGER` でピクセル用 CH0 と同期用 CH1 を起動する。
+- 以後は `CH0 → CH2 → CH0`、`CH1 → CH3 → CH1` の DMA 連鎖が各フレームの転送元アドレスを再設定する。行ごとの CPU 供給はない。
 
 ```text
-┌─────────────────────────────────────────┐
-│  アプリケーション (embedded-graphics)    │
-│  └── FrameBuffer (512×96 active) に描画  │
-└──────────┬──────────────────────────────┘
-           │ VSYNC 境界で swap
-┌──────────▼──────────────────────────────┐
-│  拡張フレームバッファ (512×112)           │
-│  [16行 V-blank BLACK] + [96行 active]   │
-│                                         │
-│  DMA_CH0 ──→ PIO0 SM0 TX FIFO          │
-│  57,344 ワード一括転送 (CPU介入ゼロ)     │
-└─────────────────────────────────────────┘
+単一バッファ (512 × 112 × 4 バイト)
+       └─ CH0 ─→ PIO0 SM0 (RGB + NCLK)
+            ↑ CH2 が毎フレーム先頭アドレスを再設定
 
-┌─────────────────────────────────────────┐
-│  SM1 タイミングバッファ (225 ワード)      │
-│                                         │
-│  DMA_CH1 ──→ PIO0 SM1 TX FIFO          │
-│  225 ワード一括転送 (CPU介入ゼロ)        │
-└─────────────────────────────────────────┘
-
-embassy_futures::join::join(dma_ch0, dma_ch1)
-→ 両 DMA を並行実行、両方完了で次フレームへ
+SM1 用の固定タイミングデータ (225 ワード)
+       └─ CH1 ─→ PIO0 SM1 (HSYNC + VSYNC)
+            ↑ CH3 が毎フレーム先頭アドレスを再設定
 ```
 
-### DMA 二重化パターン
+## 単一バッファでの動き
 
-```rust
-// 擬似コード
-loop {
-  // CH0/CH1 の READ_ADDR + TRANS_COUNT を設定
-  // MULTI_CHAN_TRIGGER(0b11) で両 DMA を完全同時起動
-  start_both_dma();
+起動時に文字・図形・カラーバーを一度描く。黄色い 12 × 12 ピクセルの四角だけを、右側の `x=230..380, y=55` で 更新できたフレームにつき 2 ピクセルずつ往復させる。
 
-  // CH0 完了待ち（CH1 は先に完了する）
-  wait_until_ch0_not_busy().await;
+CH0 の完了フラグを1 ms 間隔を目安に確認する。CH0 が完了すると DMA 連鎖は既に次フレームを開始しているため、CH0 の `TRANS_COUNT`（現在の転送残数）から読み取り位置を推定する。矩形の行まで **16 ライン以上** 残っている場合だけ旧位置を消して新位置を描き、遅れたフレームは更新を見送る。対象ピクセルは volatile 書き込みとメモリバリアで更新する。[RP2350 の DMA 仕様](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf)には、`TRANS_COUNT` の読み取り値が現在の転送残数と記載されている。
 
-    // VSYNC 境界: バッファスワップ
-    if let Ok(new_front) = SWAP_CH.try_receive() {
-        RETURN_CH.send(front).await;
-        front = new_front;
-    }
-}
-```
+この方式で走査中に更新するのは小矩形だけ。任意の全画面描画をティアリングなしで行える汎用 API ではない。PIO の `FDEBUG.TXSTALL` は各フレームで読み、起動直後の標本を除き、停止を検出した場合は RTT に警告を出す。単一バッファ版に画面上の `CPUms` / `FRMms` HUD はない。
 
-## 計測 HUD（LCD 右上）
+## メモリとダブルバッファ版
 
-HUD は 2 行で以下の指標を表示する。
+| 対象 | フレームバッファ | release ELF の静的主 RAM | 512 KiB 主 RAM の残り |
+|---|---:|---:|---:|
+| 単一バッファ正本 | 224 KiB × 1 | 約 226 KiB | 約 286 KiB |
+| ダブルバッファサンプル | 224 KiB × 2 | 約 450 KiB | 約 62 KiB |
 
-| 表示 | 意味 | 単位 | 集計 |
-|------|------|------|------|
-| `CPUms L` | 描画処理の CPU 実行時間（`DrawTarget::clear`〜HUD 描画完了） | ms | 最新値 |
-| `CPUms M` | 上記 `CPUms` の最大値 | ms | 起動後最大 |
-| `FRMms L` | 1フレームループ全体（描画 + swap待機）の時間 | ms | 最新値 |
-| `FRMms M` | 上記 `FRMms` の最大値 | ms | 起動後最大 |
+残りの値は静的領域の末尾からスタック開始位置までのアドレス差で、全量を安全に追加割り当てできるという意味ではない。主 RAM と別にある 4 KiB × 2 の SRAM 領域は、この表に含めていない。
 
-HUD の文字列更新は 8 フレームごとに間引き、描画オーバーヘッドを抑える。
+ダブルバッファサンプルは描画用と走査用を所有権付きチャネルで交換する。走査は 60 Hz で連続するが、現在の交換手順では画面内容の更新は約 30 回/秒。従来の `CPUms`、`FRMms`、`SM0/SM1 stalls` の HUD はこのサンプルに残してある。
 
-## 観測方法
-
-以下を実行して Layer 7 を起動する。
+## ビルドと実機確認
 
 ```powershell
-cargo run --bin layer7_fullframe_dma --release
+cargo build --release --bin layer7_fullframe_dma
+cargo build --release --bin layer7_single_buffer_dma
+cargo build --release --bin layer7_double_buffer_dma
 ```
 
-起動後に LCD 右上の `CPUms L/M` と `FRMms L/M` が更新されることを確認する。
-これにより、defmt の定期ログを見なくても描画負荷とフレーム周期を観測できる。
+書き込み時は基板を BOOTSEL モードにし、`picotool info -d` で対象の RP2350 とシリアルを確認してから、対象 ELF を `picotool load -u -v -x ... -t elf --ser <serial>` で指定する。手順の詳細は [セットアップガイド](setup-guide.md)を参照。
 
-## 拡張フレームバッファ
-
-### レイアウト
-
-フレームバッファを 512×96 から **512×112** に拡張し、V-blank 期間の
-ブランキングデータもバッファ内に含める。DMA は先頭から末尾まで一括転送する。
-
-```text
-行 0-15  (16行): V-blank 期間 — 全ピクセル BLACK (0x00000000)
-行 16-111 (96行): アクティブ期間 — [107 BLACK | 400 active | 5 BLACK]
-
-合計: 512 × 112 = 57,344 ワード
-```
-
-### メモリレイアウト（1行あたり）
-
-V-blank 行:
-```text
-[0x00000000 × 512]
-```
-
-アクティブ行:
-```text
-[BLACK × 107] [pixel_0 ... pixel_399] [BLACK × 5]
- ← H_BACK_PORCH →  ← H_ACTIVE →   ← H_FRONT_PORCH →
-```
-
-### 定数定義
-
-```rust
-pub const LINE_WIDTH: usize = 512;       // H_TOTAL
-pub const TOTAL_HEIGHT: usize = 112;      // V_TOTAL (= V_BACK_PORCH + V_ACTIVE)
-pub const ACTIVE_HEIGHT: usize = 96;
-pub const V_BLANK_LINES: usize = 16;     // V_BACK_PORCH
-
-pub const EXT_FB_SIZE: usize = LINE_WIDTH * TOTAL_HEIGHT; // 57,344 ワード
-```
-
-### アプリケーション側の変更
-
-`set_pixel(x, y)` は引き続き (0,0) 基準で操作するが、
-内部オフセットに V-blank 行数を加算する:
-
-```rust
-let offset = (V_BLANK_LINES + y) * LINE_WIDTH + H_BLANK_BEFORE_ACTIVE + x;
-```
-
-## SM1 タイミングバッファ
-
-### 構成 (225 ワード)
-
-SM1 PIO プログラムは `pull block` でタイミングカウント値を逐次読み取る。
-Layer 6 では CPU が `wait_push` で供給していたが、Layer 7 では
-事前に構築した静的バッファを DMA で一括転送する。
-
-```text
-ワード 0:   SM1_HSYNC_COUNT    (= 1)    ─┐ VSYNC ライン
-ワード 1:   SM1_VSYNC_REST_COUNT (= 501) ─┘
-ワード 2:   SM1_NORMAL_LINES_Y (= 110)   ... 通常ライン数
-
-ワード 3:   SM1_HSYNC_COUNT    ─┐ 通常ライン #1  (blank)
-ワード 4:   SM1_REST_COUNT     ─┘
-ワード 5:   SM1_HSYNC_COUNT    ─┐ 通常ライン #2  (blank)
-ワード 6:   SM1_REST_COUNT     ─┘
-...
-ワード 223: SM1_HSYNC_COUNT    ─┐ 通常ライン #111 (active 最終行)
-ワード 224: SM1_REST_COUNT     ─┘
-
-合計: 3 + 2 × 111 = 225 ワード
-```
-
-### バッファ初期化
-
-```rust
-static SM1_TIMING_BUF: [u32; 225] = {
-    let mut buf = [0u32; 225];
-    // VSYNC ライン
-    buf[0] = SM1_HSYNC_COUNT;       // 1
-    buf[1] = SM1_VSYNC_REST_COUNT;  // 501
-    // 通常ラインカウント
-    buf[2] = SM1_NORMAL_LINES_Y;    // 110
-    // 通常ライン × 111
-    let mut i = 0;
-    while i < 111 {
-        buf[3 + i * 2]     = SM1_HSYNC_COUNT;  // 1
-        buf[3 + i * 2 + 1] = SM1_REST_COUNT;   // 502
-        i += 1;
-    }
-    buf
-};
-```
-
-## DMA チャネル割り当て
-
-| チャネル | 用途 | 転送元 | 転送先 | ワード数 |
-|---------|------|--------|--------|---------|
-| DMA_CH0 | SM0 ピクセル | 拡張フレームバッファ | PIO0 SM0 TX FIFO | 57,344 |
-| DMA_CH1 | SM1 タイミング | SM1 タイミングバッファ | PIO0 SM1 TX FIFO | 225 |
-
-## メモリ使用量
-
-```text
-拡張フレームバッファ:
-  512 × 112 × 4 bytes = 229,376 bytes (224 KB)
-
-ダブルバッファ (× 2):
-  224 KB × 2 = 448 KB
-
-SM1 タイミングバッファ:
-  225 × 4 bytes = 900 bytes (≈ 1 KB)
-
-合計: 449 KB / 520 KB SRAM
-使用率: 86%
-残り: 71 KB → アプリケーション + スタック用
-```
-
-### Layer 6 との比較
-
-| 項目 | Layer 6 | Layer 7 |
-|------|---------|---------|
-| FB サイズ | 512×96 = 192 KB | 512×112 = 224 KB |
-| ダブルバッファ合計 | 384 KB | 448 KB |
-| SM1 バッファ | なし (CPU 供給) | 1 KB |
-| SRAM 使用率 | 74% | 86% |
-| 残り SRAM | 136 KB | 71 KB |
-| DMA チャネル | 1 (CH0) | 2 (CH0 + CH1) |
-| CPU 介入 / フレーム | 112 回 (行単位 DMA) | 0 回 |
-| 横ジッター | あり | なし |
-
-## PIO プログラム
-
-PIO プログラム自体は Layer 6 と同一。変更はデータ供給方式のみ。
-
-- **SM0** (2命令): `out pins, 18 side 1` / `nop side 0` — autopull + DMA
-- **SM1** (19命令): HSYNC/VSYNC タイミング — `pull block` + DMA
-
-SM0 の autopull threshold=18 により、TX FIFO から自動的に
-32bit ワードを OSR にロードし、下位 18bit を GPIO に出力する。
-DMA が 57,344 ワードを連続供給するため、FIFO アンダーランは発生しない。
-
-## 同期
-
-SM0 の DMA 転送 (57,344 ワード) と SM1 の DMA 転送 (225 ワード) は
-DMA の `MULTI_CHAN_TRIGGER` に `0b11` を書き込み、完全同時に開始する。
-SM1 の方が先に完了するが、CH0 の `BUSY=false` を待つことで
-フレーム境界で両チャネル完了を保証できる。
-
-両 SM は `common.apply_sm_batch()` で同時に開始され、
-PIO クロック分周比で同期しているため、フレーム内の行単位同期は
-PIO プログラムのサイクル数で保証される:
-
-- SM0: 2 PIO サイクル / NCLK → 512 NCLK / 行 → 1024 サイクル / 行
-- SM1: 1 PIO サイクル / NCLK → 512 NCLK / 行 → 512 サイクル / 行
-- SM1 の clk_div = SM0 の 2倍 → 実時間で同一速度
+正本のアニメーション版は release ビルド、実機への書き込みと Flash 照合を完了し、ユーザーが画面表示と四角の往復動作を目視確認した。保存サンプルは同じソースのコピーで、別バイナリとしてのビルドを確認する。

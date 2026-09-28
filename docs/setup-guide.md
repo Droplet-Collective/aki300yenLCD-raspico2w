@@ -102,7 +102,9 @@ cargo run --bin <ターゲット名> --release
 | `layer4_dma_colorbar` | DMA カラーバー表示テスト |
 | `layer5_framebuffer` | フレームバッファ + ダブルバッファリング |
 | `layer6_drawtest` | embedded-graphics 描画テスト（テキスト・図形・カラーバー） |
-| `layer7_fullframe_dma` | 全フレーム DMA + LCD HUD 計測（`CPUms`/`FRMms` の L/M 表示） |
+| `layer7_fullframe_dma` | 単一バッファの正本。60 Hz DMA 走査と黄色い四角の往復動作 |
+| `layer7_single_buffer_dma` | 正本の動作確認済みコピー（独立サンプル） |
+| `layer7_double_buffer_dma` | 動作確認済みダブルバッファ版。計測 HUD 付き |
 
 実行例:
 
@@ -110,14 +112,17 @@ cargo run --bin <ターゲット名> --release
 cargo run --bin layer0_gpio_test --release
 ```
 
-Layer 7 の計測表示を確認する場合は次を実行してください。
+現在の正本を動かす場合は次を実行してください。
 
 ```powershell
 cargo run --bin layer7_fullframe_dma --release
 ```
 
-LCD 右上に `CPUms L/M` と `FRMms L/M` が表示され、シリアルログを見ずに
-描画CPU時間とフレームループ時間を観測できます。
+LCD 右側で黄色い四角が左右に往復します。正本は単一バッファのため、
+画面上に `CPUms` / `FRMms` の HUD はありません。保存サンプルの構成と
+DMA 連鎖の説明は [Layer 7 のドキュメント](layer7-fullframe-dma.md)を参照してください。
+
+従来の計測 HUD を確認する場合は `layer7_double_buffer_dma` を選びます。
 
 ## トラブルシューティング
 
