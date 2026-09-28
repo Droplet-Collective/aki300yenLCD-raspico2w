@@ -76,3 +76,7 @@ path = "src/bin/layer6_drawtest.rs"
 [[bin]]
 name = "layer7_fullframe_dma"
 path = "src/bin/layer7_fullframe_dma.rs"
+
+[[bin]]
+name = "layer7_double_buffer_dma"
+path = "src/bin/layer7_double_buffer_dma.rs"
