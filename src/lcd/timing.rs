@@ -32,7 +32,7 @@ pub const V_TOTAL: u32 = V_ACTIVE + V_BACK_PORCH + V_FRONT_PORCH; // 112
 pub const VSYNC_SAMPLE_OFFSET: u32 = 98;
 
 /// 目標フレームレート (Hz)
-pub const TARGET_FPS: u32 = 30;
+pub const TARGET_FPS: u32 = 60;
 
 /// 目標ピクセルクロック周波数 (Hz)
 /// H_TOTAL × V_TOTAL × FPS = 512 × 112 × 60 = 3,440,640 Hz

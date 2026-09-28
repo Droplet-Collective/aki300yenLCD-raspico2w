@@ -49,6 +49,10 @@ bind_interrupts!(struct Irqs {
 /// SM1 の 1 フレーム分タイミングデータ (225 ワード)
 static SM1_FRAME_DATA: [u32; SM1_FRAME_SIZE] = sm1_frame_data();
 
+// CH2/CH3 が各フレーム終端で読み、CH0/CH1 の読み出し先を再設定する。
+static DMA_PIXEL_FRAME_ADDR: AtomicU32 = AtomicU32::new(0);
+static DMA_TIMING_FRAME_ADDR: AtomicU32 = AtomicU32::new(0);
+
 // ============================================================
 // ペリフェラル構造体 (TaskFn 16引数制限の回避)
 // ============================================================
@@ -79,6 +83,8 @@ struct DisplayPeripherals {
     pin22: Peri<'static, PIN_22>,
     dma_ch0: Peri<'static, DMA_CH0>,
     dma_ch1: Peri<'static, DMA_CH1>,
+    dma_ch2: Peri<'static, DMA_CH2>,
+    dma_ch3: Peri<'static, DMA_CH3>,
 }
 
 // ============================================================
@@ -113,15 +119,20 @@ static FRAME_LOOP_MS_LATEST: AtomicU32 = AtomicU32::new(0);
 /// main フレームループ全体時間（描画+待機）[ms] 最大値
 static FRAME_LOOP_MS_MAX: AtomicU32 = AtomicU32::new(0);
 
-/// display_task フレーム境界区間（swap判定+DMA再起動）時間 [us] 最新値
+/// display_task フレーム境界処理時間 [us] 最新値
 static DISPLAY_BOUNDARY_SECTION_US_LATEST: AtomicU32 = AtomicU32::new(0);
 
-/// display_task フレーム境界区間（swap判定+DMA再起動）時間 [us] 最大値
+/// display_task フレーム境界処理時間 [us] 最大値
 static DISPLAY_BOUNDARY_SECTION_US_MAX: AtomicU32 = AtomicU32::new(0);
+/// PIO が空の TX FIFO を待って停止したフレーム数（起動時の停止は除外）
+static SM0_TX_STALL_FRAMES: AtomicU32 = AtomicU32::new(0);
+static SM1_TX_STALL_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 const HUD_X: i32 = 230;
 const HUD_LINE1_Y: i32 = 12;
 const HUD_LINE2_Y: i32 = 24;
+const HUD_LINE3_Y: i32 = 36;
+const HUD_LINE4_Y: i32 = 48;
 const HUD_UPDATE_INTERVAL_FRAMES: u32 = 8;
 
 fn saturating_u64_to_u32(v: u64) -> u32 {
@@ -169,10 +180,12 @@ async fn display_task(
     mut front: &'static mut FrameBuffer,
 ) {
     // DMA CH0/CH1 の所有権を保持（embassy による二重使用を防止）
-    // 両チャネルとも PAC 直接操作 + MULTI_CHAN_TRIGGER で同時起動するため
+    // PAC 直接操作で初回同時起動し、その後は DMA チェインで再起動するため
     // embassy API では使用しない
     let _dma_ch0 = res.dma_ch0;
     let _dma_ch1 = res.dma_ch1;
+    let _dma_ch2 = res.dma_ch2;
+    let _dma_ch3 = res.dma_ch3;
 
     // === SM0: ピクセル出力 + NCLK (sideset) ===
     // 2命令反転版: side 1 でデータセットアップ、side 0 の立ち下がりでLCDサンプル
@@ -297,6 +310,13 @@ async fn display_task(
     // DMA 書き込み先アドレス (PIO0 TX FIFO) — ループ中不変
     let sm0_txf_addr = embassy_rp::pac::PIO0.txf(0).as_ptr() as u32;
     let sm1_txf_addr = embassy_rp::pac::PIO0.txf(1).as_ptr() as u32;
+    DMA_PIXEL_FRAME_ADDR.store(front.frame_data().as_ptr() as u32, Ordering::SeqCst);
+    DMA_TIMING_FRAME_ADDR.store(SM1_FRAME_DATA.as_ptr() as u32, Ordering::SeqCst);
+
+    // PAC で直接管理する4チャネルの完了フラグは display_task がポーリングする。
+    let dma = embassy_rp::pac::DMA;
+    dma.inte(0).write_value(dma.inte(0).read() & !0b1111);
+    dma.intr(0).write_value(0b1111);
 
     // === 初回 DMA 設定: WRITE_ADDR と CTRL は固定のため一度だけ設定 ===
     {
@@ -313,7 +333,7 @@ async fn display_task(
             ctrl.set_incr_read(true);
             ctrl.set_incr_write(false);
             ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PIO0_TX0);
-            ctrl.set_chain_to(0); // 自CH = チェイン無効化
+            ctrl.set_chain_to(2); // CH0 完了後、CH2 が次フレームを起動
             ch0.al1_ctrl().write_value(ctrl.0);
         }
 
@@ -327,18 +347,51 @@ async fn display_task(
             ctrl.set_incr_read(true);
             ctrl.set_incr_write(false);
             ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PIO0_TX1);
-            ctrl.set_chain_to(1); // 自CH = チェイン無効化
+            ctrl.set_chain_to(3); // CH1 完了後、CH3 が次フレームを起動
             ch1.al1_ctrl().write_value(ctrl.0);
+        }
+
+        // CH2: ピクセルフレーム先頭アドレスを CH0 のトリガー別名へ1ワード転送。
+        // 転送数はハードウェアの RELOAD 値から毎回復元される。
+        let ch2 = dma.ch(2);
+        ch2.read_addr()
+            .write_value(DMA_PIXEL_FRAME_ADDR.as_ptr() as u32);
+        ch2.write_addr()
+            .write_value(ch0.al3_read_addr_trig().as_ptr() as u32);
+        ch2.trans_count().write(|w| w.set_count(1));
+        {
+            let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
+            ctrl.set_en(true);
+            ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+            ctrl.set_incr_read(false);
+            ctrl.set_incr_write(false);
+            ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PERMANENT);
+            ctrl.set_chain_to(2); // 自CHへのチェインは無効
+            ch2.al1_ctrl().write_value(ctrl.0);
+        }
+
+        // CH3: 同期フレーム先頭アドレスを CH1 のトリガー別名へ1ワード転送。
+        let ch3 = dma.ch(3);
+        ch3.read_addr()
+            .write_value(DMA_TIMING_FRAME_ADDR.as_ptr() as u32);
+        ch3.write_addr()
+            .write_value(ch1.al3_read_addr_trig().as_ptr() as u32);
+        ch3.trans_count().write(|w| w.set_count(1));
+        {
+            let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
+            ctrl.set_en(true);
+            ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+            ctrl.set_incr_read(false);
+            ctrl.set_incr_write(false);
+            ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PERMANENT);
+            ctrl.set_chain_to(3); // 自CHへのチェインは無効
+            ch3.al1_ctrl().write_value(ctrl.0);
         }
     }
 
-    // === フレームループ: 全フレーム一括 DMA 転送 ===
-    //
-    // 方式: MULTI_CHAN_TRIGGER による完全同時起動
-    //   - 初回含め毎フレーム READ_ADDR + TRANS_COUNT を再設定
-    //   - DMA設定〜TRIGGERをクリティカルセクションで保護し、
-    //     割り込みによるFIFOデータ途切れを防止
-    //   - FIFO drain待ちは行わない（次DMAが即座にデータ供給し途切れなし）
+    // === フレームループ: 初回のみ同時起動し、以後は DMA チェインで連続供給 ===
+    // CH0→CH2→CH0、CH1→CH3→CH1 とハードウェアで再起動する。
+    // CPU はフレーム境界の転送再設定に関与しない。
     // 初回フレーム起動（クリティカルセクション内）
     cortex_m::interrupt::free(|_| {
         let dma = embassy_rp::pac::DMA;
@@ -362,13 +415,14 @@ async fn display_task(
         });
     });
 
+    let mut first_stall_sample = true;
+    let mut staged_front: Option<&'static mut FrameBuffer> = None;
     loop {
-        // --- CH0 完了待ち (ポーリング + yield) ---
-        // CH0 (SM0, 57344ワード) は CH1 (SM1, 225ワード) より後に完了する。
-        // CH0 の BUSY=false を待てば両チャネルとも完了済み。
+        // CH0 の完了フラグを待つ。CH2 は既に次フレームを起動している。
         let dma = embassy_rp::pac::DMA;
         loop {
-            if !dma.ch(0).ctrl_trig().read().busy() {
+            if dma.intr(0).read() & 0b1 != 0 {
+                dma.intr(0).write_value(0b1);
                 break;
             }
             embassy_futures::yield_now().await;
@@ -376,40 +430,34 @@ async fn display_task(
 
         let boundary_start = Instant::now();
 
-        // VSYNC 境界: swap チェック
-        if let Ok(new_front) = SWAP_CH.try_receive() {
-            RETURN_CH.send(front).await;
-            front = new_front;
+        // 前の境界で予約したバッファは、今回の CH2 再起動で使用開始済み。
+        if let Some(new_front) = staged_front.take() {
+            let old_front = core::mem::replace(&mut front, new_front);
+            RETURN_CH.send(old_front).await;
         }
 
-        // クリティカルセクション: DMA再設定〜TRIGGERを割り込み無しで実行
-        // FIFO残データが消費される前に次DMAを開始し、データ途切れを防ぐ
-        // WRITE_ADDR, CTRL は固定のため再設定不要（初回のみ設定済み）
-        cortex_m::interrupt::free(|_| {
-            let dma = embassy_rp::pac::DMA;
+        // 次のフレーム境界で CH2 が使うポインタを公開する。
+        if let Ok(new_front) = SWAP_CH.try_receive() {
+            DMA_PIXEL_FRAME_ADDR.store(new_front.frame_data().as_ptr() as u32, Ordering::SeqCst);
+            staged_front = Some(new_front);
+        }
 
-            // CH0: READ_ADDR + TRANS_COUNT のみ再設定
-            let ch0 = dma.ch(0);
-            ch0.read_addr()
-                .write_value(front.frame_data().as_ptr() as u32);
-            ch0.trans_count().write(|w| {
-                w.set_count(front.frame_data().len() as u32);
-            });
-
-            // CH1: READ_ADDR + TRANS_COUNT のみ再設定
-            let ch1 = dma.ch(1);
-            ch1.read_addr()
-                .write_value(SM1_FRAME_DATA.as_ptr() as u32);
-            ch1.trans_count().write(|w| {
-                w.set_count(SM1_FRAME_SIZE as u32);
-            });
-
-            // 両チャネル同時起動
-            dma.multi_chan_trigger().write(|w| {
-                w.set_multi_chan_trigger(0b11);
-            });
-        });
-
+        // FDEBUG.TXSTALL は write-one-to-clear。初回は SM 起動時の空 FIFO による
+        // 停止を含むため集計せず、以後はフレームごとに停止の有無を数える。
+        let fdebug = embassy_rp::pac::PIO0.fdebug();
+        let stalled = fdebug.read().txstall() & 0b11;
+        if stalled != 0 {
+            fdebug.write(|w| w.set_txstall(stalled));
+        }
+        if !first_stall_sample {
+            if stalled & 0b01 != 0 {
+                SM0_TX_STALL_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
+            if stalled & 0b10 != 0 {
+                SM1_TX_STALL_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        first_stall_sample = false;
         let boundary_us = saturating_u64_to_u32(boundary_start.elapsed().as_micros());
         DISPLAY_BOUNDARY_SECTION_US_LATEST.store(boundary_us, Ordering::Relaxed);
         update_max_atomic(&DISPLAY_BOUNDARY_SECTION_US_MAX, boundary_us);
@@ -458,6 +506,8 @@ async fn main(spawner: Spawner) {
                 pin22: p.PIN_22,
                 dma_ch0: p.DMA_CH0,
                 dma_ch1: p.DMA_CH1,
+                dma_ch2: p.DMA_CH2,
+                dma_ch3: p.DMA_CH3,
             },
             fb_a,
         ))
@@ -473,11 +523,15 @@ async fn main(spawner: Spawner) {
     let mut draw_cpu_max_buf = [0u8; 10];
     let mut frame_loop_latest_buf = [0u8; 10];
     let mut frame_loop_max_buf = [0u8; 10];
+    let mut sm0_stall_buf = [0u8; 10];
+    let mut sm1_stall_buf = [0u8; 10];
 
     let mut draw_cpu_latest_text: &str = "0";
     let mut draw_cpu_max_text: &str = "0";
     let mut frame_loop_latest_text: &str = "0";
     let mut frame_loop_max_text: &str = "0";
+    let mut sm0_stall_text: &str = "0";
+    let mut sm1_stall_text: &str = "0";
 
     loop {
         let frame_loop_start = Instant::now();
@@ -492,6 +546,14 @@ async fn main(spawner: Spawner) {
             draw_cpu_max_text = write_u32_decimal(draw_cpu_max, &mut draw_cpu_max_buf);
             frame_loop_latest_text = write_u32_decimal(frame_loop_latest, &mut frame_loop_latest_buf);
             frame_loop_max_text = write_u32_decimal(frame_loop_max, &mut frame_loop_max_buf);
+            sm0_stall_text = write_u32_decimal(
+                SM0_TX_STALL_FRAMES.load(Ordering::Relaxed),
+                &mut sm0_stall_buf,
+            );
+            sm1_stall_text = write_u32_decimal(
+                SM1_TX_STALL_FRAMES.load(Ordering::Relaxed),
+                &mut sm1_stall_buf,
+            );
         }
 
         let draw_cpu_start = Instant::now();
@@ -624,6 +686,35 @@ async fn main(spawner: Spawner) {
         Text::new(
             frame_loop_max_text,
             embedded_graphics::geometry::Point::new(HUD_X + 93, HUD_LINE2_Y),
+            text_style,
+        )
+        .draw(back)
+        .unwrap();
+
+        Text::new(
+            "SM0 stalls:",
+            embedded_graphics::geometry::Point::new(HUD_X, HUD_LINE3_Y),
+            text_style,
+        )
+        .draw(back)
+        .unwrap();
+        Text::new(
+            sm0_stall_text,
+            embedded_graphics::geometry::Point::new(HUD_X + 66, HUD_LINE3_Y),
+            text_style,
+        )
+        .draw(back)
+        .unwrap();
+        Text::new(
+            "SM1 stalls:",
+            embedded_graphics::geometry::Point::new(HUD_X, HUD_LINE4_Y),
+            text_style,
+        )
+        .draw(back)
+        .unwrap();
+        Text::new(
+            sm1_stall_text,
+            embedded_graphics::geometry::Point::new(HUD_X + 66, HUD_LINE4_Y),
             text_style,
         )
         .draw(back)
