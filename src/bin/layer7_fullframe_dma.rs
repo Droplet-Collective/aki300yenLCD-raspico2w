@@ -1,8 +1,8 @@
 //! Layer 7: シングルバッファ全フレームDMA転送方式
 //!
 //! SM0（ピクセル+NCLK）とSM1（HSYNC/VSYNC）をそれぞれ別DMAチャネルで
-//! フレーム全体を一括転送する。描画はDMA起動前に一度だけ行い、
-//! 以後は同じ読み取り専用バッファを60Hzで連続走査する。
+//! フレーム全体を一括転送する。固定図形はDMA起動前に描き、
+//! 動く小矩形だけをDMAがその行を読む前に更新する。
 //! 動的描画を行うダブルバッファ版は layer7_double_buffer_dma に保存している。
 
 #![no_std]
@@ -88,15 +88,32 @@ struct DisplayPeripherals {
 /// フレームバッファ (BSS 配置、ゼロ初期化)
 static mut FB_DATA: FrameBuffer = FrameBuffer::new();
 
+const MOTION_X_MIN: usize = 230;
+const MOTION_X_MAX: usize = 380;
+const MOTION_Y: usize = 55;
+const MOTION_SIZE: usize = 12;
+const MOTION_STEP: usize = 2;
+// このラインまでに更新を開始すれば、矩形の行まで16ライン以上残る。
+const MOTION_UPDATE_DEADLINE_LINE: usize = ACTIVE_Y_OFFSET + MOTION_Y - 16;
+
+fn fill_motion_rect(frame_addr: u32, x: usize, color: u32) {
+    let pixels = frame_addr as *mut u32;
+    for y in MOTION_Y..MOTION_Y + MOTION_SIZE {
+        let row = (ACTIVE_Y_OFFSET + y) * LINE_WIDTH + H_BLANK_BEFORE_ACTIVE as usize + x;
+        for dx in 0..MOTION_SIZE {
+            // Safety: frame_addr は FB_DATA の先頭。矩形は400x96の表示範囲内にある。
+            // DMAの読み取り位置を確認してから、この領域だけをvolatileで更新する。
+            unsafe { pixels.add(row + dx).write_volatile(color) };
+        }
+    }
+}
+
 // ============================================================
 // display_task: 全フレーム一括 DMA 転送
 // ============================================================
 
 #[embassy_executor::task]
-async fn display_task(
-    res: DisplayPeripherals,
-    frame: &'static FrameBuffer,
-) {
+async fn display_task(res: DisplayPeripherals, frame_addr: u32) {
     // DMA CH0/CH1 の所有権を保持（embassy による二重使用を防止）
     // PAC 直接操作で初回同時起動し、その後は DMA チェインで再起動するため
     // embassy API では使用しない
@@ -228,7 +245,7 @@ async fn display_task(
     // DMA 書き込み先アドレス (PIO0 TX FIFO) — ループ中不変
     let sm0_txf_addr = embassy_rp::pac::PIO0.txf(0).as_ptr() as u32;
     let sm1_txf_addr = embassy_rp::pac::PIO0.txf(1).as_ptr() as u32;
-    DMA_PIXEL_FRAME_ADDR.store(frame.frame_data().as_ptr() as u32, Ordering::SeqCst);
+    DMA_PIXEL_FRAME_ADDR.store(frame_addr, Ordering::SeqCst);
     DMA_TIMING_FRAME_ADDR.store(SM1_FRAME_DATA.as_ptr() as u32, Ordering::SeqCst);
 
     // PAC で直接管理する4チャネルの完了フラグは display_task がポーリングする。
@@ -315,10 +332,9 @@ async fn display_task(
         let dma = embassy_rp::pac::DMA;
 
         let ch0 = dma.ch(0);
-        ch0.read_addr()
-            .write_value(frame.frame_data().as_ptr() as u32);
+        ch0.read_addr().write_value(frame_addr);
         ch0.trans_count().write(|w| {
-            w.set_count(frame.frame_data().len() as u32);
+            w.set_count(FB_SIZE as u32);
         });
 
         let ch1 = dma.ch(1);
@@ -333,11 +349,41 @@ async fn display_task(
         });
     });
 
-    // DMA連鎖が走査を続ける間、CPUは100msごとにTXSTALLだけを確認する。
-    // 起動直後の空FIFOによる停止を含む最初の標本は除外する。
+    // CH0完了後、CH2が次フレームを開始している。DMAが矩形の行へ到達する前に
+    // 旧位置を消し、新位置を描く。遅れたフレームでは更新を見送る。
+    let dma = embassy_rp::pac::DMA;
+    let mut x = MOTION_X_MIN;
+    let mut moving_right = true;
     let mut first_stall_sample = true;
     loop {
-        Timer::after_millis(100).await;
+        while dma.intr(0).read() & 0b1 == 0 {
+            Timer::after_millis(1).await;
+        }
+        dma.intr(0).write_value(0b1);
+
+        let remaining = dma.ch(0).trans_count().read().count() as usize;
+        let safe_remaining = FB_SIZE - MOTION_UPDATE_DEADLINE_LINE * LINE_WIDTH;
+        if remaining >= safe_remaining {
+            fill_motion_rect(frame_addr, x, BLACK);
+            let next_x = if moving_right {
+                if x >= MOTION_X_MAX {
+                    moving_right = false;
+                    x - MOTION_STEP
+                } else {
+                    x + MOTION_STEP
+                }
+            } else if x <= MOTION_X_MIN {
+                moving_right = true;
+                x + MOTION_STEP
+            } else {
+                x - MOTION_STEP
+            };
+            fill_motion_rect(frame_addr, next_x, rgb666(63, 63, 0));
+            cortex_m::asm::dmb();
+            x = next_x;
+        }
+
+        // FDEBUG.TXSTALL はwrite-one-to-clear。起動時の停止を含む初回は除外。
         let fdebug = embassy_rp::pac::PIO0.fdebug();
         let stalled = fdebug.read().txstall() & 0b11;
         if stalled != 0 {
@@ -358,11 +404,13 @@ async fn display_task(
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // Safety: display_task 起動前は main だけがこのバッファにアクセスする。
-    // 描画後に不変参照として渡し、以後CPUは書き換えない。
-    let frame: &'static mut FrameBuffer = unsafe { &mut *addr_of_mut!(FB_DATA) };
-    draw_test_pattern(frame);
-    let frame: &'static FrameBuffer = frame;
+    let frame_addr = {
+        // Safety: DMA起動前はmainだけがFB_DATAにアクセスする。
+        // このブロックの後は参照を保持せず、動く部分はraw pointerで更新する。
+        let frame = unsafe { &mut *addr_of_mut!(FB_DATA) };
+        draw_test_pattern(frame);
+        frame.frame_data().as_ptr() as u32
+    };
 
     spawner
         .spawn(display_task(
@@ -394,7 +442,7 @@ async fn main(spawner: Spawner) {
                 dma_ch2: p.DMA_CH2,
                 dma_ch3: p.DMA_CH3,
             },
-            frame,
+            frame_addr,
         ))
         .unwrap();
 
@@ -481,10 +529,18 @@ fn draw_test_pattern(frame: &mut FrameBuffer) {
     .draw(frame)
     .unwrap();
     Text::new(
-        "Static image",
+        "Moving block",
         embedded_graphics::geometry::Point::new(230, 40),
         text_style,
     )
+    .draw(frame)
+    .unwrap();
+
+    Rectangle::new(
+        embedded_graphics::geometry::Point::new(MOTION_X_MIN as i32, MOTION_Y as i32),
+        Size::new(MOTION_SIZE as u32, MOTION_SIZE as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Rgb666::new(63, 63, 0)))
     .draw(frame)
     .unwrap();
 }
