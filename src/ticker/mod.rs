@@ -13,5 +13,6 @@ pub mod civil;
 pub mod config;
 pub mod digits;
 pub mod sntp;
+pub mod slideshow;
 pub mod sntp_net;
 pub mod weather;

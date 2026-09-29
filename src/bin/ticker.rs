@@ -9,27 +9,29 @@
 //! - `main`: SD (`WIFI.TXT` / `TICKER.TXT`) → LCD 開始 → USB → CYW43 → 以後 250 ms 周期のループで
 //!   join / DHCP (`LinkManager`)、TBYB の自己診断と buy、OTA 確認、NTP、天気、流れる文字の取得を
 //!   **順番に** 行う (HTTPS の TLS バッファは 1 組しか無いので、同時に 2 本は張らない)。
-//! - `render_task`: LCD の垂直同期 (`Display::present`、≈60 Hz) ごとに画面全体をバックバッファへ描き直し、
-//!   流れる文字を `scroll` px ずつ左へ動かす。表示する内容は `MODEL` (共有モデル) から読む。
+//! - `render_task`: LCD の垂直同期 (`Display::present`、≈60 Hz) ごとに画面全体をバックバッファへ描き直し
+//!   (背景の写真のコピー → ガラス板 → 文字)、流れる文字を `scroll` px / フレームで左へ動かす。表示する内容は
+//!   `MODEL` (共有モデル) と `slideshow::BG` (背景) から読む。
 //!   フラッシュ書き込み中 (数百 ms、割り込み禁止) は描画が止まるが、走査は SRAM の DMA リングで続く。
+//! - `slideshow_task`: SD の BMP を読み、背景を切り替える (`ticker::slideshow`)。OTA の確認〜検証中は止まる。
 //!
-//! # 画面 (400×96、外周 1 px は枠)
+//! # 画面 (400×96、v0.4.0〜: SD の写真の上に重ね描き)
+//!
+//! 描画はハードウェアに依存しない `ui` モジュール (`src/ui/`) が行い、同じコードをホストの
+//! シミュレータ `tools/ui-sim` が PNG / GIF にする (docs/ui-sim.md)。既定の構成 `layout=glass`:
 //!
 //! ```text
-//!  y  2〜29  [21:53:44] (5×7 ドット ×4)   2026/09/29 (火)            ← 日付 + 曜日 (東雲 14 px)
-//!  y 18〜33                               東京 19.1℃ 晴れ時々くもり   ← 地名 / 現在気温 / 天気
-//!  y 34〜49  最高 21.9℃  最低 19.1℃  降水確率 100%                   ← 今日の予報 (東雲 14 px)
-//!  y 50     ───────────── 区切り (暗灰) ─────────────
-//!  y 51〜66  ← こんにちは、おちょこさん。ネットワーク・ティッカー 0.3.1 が …  (流れる文字、東雲 14 px)
-//!  y 67     ───────────── 区切り (暗灰) ─────────────
-//!  y 68     <SSID> 192.168.1.23 | NTP ok | WX ok | MSG ok            ← 起動 60 s は起動診断 / 設定の注意
-//!  y 77     ticker v0.3.1 via OTA slot B TBYB:bought OK               ← wifi_ota の行 1 と同じ
-//!  y 86     OTA: up to date (latest 0.3.1), next check in 45s        ← wifi_ota の行 2 と同じ
+//!  y  4〜35  21:53:44 (DejaVu Sans の AA 数字、影付き)      ┌ 天気のガラス板 (x 234〜396, y 4〜57) ┐
+//!  y 40〜53  9月29日(火) (東雲 14 px、影付き)               │ ☁ 19.1°             ⌖東京 │
+//!            (左上は背景に薄い暗がりを焼き込む)             │ 晴れ時々くもり              │
+//!                                                           │ ▲21.9 ▼18.6 (💧40%)        │
+//!  y 74〜92  ┌ 流れる文字 (東雲 14 px) ─────────────────┬ Wi-Fi NTP WX MSG v0.4.0 ┐  ← ガラスの帯
 //! ```
 //!
-//! 日本語 (東雲 14 px) は 16 px の帯の中に上下 1 px の余白 (`JP_PAD`) を置いて描く。流れる文字の帯の
-//! 区切り線 (y 50 / 67) と文字 (y 52〜65)、区切り線と状態行 1 (文字は y 69〜) の間はそれぞれ 1 px 空く。
-//! 状態行 3 本は `FONT_6X10` を 9 px ピッチ (大文字は行 1〜7、下に伸びる字は行 8〜9 で、次の行の行 0 は空)。
+//! 状態 3 行 (Wi-Fi / 版数・TBYB / OTA、`FONT_6X10`) は必要なときだけ下の帯の位置に出す
+//! (起動 60 s、失敗から 30 s、Wi-Fi が IP を得ていない、OTA のダウンロード〜再起動待ち / 失敗、TBYB の
+//! buy 待ち / 失敗。`status=full` で常に、`status=compact` で出さない)。それ以外は帯の右端の小さな表示だけ。
+//! 背景の写真は `ticker::slideshow` が SD から読み、切り替えは背景だけを暗くして行う。
 //!
 //! TBYB の自己診断 (buy 条件) は wifi_ota と同じ「LCD 走査中 + join + DHCP」だけ。NTP / 天気 / 文字の
 //! 取得の成否は buy に関係しない (それらは buy が済むまで始めない)。
@@ -41,6 +43,7 @@ use core::cell::RefCell;
 use core::fmt::Write as _;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::Ordering;
 
 use cyw43::PowerManagementMode;
 use embassy_executor::Spawner;
@@ -53,31 +56,26 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embassy_usb::UsbDevice;
-use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::mono_font::ascii::FONT_6X10;
-use embedded_graphics::pixelcolor::Rgb666;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-use embedded_graphics::text::{Baseline, Text};
 use heapless::String;
 use pico2w_300yen_lcd::boot_trace::{self, Stage};
 use pico2w_300yen_lcd::font::shinonome;
 use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, TBYB};
-use pico2w_300yen_lcd::lcd::display::{BACK_HEIGHT, BACK_WIDTH, BackBuffer, Display, DisplayPins, FrameIrqHandler};
-use pico2w_300yen_lcd::lcd::framebuffer::{BLACK, rgb666};
+use pico2w_300yen_lcd::lcd::display::{BackBuffer, Display, DisplayPins, FrameIrqHandler};
 use pico2w_300yen_lcd::ota::app::{
     self, BootStatus, LinkManager, LinkUi, Net, NetBuffers, OtaPhase, OtaState, OtaUi, TcpState, Tone,
 };
 use pico2w_300yen_lcd::ota::http::{self, BodySink};
 use pico2w_300yen_lcd::ota::slot::{OtaFlash, SectorBuffers, Slots, slot_label};
 use pico2w_300yen_lcd::ota::OtaError;
-use pico2w_300yen_lcd::sdcard::{ReadError, init_sd, read_root_file};
+use pico2w_300yen_lcd::sdcard::{ReadError, SdVolumeManager, init_sd, read_root_file};
 use pico2w_300yen_lcd::ticker::civil;
-use pico2w_300yen_lcd::ticker::config::TickerConfig;
-use pico2w_300yen_lcd::ticker::digits;
+use pico2w_300yen_lcd::ticker::config::{LayoutName, StatusMode, TickerConfig};
+use pico2w_300yen_lcd::ticker::slideshow::{self, SlideConfig};
 use pico2w_300yen_lcd::ticker::sntp::{self, SntpError};
 use pico2w_300yen_lcd::ticker::sntp_net::{self, SntpBuffers, Sync};
 use pico2w_300yen_lcd::ticker::weather::{self, Weather};
+use pico2w_300yen_lcd::ui::canvas::Canvas;
+use pico2w_300yen_lcd::ui::screen::{self, Clock, Layout, StatusView, Tone as UiTone, View, WeatherView};
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
 use pico2w_300yen_lcd::wifi::{self, Cyw43Pins, WifiCredentials, ascii_label, read_credentials};
 use defmt_rtt as _;
@@ -193,6 +191,13 @@ struct Shared {
     message: String<MESSAGE_MAX>,
     message_gen: u32,
     scroll_px: u8,
+    /// 画面構成と状態 3 行の出し方 (ticker.txt)
+    layout: Layout,
+    status_mode: StatusMode,
+    /// 起動時刻 (状態 3 行を 60 s 出す)
+    boot_at: Instant,
+    /// 失敗から 30 s は状態 3 行を出す
+    alert_until: Option<Instant>,
 }
 
 impl Shared {
@@ -221,6 +226,10 @@ impl Shared {
             message: String::new(),
             message_gen: 0,
             scroll_px: 1,
+            layout: Layout::Glass,
+            status_mode: StatusMode::Auto,
+            boot_at: Instant::from_ticks(0),
+            alert_until: None,
         }
     }
 }
@@ -233,6 +242,11 @@ fn with_model<R>(f: impl FnOnce(&mut Shared) -> R) -> R {
     MODEL.lock(|m| f(&mut m.borrow_mut()))
 }
 
+/// 失敗を記録する (状態 3 行を `ALERT_SHOW` の間出す)
+fn raise_alert(m: &mut Shared) {
+    m.alert_until = Some(Instant::now() + ALERT_SHOW);
+}
+
 /// ota::app への表示口: 接続状況と OTA の途中経過を共有モデルへ書く (描画は render_task が毎フレーム行う)
 struct ModelUi<'a> {
     ota: &'a mut OtaState,
@@ -243,7 +257,16 @@ impl ModelUi<'_> {
     fn publish_ota(&self) {
         let mut line: String<80> = String::new();
         let (tone, progress) = self.ota.write_line(&mut line, &self.slots);
+        // 確認〜検証の間はスライドショーの SD 読み込みを止める (フラッシュ書き込みと重ねない)
+        let active = matches!(
+            self.ota.phase,
+            OtaPhase::Checking | OtaPhase::Downloading { .. } | OtaPhase::Verifying { .. }
+        );
+        slideshow::PAUSE.store(active, Ordering::Relaxed);
         with_model(|m| {
+            if tone == Tone::Error && m.ota_tone != Tone::Error {
+                raise_alert(m);
+            }
             m.ota = line;
             m.ota_tone = tone;
             m.progress = progress;
@@ -272,220 +295,162 @@ impl LinkUi for ModelUi<'_> {
 // 描画 (render_task)
 // ============================================================
 
-const WHITE: Rgb666 = Rgb666::new(63, 63, 63);
-const GRAY: Rgb666 = Rgb666::new(32, 32, 32);
-const DIM: Rgb666 = Rgb666::new(16, 16, 16);
-const CYAN: Rgb666 = Rgb666::new(0, 63, 63);
-const GREEN: Rgb666 = Rgb666::new(0, 63, 0);
-const YELLOW: Rgb666 = Rgb666::new(63, 63, 0);
-const RED: Rgb666 = Rgb666::new(63, 0, 0);
-const MAGENTA: Rgb666 = Rgb666::new(63, 0, 63);
-const FRAME_COLOR: Rgb666 = Rgb666::new(24, 24, 24);
-/// 時計 / 日付 / 天気 / 文字の色 (RGB666 ワード。フォント描画は BackBuffer に直接書く)
-const CLOCK_COLOR: u32 = rgb666(63, 63, 63);
-const DATE_COLOR: u32 = rgb666(40, 56, 63);
-const PLACE_COLOR: u32 = rgb666(63, 50, 20);
-const TEMP_COLOR: u32 = rgb666(63, 40, 0);
-const COND_COLOR: u32 = rgb666(63, 63, 63);
-const MAX_COLOR: u32 = rgb666(63, 28, 28);
-const MIN_COLOR: u32 = rgb666(28, 44, 63);
-const RAIN_COLOR: u32 = rgb666(20, 63, 63);
-const MESSAGE_COLOR: u32 = rgb666(63, 63, 48);
-const PENDING_COLOR: u32 = rgb666(32, 32, 32);
+/// 起動から状態 3 行を出しておく時間
+const STATUS_BOOT_SHOW: Duration = Duration::from_secs(60);
+/// 取得 / 接続 / OTA の失敗から状態 3 行を出しておく時間
+const ALERT_SHOW: Duration = Duration::from_secs(30);
 
-/// レイアウト (y)。docs/ticker.md の図と合わせる
-const CLOCK_X: i32 = 6;
-const CLOCK_Y: i32 = 2;
-const CLOCK_SCALE: i32 = 4;
-const RIGHT_X: i32 = 196;
-const DATE_Y: i32 = 2;
-const NOW_Y: i32 = 18;
-const FORECAST_Y: i32 = 34;
-const MESSAGE_Y: i32 = 51;
-const MESSAGE_H: i32 = 16;
-const STATUS1_Y: i32 = 68;
-const STATUS2_Y: i32 = 77;
-const STATUS3_Y: i32 = 86;
-const TEXT_X: i32 = 2;
-/// 日本語 (東雲 14 px) を 16 px の帯に置くときの上の余白 (px)。下にも 1 px 残る
-const JP_PAD: i32 = (MESSAGE_H - shinonome::HEIGHT as i32) / 2;
-
-fn tone_color(tone: Tone) -> Rgb666 {
+fn ui_tone(tone: Tone) -> UiTone {
     match tone {
-        Tone::Muted => GRAY,
-        Tone::Normal => WHITE,
-        Tone::Ok => GREEN,
-        Tone::Busy => YELLOW,
-        Tone::Error => RED,
+        Tone::Muted => UiTone::Muted,
+        Tone::Normal => UiTone::Normal,
+        Tone::Ok => UiTone::Ok,
+        Tone::Busy => UiTone::Busy,
+        Tone::Error => UiTone::Error,
     }
 }
 
-fn draw_text(frame: &mut BackBuffer, text: &str, x: i32, y: i32, color: Rgb666) {
-    let style = MonoTextStyle::new(&FONT_6X10, color);
-    Text::with_baseline(text, Point::new(x, y), style, Baseline::Top)
-        .draw(frame)
-        .unwrap();
+/// `ok` / `ok s1` / `ok(http)` → 良好、`---` → 未取得、`syncing` / `fetching` → 処理中、他は失敗
+fn job_tone(state: &str) -> UiTone {
+    if state.starts_with("ok") {
+        UiTone::Ok
+    } else if state == "---" || state.is_empty() {
+        UiTone::Muted
+    } else if state == "syncing" || state == "fetching" {
+        UiTone::Busy
+    } else {
+        UiTone::Error
+    }
 }
 
-fn fill_rect(frame: &mut BackBuffer, x: i32, y: i32, w: u32, h: u32, color: Rgb666) {
-    Rectangle::new(Point::new(x, y), Size::new(w, h))
-        .into_styled(PrimitiveStyle::with_fill(color))
-        .draw(frame)
-        .unwrap();
+/// 状態 3 行を出すか (docs/ticker.md「状態表示」): 起動 60 s、失敗から 30 s、起動診断 / 設定の注意の表示中、
+/// Wi-Fi が IP を得ていない間、OTA のダウンロード〜再起動待ちと OTA 失敗、TBYB の buy 待ち / 失敗
+fn status_expanded(m: &Shared, now: Instant) -> bool {
+    match m.status_mode {
+        StatusMode::Full => return true,
+        StatusMode::Compact => return false,
+        StatusMode::Auto => {}
+    }
+    now < m.boot_at + STATUS_BOOT_SHOW
+        || m.alert_until.is_some_and(|t| now < t)
+        || (m.diag_until.is_some_and(|t| now < t) && !m.diag.is_empty())
+        || (m.note_until.is_some_and(|t| now < t) && !m.note.is_empty())
+        || m.wifi_tone != Tone::Ok
+        || m.progress.is_some()
+        || m.ota_tone == Tone::Error
+        || matches!(m.ident_tone, Tone::Busy | Tone::Error)
 }
 
-/// 東雲フォント (14 px、等倍) で 16 px の帯 `y` に描き、次の x を返す
-fn draw_jp(frame: &mut BackBuffer, text: &str, x: i32, y: i32, color: u32) -> i32 {
-    shinonome::draw_text(text, x, y + JP_PAD, BACK_WIDTH as i32 - 1, |px, py| {
-        if px >= 1 && py >= 1 {
-            frame.set_pixel(px as usize, py as usize, color);
-        }
-    })
-}
-
-/// 画面の外周 1 px の枠 (wifi_ota と同じ)
-fn draw_frame_border(frame: &mut BackBuffer) {
-    let w = BACK_WIDTH as u32;
-    let h = BACK_HEIGHT as u32;
-    fill_rect(frame, 0, 0, w, 1, FRAME_COLOR);
-    fill_rect(frame, 0, BACK_HEIGHT as i32 - 1, w, 1, FRAME_COLOR);
-    fill_rect(frame, 0, 0, 1, h, FRAME_COLOR);
-    fill_rect(frame, BACK_WIDTH as i32 - 1, 0, 1, h, FRAME_COLOR);
-}
-
-fn draw_screen(frame: &mut BackBuffer, m: &Shared, scroll_x: i32) {
-    frame.clear(BLACK);
-    draw_frame_border(frame);
+/// 共有モデル → 画面 (背景 + 重ね描き)。`line1` / `date` は呼び出し側の作業用
+fn draw_screen(frame: &mut BackBuffer, bg: &[u16], m: &Shared, scroll_x: i32) {
     let now = Instant::now();
-
-    // --- 時計 + 日付 ---
-    let mut text: String<96> = String::new();
-    match m.clock {
-        Some(sync) => {
-            let dt = civil::from_unix(sync.now_unix(), m.tz_offset_secs);
-            let _ = write!(text, "{:02}:{:02}:{:02}", dt.hour, dt.minute, dt.second);
-            digits::draw_text(&text, CLOCK_X, CLOCK_Y, CLOCK_SCALE, |px, py| {
-                frame.set_pixel(px as usize, py as usize, CLOCK_COLOR);
-            });
-            text.clear();
-            let _ = write!(text, "{:04}/{:02}/{:02} ({})", dt.year, dt.month, dt.day, dt.weekday_ja());
-            draw_jp(frame, &text, RIGHT_X, DATE_Y, DATE_COLOR);
-        }
-        None => {
-            digits::draw_text("--:--:--", CLOCK_X, CLOCK_Y, CLOCK_SCALE, |px, py| {
-                frame.set_pixel(px as usize, py as usize, PENDING_COLOR);
-            });
-            draw_jp(frame, "時刻同期中…", RIGHT_X, DATE_Y, PENDING_COLOR);
-        }
-    }
-
-    // --- 現在の天気 (地名 / 気温 / 天気) と今日の予報 ---
-    match m.weather {
-        Some(w) => {
-            let mut x = draw_jp(frame, &m.place, RIGHT_X, NOW_Y, PLACE_COLOR) + 8;
-            text.clear();
-            weather::format_temp(&mut text, w.temperature);
-            let _ = text.push('℃');
-            x = draw_jp(frame, &text, x, NOW_Y, TEMP_COLOR) + 8;
-            draw_jp(frame, w.condition_ja(), x, NOW_Y, COND_COLOR);
-
-            let mut x = TEXT_X + 4;
-            text.clear();
-            let _ = text.push_str("最高 ");
-            match w.max {
-                Some(v) => weather::format_temp(&mut text, v),
-                None => {
-                    let _ = text.push_str("--");
-                }
-            }
-            let _ = text.push('℃');
-            x = draw_jp(frame, &text, x, FORECAST_Y, MAX_COLOR) + 12;
-            text.clear();
-            let _ = text.push_str("最低 ");
-            match w.min {
-                Some(v) => weather::format_temp(&mut text, v),
-                None => {
-                    let _ = text.push_str("--");
-                }
-            }
-            let _ = text.push('℃');
-            x = draw_jp(frame, &text, x, FORECAST_Y, MIN_COLOR) + 12;
-            text.clear();
-            match w.rain_pct {
-                Some(p) => {
-                    let _ = write!(text, "降水確率 {}%", p);
-                }
-                None => {
-                    let _ = text.push_str("降水確率 --%");
-                }
-            }
-            draw_jp(frame, &text, x, FORECAST_Y, RAIN_COLOR);
-        }
-        None => {
-            let x = draw_jp(frame, &m.place, RIGHT_X, NOW_Y, PLACE_COLOR) + 8;
-            draw_jp(frame, "天気取得中…", x, NOW_Y, PENDING_COLOR);
-        }
-    }
-
-    // --- 流れる文字 (16 px の帯。上下に 1 px の区切り。文字は帯の中央 14 px で区切りとは 1 px 空く) ---
-    fill_rect(frame, 1, MESSAGE_Y - 1, BACK_WIDTH as u32 - 2, 1, DIM);
-    fill_rect(frame, 1, MESSAGE_Y + MESSAGE_H, BACK_WIDTH as u32 - 2, 1, DIM);
-    if !m.message.is_empty() {
-        draw_jp(frame, &m.message, scroll_x, MESSAGE_Y, MESSAGE_COLOR);
-    }
+    let expanded = status_expanded(m, now);
 
     // --- 状態行 1: 起動診断 → ticker.txt の注意 → Wi-Fi / NTP / WX / MSG ---
-    text.clear();
-    if m.diag_until.is_some_and(|until| now < until) && !m.diag.is_empty() {
-        draw_text(frame, &m.diag, TEXT_X, STATUS1_Y, tone_color(m.diag_tone));
+    let mut line1: String<96> = String::new();
+    let line1_tone = if m.diag_until.is_some_and(|until| now < until) && !m.diag.is_empty() {
+        let _ = line1.push_str(&m.diag);
+        ui_tone(m.diag_tone)
     } else if m.note_until.is_some_and(|until| now < until) && !m.note.is_empty() {
-        draw_text(frame, &m.note, TEXT_X, STATUS1_Y, YELLOW);
+        let _ = line1.push_str(&m.note);
+        UiTone::Busy
     } else {
-        let _ = write!(text, "{} | NTP {} | WX {} | MSG {}", m.wifi, m.ntp, m.wx, m.msg);
-        let color = match m.wifi_tone {
-            Tone::Ok => CYAN,
-            other => tone_color(other),
-        };
-        draw_text(frame, &text, TEXT_X, STATUS1_Y, color);
-    }
+        let _ = write!(line1, "{} | NTP {} | WX {} | MSG {}", m.wifi, m.ntp, m.wx, m.msg);
+        ui_tone(m.wifi_tone)
+    };
+    let mut version: String<16> = String::new();
+    let _ = write!(version, "v{}", FIRMWARE_VERSION);
 
-    // --- 状態行 2: 版数 / 区画 / TBYB (wifi_ota の行 1 と同じ) ---
-    draw_text(frame, &m.ident_head, TEXT_X, STATUS2_Y, MAGENTA);
-    let rest_x = TEXT_X + m.ident_head.len() as i32 * FONT_6X10.character_size.width as i32;
-    draw_text(frame, &m.ident_rest, rest_x, STATUS2_Y, tone_color(m.ident_tone));
-
-    // --- 状態行 3: OTA (wifi_ota の行 2 と同じ)。ダウンロード中は行の上 (行 0、文字は無い) に 1 px の進捗バー ---
-    if let Some((done, total)) = m.progress {
-        let width = (BACK_WIDTH as i32 - 2 * TEXT_X) as u32;
-        let filled = if total > 0 { (done as u64 * width as u64 / total as u64) as u32 } else { 0 };
-        fill_rect(frame, TEXT_X, STATUS3_Y, width, 1, DIM);
-        fill_rect(frame, TEXT_X, STATUS3_Y, filled, 1, YELLOW);
-    }
-    draw_text(frame, &m.ota, TEXT_X, STATUS3_Y, tone_color(m.ota_tone));
+    let clock = m.clock.map(|sync| {
+        let dt = civil::from_unix(sync.now_unix(), m.tz_offset_secs);
+        Clock {
+            year: dt.year,
+            month: dt.month,
+            day: dt.day,
+            weekday: dt.weekday,
+            hour: dt.hour,
+            minute: dt.minute,
+            second: dt.second,
+        }
+    });
+    let view = View {
+        clock,
+        place: &m.place,
+        weather: m.weather.map(|w| WeatherView {
+            temperature: w.temperature,
+            code: w.code,
+            condition: w.condition_ja(),
+            max: w.max,
+            min: w.min,
+            rain_pct: w.rain_pct,
+        }),
+        message: &m.message,
+        scroll_x,
+        status: StatusView {
+            expanded,
+            line1: &line1,
+            line1_tone,
+            ident_head: &m.ident_head,
+            ident_rest: &m.ident_rest,
+            ident_tone: ui_tone(m.ident_tone),
+            ota: &m.ota,
+            ota_tone: ui_tone(m.ota_tone),
+            progress: m.progress,
+            wifi: match m.wifi_tone {
+                Tone::Ok => UiTone::Ok,
+                Tone::Error => UiTone::Error,
+                _ => UiTone::Busy,
+            },
+            ntp: job_tone(&m.ntp),
+            wx: job_tone(&m.wx),
+            msg: job_tone(&m.msg),
+            version: &version,
+        },
+    };
+    let mut canvas = Canvas::new(&mut frame.data);
+    screen::render(&mut canvas, bg, slideshow::LEVEL.load(Ordering::Relaxed), &view, m.layout);
 }
 
-/// 毎フレーム (LCD の垂直同期ごと) 画面を描き直し、流れる文字を動かす
+/// 毎フレーム (LCD の垂直同期ごと) 画面を描き直し、流れる文字を動かす。
+///
+/// 流れる文字の位置は LCD のフレーム番号で進める (SD の読み込みなどで描画が 1 フレーム遅れても、
+/// 速さは変わらず 2 px 飛ぶだけ)。描き終えるたびに `slideshow::FRAME_SLOT` で SD の読み込みに番を渡す。
 #[embassy_executor::task]
 async fn render_task(mut display: Display) {
-    let mut scroll_x = BACK_WIDTH as i32;
     let mut message_gen = u32::MAX;
     let mut message_width: i32 = 0;
+    let mut scroll_x = 0;
+    let mut last_frame = Display::frame_count();
+    let mut render_us_max: u64 = 0;
+    let mut stats_at = Instant::now();
     loop {
+        let started = Instant::now();
+        let frame_now = Display::frame_count();
+        let elapsed_frames = frame_now.wrapping_sub(last_frame).clamp(1, 8) as i32;
+        last_frame = frame_now;
         MODEL.lock(|cell| {
             let m = cell.borrow();
+            let (_, scroll_w) = m.layout.scroll_area(false);
             if m.message_gen != message_gen {
                 message_gen = m.message_gen;
                 message_width = shinonome::text_width(&m.message) as i32;
-                scroll_x = BACK_WIDTH as i32;
-            }
-            draw_screen(display.back(), &m, scroll_x);
-            if message_width > 0 {
-                scroll_x -= i32::from(m.scroll_px.max(1));
+                scroll_x = scroll_w;
+            } else if message_width > 0 {
+                scroll_x -= i32::from(m.scroll_px.max(1)) * elapsed_frames;
                 if scroll_x + message_width < 0 {
-                    scroll_x = BACK_WIDTH as i32;
+                    scroll_x = scroll_w;
                 }
             }
+            slideshow::BG.lock(|bg| draw_screen(display.back(), &bg.borrow()[..], &m, scroll_x));
         });
+        let spent = started.elapsed().as_micros();
+        render_us_max = render_us_max.max(spent);
+        if stats_at.elapsed() >= Duration::from_secs(30) {
+            defmt::info!("render: max {} us per frame (last 30 s), frame {}", render_us_max, frame_now);
+            render_us_max = 0;
+            stats_at = Instant::now();
+        }
+        slideshow::FRAME_SLOT.signal(());
         display.present().await;
     }
 }
@@ -619,6 +584,7 @@ async fn do_ntp(stack: embassy_net::Stack<'static>, sntp_bufs: &mut SntpBuffers,
             with_model(|m| {
                 m.ntp.clear();
                 let _ = m.ntp.push_str(e.label());
+                raise_alert(m);
             });
         }
     }
@@ -663,7 +629,10 @@ async fn do_weather(net: &Net<'_>, bufs: &mut NetBuffers, body: &mut [u8], confi
         }
         Err(text) => {
             job.failed(WEATHER_RETRY);
-            with_model(|m| m.wx = text);
+            with_model(|m| {
+                m.wx = text;
+                raise_alert(m);
+            });
         }
     }
 }
@@ -705,11 +674,17 @@ async fn do_message(net: &Net<'_>, bufs: &mut NetBuffers, body: &mut [u8], confi
         }
         Ok((code, _, _)) => {
             job.failed(MESSAGE_RETRY);
-            with_model(|m| m.msg = short_error(OtaError::HttpStatus(code)));
+            with_model(|m| {
+                m.msg = short_error(OtaError::HttpStatus(code));
+                raise_alert(m);
+            });
         }
         Err(e) => {
             job.failed(MESSAGE_RETRY);
-            with_model(|m| m.msg = short_error(e));
+            with_model(|m| {
+                m.msg = short_error(e);
+                raise_alert(m);
+            });
         }
     }
 }
@@ -776,6 +751,7 @@ async fn main(spawner: Spawner) {
     // --- SD カード: wifi.txt と ticker.txt (GPIO SPI は同期処理なので走査開始前に済ませる) ---
     let mut config = TickerConfig::default();
     let mut config_note: String<80> = String::new();
+    let mut sd: Option<SdVolumeManager> = None;
     let credentials: Result<WifiCredentials, &'static str> = match init_sd(p.PIN_0, p.PIN_26, p.PIN_27, p.PIN_28) {
         Ok(volume_mgr) => {
             let creds = read_credentials(&volume_mgr);
@@ -795,6 +771,8 @@ async fn main(spawner: Spawner) {
                     let _ = write!(config_note, "ticker.txt: {}, using Tokyo defaults", e);
                 }
             }
+            // 背景の写真 (スライドショー) は走査開始後に別タスクが読む
+            sd = Some(volume_mgr);
             creds
         }
         Err(message) => {
@@ -807,14 +785,22 @@ async fn main(spawner: Spawner) {
         Err(message) => defmt::warn!("wifi.txt: {}", message),
     }
     defmt::info!(
-        "ticker.txt: lat {} lon {} tz {} s place {} scroll {} note '{}'",
+        "ticker.txt: lat {} lon {} tz {} s place {} scroll {} slide {} s images '{}' sdfast {} note '{}'",
         config.lat,
         config.lon,
         config.tz_offset_secs,
         config.place.as_str(),
         config.scroll_px,
+        config.slide_secs,
+        config.images.as_str(),
+        config.sd_fast,
         config_note.as_str()
     );
+    let layout = match config.layout {
+        LayoutName::Glass => Layout::Glass,
+        LayoutName::Dock => Layout::Dock,
+        LayoutName::Classic => Layout::Classic,
+    };
     boot_trace::stage(Stage::SdRead);
 
     // --- 共有モデルの初期値 ---
@@ -840,6 +826,9 @@ async fn main(spawner: Spawner) {
         m.tz_offset_secs = config.tz_offset_secs;
         m.place = config.place.clone();
         m.scroll_px = config.scroll_px;
+        m.layout = layout;
+        m.status_mode = config.status;
+        m.boot_at = Instant::now();
         if !config_note.is_empty() {
             m.note = config_note.clone();
             m.note_until = Some(Instant::now() + NOTE_SHOW);
@@ -885,10 +874,28 @@ async fn main(spawner: Spawner) {
         dma_ch2: p.DMA_CH2,
         dma_ch3: p.DMA_CH3,
     });
-    MODEL.lock(|cell| draw_screen(display.back(), &cell.borrow(), BACK_WIDTH as i32));
+    // 背景は写真を読むまで既定のグラデーション
+    slideshow::fill_default(layout);
+    MODEL.lock(|cell| {
+        let m = cell.borrow();
+        slideshow::BG.lock(|bg| draw_screen(display.back(), &bg.borrow()[..], &m, layout.scroll_area(false).1));
+    });
     display.start(Irqs);
     boot_trace::stage(Stage::DisplayStarted);
     spawner.spawn(render_task(display)).unwrap();
+    if let Some(volume_mgr) = sd {
+        spawner
+            .spawn(slideshow::slideshow_task(
+                volume_mgr,
+                SlideConfig {
+                    interval: Duration::from_secs(u64::from(config.slide_secs)),
+                    images: config.images.clone(),
+                    layout,
+                    sd_fast: config.sd_fast,
+                },
+            ))
+            .unwrap();
+    }
 
     // --- picotool 用 USB reset interface ---
     let usb = build_usb_device(UsbDriver::new(p.USB, Irqs), "Network Ticker");
@@ -1028,6 +1035,9 @@ async fn main(spawner: Spawner) {
                 match last_error {
                     Some(code) => {
                         let _ = write!(m.wifi, "join failed ({}), retry in {}s", code, app::secs_until(*next_attempt));
+                        if m.wifi_tone != Tone::Error {
+                            raise_alert(m);
+                        }
                         m.wifi_tone = Tone::Error;
                     }
                     None => {
@@ -1045,6 +1055,16 @@ async fn main(spawner: Spawner) {
             slots: boot.slots,
         }
         .publish_ota();
+
+        // --- 背景の写真が読めなかったら状態行 1 に出す ---
+        if let Some(error) = slideshow::LAST_ERROR.lock(|e| e.borrow_mut().take()) {
+            with_model(|m| {
+                m.note.clear();
+                let _ = m.note.push_str(&error);
+                m.note_until = Some(Instant::now() + ALERT_SHOW);
+                raise_alert(m);
+            });
+        }
 
         Timer::after(TICK).await;
     }

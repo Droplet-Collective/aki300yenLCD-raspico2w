@@ -56,6 +56,10 @@ impl BitBangSd {
         if self.slow {
             let mut delay = Delay;
             delay.delay_us(2); // 初期化中は 400 kHz 以下
+        } else {
+            // 速い読み出し (写真の背景、v0.4.0〜): 半周期 ≈ 0.2 µs + GPIO 操作 → SCK ≈ 1.5〜2 MHz。
+            // SD の SPI モードの上限 25 MHz より十分遅い。読み誤りは CRC (embedded-sdmmc の既定で有効) で分かる。
+            cortex_m::asm::delay(FAST_HALF_CLOCK_CYCLES);
         }
     }
 
@@ -125,6 +129,9 @@ impl SpiDevice<u8> for BitBangSd {
         Ok(())
     }
 }
+
+/// 速い読み出しの半周期 (CPU サイクル、150 MHz で ≈ 0.2 µs)
+const FAST_HALF_CLOCK_CYCLES: u32 = 30;
 
 pub struct FixedTime;
 
@@ -277,4 +284,46 @@ pub enum ReadError {
     NotFound,
     /// ボリューム / ディレクトリ / 読み取りの失敗
     Other(&'static str),
+}
+
+/// SD の読み出し速度を切り替える (`fast = false` で初期化時と同じ低速 ≈ 200 kHz)。
+/// `ticker` は wifi.txt / ticker.txt を低速で読んだあと、写真の読み込みだけを速くする。
+pub fn set_fast(volume_mgr: &SdVolumeManager, fast: bool) {
+    volume_mgr.device(|dev| dev.card.spi(|bus| bus.slow = !fast));
+}
+
+/// SD ルートの `*.BMP` (8.3 形式の名前、ディレクトリ / 隠し / システム / `_` で始まる名前は除く) を
+/// 名前順に最大 `N` 個。macOS が作る `._IMAGE.BMP` (短い名前は `_IMAGE~1.BMP`) を拾わないよう `_` 始まりは除く。
+pub fn list_root_bmps<const N: usize>(volume_mgr: &SdVolumeManager) -> Result<heapless::Vec<heapless::String<12>, N>, &'static str> {
+    let volume = volume_mgr
+        .open_volume(embedded_sdmmc::VolumeIdx(0))
+        .map_err(volume_error)?;
+    let root = volume.open_root_dir().map_err(|_| "ROOT DIR ERROR")?;
+    let mut names: heapless::Vec<heapless::String<12>, N> = heapless::Vec::new();
+    root.iterate_dir(|entry| {
+        let attr = entry.attributes;
+        let ext = entry.name.extension();
+        let base = entry.name.base_name();
+        if !attr.is_directory()
+            && !attr.is_hidden()
+            && !attr.is_system()
+            && !attr.is_volume()
+            && ext.eq_ignore_ascii_case(b"BMP")
+            && !base.is_empty()
+            && base[0] != b'_'
+            && entry.size > 54
+        {
+            let mut name: heapless::String<12> = heapless::String::new();
+            for &b in base.iter().chain(b".").chain(ext.iter()) {
+                let _ = name.push(b as char);
+            }
+            if names.push(name).is_err() {
+                return core::ops::ControlFlow::Break(());
+            }
+        }
+        core::ops::ControlFlow::Continue(())
+    })
+    .map_err(|_| "ROOT DIR READ ERROR")?;
+    names.sort_unstable();
+    Ok(names)
 }

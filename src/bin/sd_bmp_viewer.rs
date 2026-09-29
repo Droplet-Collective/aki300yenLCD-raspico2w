@@ -29,8 +29,9 @@ use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Error as FsError, File, Mode, SdCard, SdCardError,
     TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
-use pico2w_300yen_lcd::lcd::display::{BACK_WIDTH, BackBuffer, Display, DisplayPins, FrameIrqHandler};
-use pico2w_300yen_lcd::lcd::framebuffer::{ACTIVE_HEIGHT, BLACK, rgb666};
+use pico2w_300yen_lcd::lcd::display::{BACK_BLACK, BACK_WIDTH, BackBuffer, Display, DisplayPins, FrameIrqHandler};
+use pico2w_300yen_lcd::lcd::framebuffer::ACTIVE_HEIGHT;
+use pico2w_300yen_lcd::ui::color::rgb;
 use pico2w_300yen_lcd::lcd::timing::H_ACTIVE;
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
 use {defmt_rtt as _, panic_probe as _};
@@ -366,7 +367,7 @@ async fn draw_bmp(
     let dst_x = (H_ACTIVE as usize - draw_width) / 2;
     let dst_y = (ACTIVE_HEIGHT - draw_height) / 2;
     let mut row = [0u8; 64 * 3];
-    staged.clear(BLACK);
+    staged.clear(BACK_BLACK);
 
     for dy in 0..draw_height {
         let source_y = src_y + dy as u32;
@@ -382,11 +383,8 @@ async fn draw_bmp(
             let count = (draw_width - x).min(64);
             read_exact(file, &mut row[..count * 3])?;
             for (dx, bgr) in row[..count * 3].chunks_exact(3).enumerate() {
-                staged.data[(dst_y + dy) * BACK_WIDTH + dst_x + x + dx] = rgb666(
-                    (bgr[2] >> 2) as u32,
-                    (bgr[1] >> 2) as u32,
-                    (bgr[0] >> 2) as u32,
-                );
+                // バックバッファは RGB565 (v0.4.0〜)
+                staged.data[(dst_y + dy) * BACK_WIDTH + dst_x + x + dx] = rgb(bgr[2], bgr[1], bgr[0]);
             }
         }
         // GPIO SPI は同期処理。各行の後で USB reset task に実行機会を渡す。
@@ -485,7 +483,7 @@ async fn main(spawner: Spawner) {
 }
 
 fn draw_error(frame: &mut BackBuffer, message: &'static str) {
-    frame.clear(BLACK);
+    frame.clear(BACK_BLACK);
     let style = MonoTextStyle::new(&FONT_6X10, Rgb666::WHITE);
     Text::new(
         "SD BMP viewer",

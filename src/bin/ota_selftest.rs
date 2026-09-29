@@ -43,7 +43,7 @@ use pico2w_300yen_lcd::ab_boot::{
 };
 use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, IMAGE_DEF_MAJOR, IMAGE_DEF_MINOR, TBYB};
 use pico2w_300yen_lcd::lcd::display::{BackBuffer, Display, DisplayPins, FrameIrqHandler};
-use pico2w_300yen_lcd::lcd::framebuffer::BLACK;
+use pico2w_300yen_lcd::lcd::display::BACK_BLACK;
 use pico2w_300yen_lcd::lcd::timing::H_ACTIVE;
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
 use {defmt_rtt as _, panic_probe as _};
@@ -206,7 +206,7 @@ const RED: Rgb666 = Rgb666::new(63, 0, 0);
 ///  P2 data   0x3C2000-0x3FFFFF  248K  data   (not bootable)
 /// ```
 fn draw_screen(frame: &mut BackBuffer, status: &Status) {
-    frame.clear(BLACK);
+    frame.clear(BACK_BLACK);
     let mut y = 1;
     let mut line: String<80> = String::new();
 

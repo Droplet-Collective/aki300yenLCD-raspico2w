@@ -20,6 +20,8 @@ PIO + DMA で駆動し、その表示を持ったファームウェアを **Wi-F
 - **ネットワーク・ティッカー (v0.3.0〜)**: OTA の土台の上に、NTP 時計・Open-Meteo の天気・GitHub 上の
   `message.txt` を流す表示を載せた `ticker` bin。v0.3.0 からは Release の OTA イメージがこれになり、
   `wifi_ota` 0.2.x が動いている機体もそのまま `ticker` に切り替わります ([ticker.md](docs/ticker.md))。
+  v0.4.0 からは SD の写真 (BMP) をスライドショーで背景にし、その上に半透明の板で情報を重ねます。
+  画面は PC のシミュレータ `tools/ui-sim` で書き込む前に確かめられます ([ui-sim.md](docs/ui-sim.md))。
 
 ## ハードウェア
 
@@ -63,14 +65,18 @@ src/
   usb_reset.rs      picotool 用 USB reset interface
   sdcard.rs         microSD (GPIO SPI) と FAT ボリューム
   ota/app.rs        OTA + TBYB + 接続管理の実行部 (ticker / wifi_ota 共用)
-  ticker/           ticker の部品 (暦、ticker.txt、Open-Meteo、SNTP、時計の数字)
+  ticker/           ticker の部品 (暦、ticker.txt、Open-Meteo、SNTP、写真のスライドショー)
+  ui/               画面の描画 (no_std の純粋なコード、tools/ui-sim と共用): 画面構成、ガラス板、AA 数字、
+                    天気アイコン、BMP の読み込み (拡大縮小 + 切り出し)
   font/shinonome.rs 東雲フォント (14 ドット日本語) の検索と描画
   bin/              下記の実行ファイル
 partition/          A/B パーティションテーブル (pico2w-ab.json → pico2w-ab.uf2)
 scripts/            make-ota-image.sh (ELF → .bin/.uf2/.sha256)、make-manifest.sh、make-partition-table.sh
 fonts/shinonome/    東雲フォント (14 ドット) のビットマップテーブルとライセンス (Public Domain)
+fonts/dejavu/       時計 / 気温の AA 数字の元 (DejaVu Sans) のライセンス
 ticker/message.txt  ticker が流す文字 (main を書き換えれば 5 分以内に反映)
-tools/              bdf2bin.py (BDF → フォントテーブル)、ticker-tests (ホストでのユニットテスト)
+tools/              bdf2bin.py (BDF → フォントテーブル)、ticker-tests (ホストでのユニットテスト)、
+                    ui-sim (画面シミュレータ: PNG / GIF、見本の背景 BMP。docs/ui-sim.md)
 .github/workflows/  build.yml (全 bin をビルド、v* タグで Release)、release.yml (workflow_dispatch で Release)
 docs/               設計・手順・実機で得た知見 (下記リンク)
 ```
@@ -79,7 +85,7 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 
 | bin | 内容 |
 |---|---|
-| `ticker` | **Release の OTA イメージ (v0.3.0〜)**。NTP 時計 + Open-Meteo 天気 + `ticker/message.txt` の流れる文字 (東雲フォント 14 ドット) + OTA。設定は SD の `TICKER.TXT` ([ticker.md](docs/ticker.md))。Release 用は `--features tbyb` |
+| `ticker` | **Release の OTA イメージ (v0.3.0〜)**。NTP 時計 + Open-Meteo 天気 + `ticker/message.txt` の流れる文字 (東雲フォント 14 ドット) + OTA。v0.4.0〜 SD の BMP のスライドショーを背景に、ガラス風の板で重ね描き。設定は SD の `TICKER.TXT` ([ticker.md](docs/ticker.md))。Release 用は `--features tbyb` |
 | `wifi_ota` | OTA の最小構成 (v0.2.x の OTA イメージ)。`wifi_status` の表示 + GitHub Release からの自己更新。OTA / TBYB の本体は `src/ota/app.rs` で `ticker` と共用 |
 | `wifi_status` | SD の `WIFI.TXT` で Wi-Fi に接続し、周辺 AP の RSSI を LCD に表示 ([wifi-status.md](docs/wifi-status.md)) |
 | `ota_selftest` | Wi-Fi 無しで A/B・TBYB を確認する診断 bin。起動区画・版数・TBYB 状態を表示して `explicit_buy` ([ota-setup.md](docs/ota-setup.md)) |
@@ -142,6 +148,8 @@ rustup target add thumbv8m.main-none-eabihf     # rust-toolchain.toml が stable
 cargo build --release                           # 全 bin
 cargo build --release --bin ticker --features tbyb     # OTA で配る (Release 用) イメージ (v0.3.0〜)
 (cd tools/ticker-tests && cargo test)                   # ticker の純粋なロジックをホストでテスト
+(cd tools/ui-sim && cargo test --release && cargo run --release -- --scenario scenarios/default.json --out out/)
+                                                        # 画面を PC で描いて out/*.png / *.gif に (docs/ui-sim.md)
 ```
 
 ELF から配布物を作るには picotool 2.x が必要です:

@@ -81,6 +81,26 @@ mod tests {
     }
 
     #[test]
+    fn config_slideshow_keys() {
+        use config::{LayoutName, StatusMode};
+        let d = config::TickerConfig::default();
+        assert_eq!((d.slide_secs, d.layout, d.status, d.sd_fast), (30, LayoutName::Glass, StatusMode::Auto, true));
+        assert!(d.images.is_empty());
+        let text = "slide=0\nimages= IMAGE.BMP , image2.bmp,bad name.bmp,TOOLONGNAME.BMP\nlayout=Dock\nstatus=full\nsdfast=0\n";
+        let (c, any) = config::TickerConfig::parse(text.as_bytes());
+        assert!(any);
+        assert_eq!(c.slide_secs, 0);
+        assert_eq!(config::image_names(&c.images).collect::<Vec<_>>(), ["IMAGE.BMP", "image2.bmp"]);
+        assert_eq!((c.layout, c.status, c.sd_fast), (LayoutName::Dock, StatusMode::Full, false));
+        // 範囲外 / 不正は既定のまま
+        let (c, any) = config::TickerConfig::parse(b"slide=3\nimages=,,\nlayout=fancy\nstatus=on\nsdfast=yes\n");
+        assert!(!any);
+        assert_eq!(c, d);
+        assert!(config::is_short_name("A.BMP") && config::is_short_name("PHOTO_01.BMP"));
+        assert!(!config::is_short_name("PHOTO.JPEG") && !config::is_short_name(".BMP") && !config::is_short_name("NOEXT"));
+    }
+
+    #[test]
     fn tz_forms() {
         assert_eq!(config::parse_tz("+9"), Some(32_400));
         assert_eq!(config::parse_tz("9"), Some(32_400));

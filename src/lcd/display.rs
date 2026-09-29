@@ -46,7 +46,8 @@
 //!
 //! # メモリ
 //!
-//! FRONT 230,068 B + BACK 153,600 B + SM1 データ 456 B。
+//! FRONT 230,068 B + BACK 76,800 B (RGB565、v0.3 までは RGB666 ワードで 153,600 B) + SM1 データ 456 B
+//! + 走査ワードの表 2 KB。
 
 use core::future::poll_fn;
 use core::ptr::{addr_of, addr_of_mut};
@@ -72,7 +73,7 @@ use embedded_graphics::primitives::Rectangle;
 use fixed::FixedU32;
 use fixed::types::extra::U8;
 
-use crate::lcd::framebuffer::{ACTIVE_HEIGHT, ACTIVE_Y_OFFSET, BLACK, FB_SIZE, FrameBuffer, LINE_WIDTH, rgb666};
+use crate::lcd::framebuffer::{ACTIVE_HEIGHT, ACTIVE_Y_OFFSET, FB_SIZE, FrameBuffer, LINE_WIDTH, rgb666};
 use crate::lcd::timing::{H_ACTIVE, H_TOTAL, PIO_CLK_DIV_FRAC, PIO_CLK_DIV_INT, SM1_CLK_DIV_BITS, V_NORMAL_LINES};
 
 // ============================================================
@@ -83,7 +84,7 @@ use crate::lcd::timing::{H_ACTIVE, H_TOTAL, PIO_CLK_DIV_FRAC, PIO_CLK_DIV_INT, S
 pub const BACK_WIDTH: usize = H_ACTIVE as usize; // 400
 /// バックバッファの高さ (LCD の表示高)
 pub const BACK_HEIGHT: usize = ACTIVE_HEIGHT; // 96
-/// バックバッファのワード数 (38,400 ワード = 153,600 バイト)
+/// バックバッファの画素数 (38,400 画素 = 76,800 バイト)
 pub const BACK_SIZE: usize = BACK_WIDTH * BACK_HEIGHT;
 
 /// LCD の最初の表示画素に対応するフレーム行内の x (バックバッファの x=0 を置く位置)。
@@ -170,50 +171,63 @@ static FRAME_WAKER: AtomicWaker = AtomicWaker::new();
 // BackBuffer: アプリが描く 400×96 の画面
 // ============================================================
 
-/// アプリケーションが描画するバックバッファ (400×96、RGB666 ワード)。
+/// アプリケーションが描画するバックバッファ (400×96、**RGB565** の `u16`)。
 ///
-/// `FrameBuffer` と同じピクセルワード ([`rgb666`]) を使う。
-/// `embedded-graphics` の `DrawTarget<Color = Rgb666>` を実装する。
+/// v0.4.0 で RGB666 ワード (`u32`、153,600 B) から RGB565 (76,800 B) にした。空いた 76.8 KB を
+/// `ticker` の写真の背景 (同じく RGB565) に使うため (docs/ticker.md「RAM」)。LCD は 18 bit なので
+/// 垂直ブランキングのコピー ([`Display::present`]) が表引きで RGB666 の走査ワードへ広げる
+/// (R/B の 5 bit は上位ビットの複製で 6 bit に、`ui::color::to_666` と同じ)。
+///
+/// `embedded-graphics` の `DrawTarget<Color = Rgb666>` も実装する (R/B の最下位ビットは捨てる)。
 pub struct BackBuffer {
-    /// 行優先 `[y * 400 + x]`
-    pub data: [u32; BACK_SIZE],
+    /// 行優先 `[y * 400 + x]`、RGB565
+    pub data: [u16; BACK_SIZE],
+}
+
+/// バックバッファの黒
+pub const BACK_BLACK: u16 = 0;
+
+/// RGB666 (各 0..=63) → バックバッファの RGB565
+#[inline]
+pub const fn rgb666_to_565(r: u8, g: u8, b: u8) -> u16 {
+    ((r as u16 >> 1) << 11) | ((g as u16 & 0x3f) << 5) | (b as u16 >> 1)
 }
 
 impl BackBuffer {
     pub const fn new() -> Self {
-        Self { data: [BLACK; BACK_SIZE] }
+        Self { data: [BACK_BLACK; BACK_SIZE] }
     }
 
     #[inline]
-    pub fn set_pixel(&mut self, x: usize, y: usize, color: u32) {
+    pub fn set_pixel(&mut self, x: usize, y: usize, color: u16) {
         if x < BACK_WIDTH && y < BACK_HEIGHT {
             self.data[y * BACK_WIDTH + x] = color;
         }
     }
 
     #[inline]
-    pub fn get_pixel(&self, x: usize, y: usize) -> u32 {
+    pub fn get_pixel(&self, x: usize, y: usize) -> u16 {
         if x < BACK_WIDTH && y < BACK_HEIGHT {
             self.data[y * BACK_WIDTH + x]
         } else {
-            BLACK
+            BACK_BLACK
         }
     }
 
-    /// 行 y (0..96) の 400 ワード
+    /// 行 y (0..96) の 400 画素
     #[inline]
-    pub fn row(&self, y: usize) -> &[u32] {
+    pub fn row(&self, y: usize) -> &[u16] {
         &self.data[y * BACK_WIDTH..(y + 1) * BACK_WIDTH]
     }
 
-    /// 行 y (0..96) の 400 ワード (可変)
+    /// 行 y (0..96) の 400 画素 (可変)
     #[inline]
-    pub fn row_mut(&mut self, y: usize) -> &mut [u32] {
+    pub fn row_mut(&mut self, y: usize) -> &mut [u16] {
         &mut self.data[y * BACK_WIDTH..(y + 1) * BACK_WIDTH]
     }
 
-    /// 全画面を指定ワードで塗る
-    pub fn clear(&mut self, color: u32) {
+    /// 全画面を指定色 (RGB565) で塗る
+    pub fn clear(&mut self, color: u16) {
         self.data.fill(color);
     }
 }
@@ -230,6 +244,11 @@ impl OriginDimensions for BackBuffer {
     }
 }
 
+#[inline]
+fn to_565(color: Rgb666) -> u16 {
+    rgb666_to_565(color.r(), color.g(), color.b())
+}
+
 impl DrawTarget for BackBuffer {
     type Color = Rgb666;
     type Error = core::convert::Infallible;
@@ -243,15 +262,14 @@ impl DrawTarget for BackBuffer {
                 && (x as usize) < BACK_WIDTH
                 && (y as usize) < BACK_HEIGHT
             {
-                let word = rgb666(color.r() as u32, color.g() as u32, color.b() as u32);
-                self.data[y as usize * BACK_WIDTH + x as usize] = word;
+                self.data[y as usize * BACK_WIDTH + x as usize] = to_565(color);
             }
         }
         Ok(())
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        let word = rgb666(color.r() as u32, color.g() as u32, color.b() as u32);
+        let word = to_565(color);
         let clipped = area.intersection(&self.bounding_box());
         if clipped.size.width > 0 && clipped.size.height > 0 {
             let x_start = clipped.top_left.x as usize;
@@ -266,10 +284,63 @@ impl DrawTarget for BackBuffer {
     }
 
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
-        let word = rgb666(color.r() as u32, color.g() as u32, color.b() as u32);
-        self.data.fill(word);
+        self.data.fill(to_565(color));
         Ok(())
     }
+}
+
+// ============================================================
+// RGB565 → 走査ワード (RGB666、ビット順反転込み) の表
+// ============================================================
+
+/// RGB565 の上位バイト (RRRRRGGG) の寄与: R の 6 bit と G の上位 3 bit
+const fn lut_hi() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let (r6, g6, _) = crate::ui::color::to_666((i as u16) << 8);
+        t[i] = rgb666(r6 as u32, g6 as u32, 0);
+        i += 1;
+    }
+    t
+}
+
+/// RGB565 の下位バイト (GGGBBBBB) の寄与: G の下位 3 bit と B の 6 bit
+const fn lut_lo() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let (_, g6, b6) = crate::ui::color::to_666(i as u16);
+        t[i] = rgb666(0, g6 as u32, b6 as u32);
+        i += 1;
+    }
+    t
+}
+
+/// 垂直ブランキングのコピーで引く表 (各 1 KB)。CPU が読むだけ (DMA は読まない) だが、
+/// 所要時間を XIP キャッシュの当たり外れに左右されないよう SRAM (.data) に置く。
+#[unsafe(link_section = ".data.lcd_lut_hi")]
+static LUT_HI: [u32; 256] = lut_hi();
+#[unsafe(link_section = ".data.lcd_lut_lo")]
+static LUT_LO: [u32; 256] = lut_lo();
+
+// 上位 / 下位バイトの寄与を OR すると 1 画素の走査ワードになる (ビット反転は各ビット独立なので分けてよい)。
+// 全 65,536 色でコンパイル時に確かめる。
+const _: () = {
+    let hi = lut_hi();
+    let lo = lut_lo();
+    let mut c: u32 = 0;
+    while c < 65536 {
+        let (r, g, b) = crate::ui::color::to_666(c as u16);
+        assert!(hi[(c >> 8) as usize] | lo[(c & 0xff) as usize] == rgb666(r as u32, g as u32, b as u32));
+        c += 1;
+    }
+};
+
+/// RGB565 の 1 画素 → 走査ワード
+#[inline(always)]
+fn scan_word(c: u16) -> u32 {
+    LUT_HI[(c >> 8) as usize] | LUT_LO[(c & 0xff) as usize]
 }
 
 // ============================================================
@@ -411,6 +482,12 @@ impl Display {
     }
 }
 
+/// 次のフレーム先頭 (CH2 完了) まで待つ。描画しないタスク (SD の読み込みなど) が 1 フレームに
+/// 1 回だけ動くための待ち合わせにも使える (走査開始前に呼ぶと永久に待つ)
+pub async fn next_frame() {
+    wait_frame_start().await
+}
+
 /// 次の CH2 完了 (フレーム先頭) まで待つ
 async fn wait_frame_start() {
     let seen = FRAME_COUNT.load(Ordering::Acquire);
@@ -427,6 +504,10 @@ async fn wait_frame_start() {
 
 /// BACK の 96 行を FRONT の表示行へ写す。可視開始位置 `VISIBLE_X_OFFSET` に置き、
 /// 行の残り (左 106 + 右 3 ワード) は端の画素色で埋める。
+///
+/// RGB565 → 走査ワードの変換は 2 つの 256 語の表の OR (1 画素 ≈ 7 サイクル、1 行 ≈ 20〜25 µs @150 MHz)。
+/// 走査は 1 行 ≈ 147 µs なので、ブランキング中に始めれば v0.3 までの単純コピー (≈5 µs/行) と同じく
+/// 走査に追い越されない (全 96 行 ≈ 2.4 ms、ブランキング 16 行 ≈ 2.4 ms のうち先頭 12 行以内に開始)。
 fn copy_back_to_front() {
     // Safety: BACK は Display の &mut self 経由でしか書かれず、この関数も
     // Display の &mut self からしか呼ばれない。FRONT を書くのはここだけで、
@@ -437,9 +518,13 @@ fn copy_back_to_front() {
         let src = back.row(y);
         let row_start = (ACTIVE_Y_OFFSET + y) * LINE_WIDTH;
         let dst = &mut front.data[row_start..row_start + LINE_WIDTH];
-        dst[VISIBLE_X_OFFSET..VISIBLE_X_OFFSET + BACK_WIDTH].copy_from_slice(src);
-        dst[..VISIBLE_X_OFFSET].fill(src[0]);
-        dst[VISIBLE_X_OFFSET + BACK_WIDTH..].fill(src[BACK_WIDTH - 1]);
+        for (d, &c) in dst[VISIBLE_X_OFFSET..VISIBLE_X_OFFSET + BACK_WIDTH].iter_mut().zip(src) {
+            *d = scan_word(c);
+        }
+        let first = scan_word(src[0]);
+        let last = scan_word(src[BACK_WIDTH - 1]);
+        dst[..VISIBLE_X_OFFSET].fill(first);
+        dst[VISIBLE_X_OFFSET + BACK_WIDTH..].fill(last);
     }
     compiler_fence(Ordering::SeqCst);
 }
