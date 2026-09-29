@@ -98,6 +98,10 @@ partition table: 3 partitions
 | 2 | 起動スロット (0x10000000 が対応するストレージオフセットから判定) と bootrom の起動種別 (`NORMAL`/`BOOTSEL`/`FLASH_UPDATE`…) |
 | 3 | `get_sys_info(BOOT_INFO)` の生値。`tbyb=0x01` なら buy 待ち、`0x04` は他方区画の先頭セクタを消去済み |
 | 4 | TBYB の状態: `not a TBYB boot` / `pending -> buy in 2.5s` (黄) / `bought OK` (緑) / `FAILED rc=…` (赤) / `skip-buy build` (赤)。`WDT:` は bootrom が仕掛けたウォッチドッグの残り秒 |
+
+表示は 400×96 のバックバッファに描かれ、垂直ブランキングでフロントへ反映される
+(`src/lcd/display.rs`)。0.5 秒ごとの再描画で画がずれたり欠けたりするのは v0.1.1 以前の症状
+([ota-design.md §4.1](ota-design.md#41-表示とフラッシュ操作の共存))。
 | 5〜 | パーティションテーブル。`storage` を含む区画を緑で表示 |
 
 `partition table: error -14 (PRECONDITION_NOT_MET)` はテーブル未ロード
@@ -148,7 +152,48 @@ Wi-Fi を使わずに「新版を他方スロットへ書き、FLASH_UPDATE で�
 起動で低い版数が優先され、その際に他方 (0.101) の先頭セクタが消される (§5.1.16)。
 以後は 0.100 だけが起動する。TBYB 付きで同じことをすると消去は buy 時に行われる。
 
-### 4.4 起動診断
+### 4.4 表示修正後の再確認 (v0.1.2 / v0.1.3)
+
+v0.1.1 の実機試験で、buy 後に LCD が砂嵐になる (電源再投入まで直らない) 事象と、
+0.5 秒ごとに画の一部がずれる事象が見つかった。原因と修正は
+[ota-design.md §4.1](ota-design.md#41-表示とフラッシュ操作の共存)。v0.1.2 以降のイメージで
+以下を確認する。前提: A に v0.1.1 (buy 済)、B に v0.1.0 (buy 時に先頭セクタが消されていれば
+3 行目に `tbyb=0x04` が出ていた。どちらでも次の書き込み先は B)。
+
+用意するファイル (CI アーティファクト、または `scripts/make-ota-image.sh` の出力):
+
+| ファイル | 版数 | TBYB | 用途 |
+|---|---|---|---|
+| `ota_selftest.uf2` | 0.1.2 (IMAGE_DEF 0.102) | 無し | 0.5 秒ごとのずれが消えたことの確認 |
+| `ota_selftest_v0.1.3_tbyb.uf2` | 0.1.3 (0.103) | 有り | buy 中に砂嵐にならないことの確認 |
+| `wifi_status.uf2` | 0.1.2 | 無し | 通常運用に戻すとき (下の注意を参照) |
+
+`ota_selftest_v0.1.3_tbyb.uf2` は `Cargo.toml` の `version` を一時的に `0.1.3` にして
+`cargo build --release --bin ota_selftest --features tbyb` した ELF から作る
+(リポジトリの `version` は 0.1.2 のまま)。
+
+1. A (v0.1.1) で起動中に `ota_selftest.uf2` (0.1.2) を D&D (または `picotool load -f -v -x`)。
+   B に入り、FLASH_UPDATE で起動する。
+   - LCD: `OTA selftest v0.1.2  IMAGE_DEF 0.102  tbyb-build:no`, `slot B`, `type FLASH_UPDATE(4)`,
+     `TBYB: not a TBYB boot`。
+   - **確認 1**: 右上の `up Ns` と `WDT:` が 0.5 秒ごとに更新されても、画の一部がずれたり
+     黒く欠けたりしない (バックバッファ描画 + 垂直ブランキングでの反映)。
+   - 電源を入れ直すと `slot B`, `0.102`, `type NORMAL(0)` (0.102 > 0.101 なので B が選ばれる)。
+2. B (v0.1.2) で起動中に `ota_selftest_v0.1.3_tbyb.uf2` を D&D。A に入り、TBYB で起動する。
+   - LCD: `v0.1.3  IMAGE_DEF 0.103  tbyb-build:yes`, `slot A`, `type FLASH_UPDATE(4)`,
+     `TBYB: pending -> buy in 3.0s`, `WDT: 16.x s left`。
+   - **確認 2**: 3 秒後に `TBYB: bought OK` (緑) になる瞬間とその後、**画面が砂嵐にならない**。
+     buy のセクタ消去・書き込み (数十〜数百 ms) の間も走査は SRAM だけを読む DMA リングで続く。
+     `WDT: off` に変わる。
+   - 電源を入れ直すと `slot A`, `0.103`, `type NORMAL(0)`, `TBYB: not a TBYB boot`。
+3. 以後 A=0.1.3 / B=0.1.2 の状態から 4.2 (skip-buy で巻き戻し) や 4.3 (ダウングレード) を試せる。
+
+注意: **版数は bin の種類を区別しない**。bootrom は「A/B のうち版数の高い方」を選ぶだけなので、
+A に `ota_selftest` 0.1.3 がある状態で `wifi_status` 0.1.2 を B に入れると、FLASH_UPDATE 起動で
+1 回は `wifi_status` が動くが、電源再投入後は 0.1.3 の `ota_selftest` に戻る。`wifi_status` を
+常用に戻すときは、より高い版数でビルドするか、`picotool erase -p 0` で A を消してから入れる。
+
+### 4.5 起動診断
 
 起動に失敗したときは BOOTSEL に落ちるので、`picotool info -d`、
 `picotool partition info`、`picotool reboot -g 0` (P0 の診断) を使う。
