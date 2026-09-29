@@ -140,8 +140,8 @@ struct DisplayPeripherals {
 /// フレームバッファ (BSS 配置、ゼロ初期化)
 static mut FB_DATA: FrameBuffer = FrameBuffer::new();
 
-/// 実機の可視開始位置 (wifi_status / sd_bmp_viewer と同じ補正)
-const VIEWER_VISIBLE_X: usize = 98;
+/// 実機の可視開始位置。`lcd::display::VISIBLE_X_OFFSET` (106、実機確認済み 2026-09-29) と同じ値
+const VIEWER_VISIBLE_X: usize = 106;
 
 fn align_image_to_visible_area(frame: &mut FrameBuffer) {
     let nominal_x = H_BLANK_BEFORE_ACTIVE as usize;
