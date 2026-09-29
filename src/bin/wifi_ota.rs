@@ -133,8 +133,10 @@ const TLS_TX_SIZE: usize = 3072;
 /// TCP ソケットバッファ (受信ウィンドウがダウンロード速度を決める。RAM 節約のため 4 kB)
 const TCP_RX_SIZE: usize = 4096;
 const TCP_TX_SIZE: usize = 2048;
-/// HTTP 応答ヘッダ用 (GitHub は 2〜3 kB のヘッダを返す)
-const HTTP_HEADER_SIZE: usize = 4096;
+/// HTTP 応答ヘッダ用。github.com の 302 は Content-Security-Policy (約 3.7 kB) と
+/// Set-Cookie 3 本を含めて 5.0〜5.9 kB (2026-09 実測)。reqwless はヘッダ終端がこのバッファに
+/// 収まらないと `BufferTooSmall` を返す (v0.2.0 の 4 kB では "bad HTTP response" になった)。
+const HTTP_HEADER_SIZE: usize = 8192;
 /// 本文の受信単位
 const CHUNK_SIZE: usize = 2048;
 /// manifest.json の上限
