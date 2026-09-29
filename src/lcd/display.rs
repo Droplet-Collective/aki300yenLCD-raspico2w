@@ -40,9 +40,9 @@
 //!
 //! # 可視位置の補正
 //!
-//! 実機の可視開始位置はフレーム x=98 (名目の 108 より 10 画素左) なので、
-//! コピー時に [`VISIBLE_X`] へ置き、行の残りは端の画素色で埋める
-//! (以前の `align_image_to_visible_area` と同じ結果)。
+//! LCD が最初の表示画素として取り込むのはフレーム行の x=[`VISIBLE_X_OFFSET`] (106) 番目の
+//! ワードなので、コピー時にバックバッファをそこへ置き、行の残りは端の画素色で埋める。
+//! 根拠は [`VISIBLE_X_OFFSET`] のコメント。
 //!
 //! # メモリ
 //!
@@ -86,8 +86,33 @@ pub const BACK_HEIGHT: usize = ACTIVE_HEIGHT; // 96
 /// バックバッファのワード数 (38,400 ワード = 153,600 バイト)
 pub const BACK_SIZE: usize = BACK_WIDTH * BACK_HEIGHT;
 
-/// 実機の可視開始位置 (フレーム内 x)。診断目盛りで x=98 から見えることを確認済み。
-pub const VISIBLE_X: usize = 98;
+/// LCD の最初の表示画素に対応するフレーム行内の x (バックバッファの x=0 を置く位置)。
+///
+/// 名目値は `H_BACK_PORCH` = 108 (HSYNC パルス 1 + バックポーチ 107、`timing.rs`) だが、
+/// SM0 と SM1 の起動位相で 2 ワードずれる:
+///
+/// - SM1 (HSYNC/VSYNC) は有効化直後に `set pins, 3` / `set pins, 2` の 2 命令 (= 2 NCLK) を
+///   実行してから `pull block` で止まる。SM0 (画素) は先頭の `out` で止まる。
+/// - `MULTI_CHAN_TRIGGER` で CH0/CH1 が同時に FIFO を埋めると両 SM は同時に動き出すが、
+///   SM1 は既に行の 2 サイクル目まで進んでいるので、以後すべての行で HSYNC の立ち下がり
+///   (行の 2 サイクル目、`set pins, 0`) はフレーム行の **x=−1** (前行の最終ワード) の
+///   NCLK 立ち下がりで LCD に取り込まれる。
+/// - LTA042B010F は HSYNC 取り込みから 107 クロック後の画素を表示開始とする
+///   (`docs/datasheet-LTA042B010F.md` の H back porch) ので、最初の表示画素は
+///   フレーム行の x = −1 + 107 = **106**。
+///
+/// 実機の写真とも一致する: 以前の 98 では左端の 1 文字 (6 px) が欠けていた (バックバッファの
+/// x=0..7 が表示開始より左に置かれていた)。両 SM のクロック分周器の位相で ±1 ワードの
+/// 不確かさが残るため、`wifi_ota` は起動直後に目盛りと外周 1 px の枠を出して確認できるようにしている。
+///
+/// 106 + 400 = 506 ≤ 509 (`LINE_WIDTH`) なので右端も切れない (残り 3 ワードは
+/// 右端の画素色で埋め、次行の HSYNC までのフロントポーチになる)。
+pub const VISIBLE_X_OFFSET: usize = 106;
+
+const _: () = assert!(
+    VISIBLE_X_OFFSET + BACK_WIDTH <= LINE_WIDTH,
+    "back buffer must fit in the frame line after VISIBLE_X_OFFSET"
+);
 
 /// `present()` がコピーを始めてよい最終ライン (0 起点のフレーム行)。
 /// これより前 (垂直ブランキング 16 行のうち先頭 12 行以内) に起きられれば、
@@ -398,8 +423,8 @@ async fn wait_frame_start() {
     .await
 }
 
-/// BACK の 96 行を FRONT の表示行へ写す。可視開始位置 `VISIBLE_X` に置き、
-/// 行の残り (左 98 + 右 11 ワード) は端の画素色で埋める。
+/// BACK の 96 行を FRONT の表示行へ写す。可視開始位置 `VISIBLE_X_OFFSET` に置き、
+/// 行の残り (左 106 + 右 3 ワード) は端の画素色で埋める。
 fn copy_back_to_front() {
     // Safety: BACK は Display の &mut self 経由でしか書かれず、この関数も
     // Display の &mut self からしか呼ばれない。FRONT を書くのはここだけで、
@@ -410,9 +435,9 @@ fn copy_back_to_front() {
         let src = back.row(y);
         let row_start = (ACTIVE_Y_OFFSET + y) * LINE_WIDTH;
         let dst = &mut front.data[row_start..row_start + LINE_WIDTH];
-        dst[VISIBLE_X..VISIBLE_X + BACK_WIDTH].copy_from_slice(src);
-        dst[..VISIBLE_X].fill(src[0]);
-        dst[VISIBLE_X + BACK_WIDTH..].fill(src[BACK_WIDTH - 1]);
+        dst[VISIBLE_X_OFFSET..VISIBLE_X_OFFSET + BACK_WIDTH].copy_from_slice(src);
+        dst[..VISIBLE_X_OFFSET].fill(src[0]);
+        dst[VISIBLE_X_OFFSET + BACK_WIDTH..].fill(src[BACK_WIDTH - 1]);
     }
     compiler_fence(Ordering::SeqCst);
 }
