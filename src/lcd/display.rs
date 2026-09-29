@@ -460,12 +460,16 @@ fn start_scanout(
         ".wrap",
     );
 
-    let Pio {
-        mut common,
-        mut sm0,
-        mut sm1,
-        ..
-    } = Pio::new(pins.pio0, irqs);
+    // `Pio` は関数を抜けても **drop しない** (末尾の `mem::forget`)。
+    // embassy-rp の `StateMachine::drop` は SM を無効化し、`Common`/`StateMachine`
+    // の最後の drop で PIO が使っていた全 GPIO の FUNCSEL を NULL に戻す
+    // (embassy-rp 0.9 `pio/mod.rs` `on_pio_drop`)。以前は display_task が
+    // `pending().await` で永久に保持していたが、同期関数に移した際に関数末尾で
+    // drop され、NCLK/HSYNC/VSYNC/RGB が全て切り離されて白画面になっていた。
+    let mut pio = Pio::new(pins.pio0, irqs);
+    let common = &mut pio.common;
+    let sm0 = &mut pio.sm0;
+    let sm1 = &mut pio.sm1;
 
     let pin2 = common.make_pio_pin(pins.pin2);
     let pin3 = common.make_pio_pin(pins.pin3);
@@ -525,8 +529,8 @@ fn start_scanout(
     sm1.set_config(&cfg1);
 
     common.apply_sm_batch(|batch| {
-        batch.set_enable(&mut sm0, true);
-        batch.set_enable(&mut sm1, true);
+        batch.set_enable(sm0, true);
+        batch.set_enable(sm1, true);
     });
 
     let sm0_txf_addr = pac::PIO0.txf(0).as_ptr() as u32;
@@ -629,4 +633,8 @@ fn start_scanout(
 
         dma.multi_chan_trigger().write(|w| w.set_multi_chan_trigger(0b11));
     });
+
+    // 走査は電源を切るまで続くので PIO0 の所有権を解放しない (上記コメント参照)。
+    // (PIO 用 `Pin` と `LoadedProgram` には Drop 処理が無いので、そのまま解放してよい)
+    core::mem::forget(pio);
 }
