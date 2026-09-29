@@ -44,7 +44,8 @@ pub struct Fetched {
 
 /// `url` を GET し、3xx なら `Location` へ追従、200 なら本文を `chunk` 単位で `sink` へ流す。
 /// 4xx / 5xx は本文を読まずに `Fetched { status, .. }` で返す (404 = Release 無しは呼び出し側で判断)。
-/// `url` はリダイレクトで書き換わる。`rx_buf` は応答ヘッダ用 (GitHub は 2〜3 kB 出す)。
+/// `url` はリダイレクトで書き換わる。`rx_buf` は応答ヘッダ用 (github.com の 302 は 5〜6 kB 出す。
+/// 収まらないと [`OtaError::HttpHeaderTooLong`])。
 pub async fn fetch<T: TcpConnect, D: Dns, S: BodySink>(
     client: &mut HttpClient<'_, T, D>,
     url: &mut String<URL_MAX>,
@@ -69,7 +70,7 @@ pub async fn fetch<T: TcpConnect, D: Dns, S: BodySink>(
             let mut found = false;
             for (name, value) in response.headers() {
                 if name.eq_ignore_ascii_case("location") {
-                    let text = core::str::from_utf8(value).map_err(|_| OtaError::HttpProtocol)?;
+                    let text = core::str::from_utf8(value).map_err(|_| OtaError::HttpRedirect)?;
                     next.push_str(text.trim()).map_err(|_| OtaError::LocationTooLong)?;
                     found = true;
                     break;
@@ -78,7 +79,7 @@ pub async fn fetch<T: TcpConnect, D: Dns, S: BodySink>(
             drop(response);
             drop(handle);
             if !found || !(next.starts_with("https://") || next.starts_with("http://")) {
-                return Err(OtaError::HttpProtocol);
+                return Err(OtaError::HttpRedirect);
             }
             if redirects >= MAX_REDIRECTS {
                 return Err(OtaError::TooManyRedirects);
@@ -123,6 +124,9 @@ fn map_error(error: reqwless::Error) -> OtaError {
         reqwless::Error::Dns => OtaError::Dns,
         reqwless::Error::Network(_) | reqwless::Error::ConnectionAborted => OtaError::Network,
         reqwless::Error::Tls(_) => OtaError::Tls,
+        reqwless::Error::BufferTooSmall => OtaError::HttpHeaderTooLong,
+        reqwless::Error::Codec => OtaError::HttpCodec,
+        reqwless::Error::InvalidUrl(_) => OtaError::HttpRedirect,
         _ => OtaError::HttpProtocol,
     }
 }

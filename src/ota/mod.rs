@@ -39,7 +39,13 @@ pub enum OtaError {
     Network,
     /// TLS ハンドシェイク失敗
     Tls,
-    /// HTTP 応答の解釈失敗 (ヘッダ過大など)
+    /// 応答ヘッダが受信バッファ (`HTTP_HEADER_SIZE`) に収まらない (reqwless `BufferTooSmall`)
+    HttpHeaderTooLong,
+    /// 応答の構文が解釈できない (reqwless `Codec`: ステータス行 / ヘッダ / chunked 本文)
+    HttpCodec,
+    /// 3xx なのに `Location` が無い、http(s) でない、または URL として解釈できない
+    HttpRedirect,
+    /// その他の HTTP クライアント内部エラー (reqwless `AlreadySent` など)
     HttpProtocol,
     /// 200 / 302 / 404 以外の HTTP ステータス
     HttpStatus(u16),
@@ -74,6 +80,9 @@ impl OtaError {
             OtaError::Dns => "DNS failed",
             OtaError::Network => "network error",
             OtaError::Tls => "TLS failed",
+            OtaError::HttpHeaderTooLong => "HTTP header too long",
+            OtaError::HttpCodec => "HTTP parse error",
+            OtaError::HttpRedirect => "bad redirect URL",
             OtaError::HttpProtocol => "bad HTTP response",
             OtaError::HttpStatus(_) => "HTTP status",
             OtaError::TooManyRedirects => "too many redirects",
