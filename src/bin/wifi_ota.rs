@@ -18,6 +18,10 @@
 //!   `Rejected` とし、最初にそう判定した時刻 + `REJECTED_RETRY_DELAY` に FLASH_UPDATE 起動を再試行する。
 //!   60 s ごとの確認で同じ判定が続いても再試行時刻は動かさない (`OtaState::rejected`。v0.2.3 までは
 //!   確認ごとに 10 分後へ延びて永遠に再試行しなかった)。
+//! - 起動時は WL_REG_ON を `wifi::CYW43_POWER_OFF_MS` (500 ms) 落として CYW43439 をコールドスタートさせ、
+//!   FLASH_UPDATE 再起動の前にも `leave()` + WL_REG_ON Low (`wifi::power_off_for_reboot`) で電源を切る。
+//!   DHCP が 20 s で通らなければ AP から離脱して再 join する (v0.2.5 の TBYB 起動は温かい再起動で
+//!   join は通るが DHCP が一度も通らず、再 join もしないまま 120 s で巻き戻った)。
 //! - 巻き戻りの原因が分かるように、buy 待ちの新版は進行段階と稼働時間を WATCHDOG.SCRATCH5〜7 に
 //!   書き続ける (`boot_trace`)。panic / HardFault も記録する。巻き戻り後に起動した旧版は起動時に
 //!   それを読み、`WATCHDOG.REASON` と BOOT_INFO の診断ワードと共に LCD の下段に出す。
@@ -164,6 +168,9 @@ const WATCHDOG_LOAD_MAX: u32 = 0x00ff_ffff;
 /// wifi_status と同じスキャン / 接続パラメータ
 const SCAN_PERIOD: Duration = Duration::from_secs(10);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(20);
+/// DHCP タイムアウト後の `leave()` に許す時間と、離脱してから再 join するまでの間
+const DHCP_REJOIN_LEAVE_TIMEOUT: Duration = Duration::from_secs(2);
+const DHCP_REJOIN_DELAY: Duration = Duration::from_millis(500);
 const JOIN_RETRY_MIN: Duration = Duration::from_secs(5);
 const JOIN_RETRY_MAX: Duration = Duration::from_secs(60);
 /// メインループの周期 (画面更新)
@@ -907,6 +914,22 @@ enum Link {
     Joined,
 }
 
+/// 対象区画への FLASH_UPDATE 再起動。先に AP から離脱して CYW43 の電源 (WL_REG_ON) を落とし、
+/// 次の版が接続中のチップを引き継がないようにする (`wifi::power_off_for_reboot`)。戻らない。
+async fn reboot_into_slot(ui: &mut Ui, control: &mut cyw43::Control<'static>, slots: Slots) -> ! {
+    ui.model.status.clear();
+    let _ = write!(
+        ui.model.status,
+        "rebooting into slot {} (P{})... wifi off",
+        slot_label(&slots.target),
+        slots.target.index
+    );
+    ui.model.joined_ssid = None;
+    ui.present().await;
+    wifi::power_off_for_reboot(control).await;
+    ab_boot::reboot_flash_update(slots.target.start_offset(), 100)
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -1023,7 +1046,16 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_task(usb)).unwrap();
 
     // --- CYW43439 + embassy-net (DHCP)。ダウンロード速度のため Performance ---
-    boot_trace::stage(Stage::WifiInit);
+    // 最初に WL_REG_ON を CYW43_POWER_OFF_MS 落とす (FLASH_UPDATE の温かい再起動でも CYW43 をコールドスタート
+    // させる。v0.2.5 の TBYB 起動で join 成功・DHCP 不通のまま巻き戻った原因の対策)。
+    boot_trace::stage(Stage::WifiPowerCycle);
+    ui.model.status.clear();
+    let _ = write!(
+        ui.model.status,
+        "Wi-Fi: power cycle ({} ms) + init...",
+        wifi::CYW43_POWER_OFF_MS
+    );
+    ui.present().await;
     let pio1 = Pio::new(p.PIO1, Irqs);
     let wifi::Network {
         stack,
@@ -1040,6 +1072,7 @@ async fn main(spawner: Spawner) {
             dma: p.DMA_CH4,
         },
         PowerManagementMode::Performance,
+        || boot_trace::stage(Stage::WifiInit),
     )
     .await;
     boot_trace::stage(Stage::WifiReady);
@@ -1115,14 +1148,38 @@ async fn main(spawner: Spawner) {
                     ui.present().await;
                     boot_trace::stage(Stage::DhcpWait);
                     if with_timeout(DHCP_TIMEOUT, stack.wait_config_up()).await.is_err() {
-                        defmt::warn!("DHCP timeout");
+                        // DHCP が通らない。association はあるのにデータが流れない状態 (v0.2.5 の TBYB 起動で
+                        // 観測: join1 dhcpto1 のまま 120 s) から抜けるため、AP から離脱して次のループで
+                        // 再 join する (v0.2.5 までは Joined のまま DHCP クライアントに任せ、リンクが落ちない
+                        // 限り再 join しなかった)。TBYB の締め切り判定と延長タスクはこのループの外で回り続ける。
+                        defmt::warn!("DHCP timeout; leaving and rejoining");
                         counters.dhcp_timeouts = counters.dhcp_timeouts.saturating_add(1);
                         boot_trace::stage(Stage::DhcpTimeout);
                         boot_trace::info(counters.pack());
-                    } else if ui.model.ota.next_check.is_none() {
-                        ui.model.ota.next_check = Some(Instant::now() + OTA_FIRST_CHECK_DELAY);
+                        ui.model.status.clear();
+                        let _ = write!(
+                            ui.model.status,
+                            "{}: DHCP timeout ({}), rejoining...",
+                            ascii_label::<32>(creds.ssid.as_bytes()),
+                            counters.dhcp_timeouts
+                        );
+                        ui.model.joined_ssid = None;
+                        ui.present().await;
+                        if with_timeout(DHCP_REJOIN_LEAVE_TIMEOUT, control.leave()).await.is_err() {
+                            defmt::warn!("leave() timed out");
+                        }
+                        boot_trace::stage(Stage::DhcpRetry);
+                        link = Link::Disconnected {
+                            next_attempt: Instant::now() + DHCP_REJOIN_DELAY,
+                            retry: JOIN_RETRY_MIN,
+                            last_error: None,
+                        };
+                    } else {
+                        if ui.model.ota.next_check.is_none() {
+                            ui.model.ota.next_check = Some(Instant::now() + OTA_FIRST_CHECK_DELAY);
+                        }
+                        link = Link::Joined;
                     }
-                    link = Link::Joined;
                 }
                 Err(error) => {
                     defmt::error!("join failed: status {}", error.status);
@@ -1244,14 +1301,13 @@ async fn main(spawner: Spawner) {
             OtaPhase::Rebooting { version, at } if Instant::now() >= at => {
                 if let Ok(slots) = ui.model.boot.slots {
                     defmt::info!("reboot(FLASH_UPDATE) into P{} for {}", slots.target.index, version);
-                    Timer::after_millis(50).await;
-                    ab_boot::reboot_flash_update(slots.target.start_offset(), 100);
+                    reboot_into_slot(&mut ui, &mut control, slots).await;
                 }
             }
             OtaPhase::Rejected { version, retry_at } if Instant::now() >= retry_at => {
                 if let Ok(slots) = ui.model.boot.slots {
                     defmt::warn!("retrying FLASH_UPDATE boot into P{} for {}", slots.target.index, version);
-                    ab_boot::reboot_flash_update(slots.target.start_offset(), 100);
+                    reboot_into_slot(&mut ui, &mut control, slots).await;
                 }
             }
             _ => {}

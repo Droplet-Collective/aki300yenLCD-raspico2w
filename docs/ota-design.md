@@ -182,6 +182,7 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
 | SHA-256 不一致 | FLASH_UPDATE 再起動しない。対象区画の先頭セクタを消しておく |
 | 新版が起動しない / ハング / パニック | bootrom のウォッチドッグ (16.7 s) で旧版へ。新版は TBYB のまま残り通常起動では選ばれない (延長タスクも止まるので、延長中のハングでも同じ)。v0.2.4 から新版は進行 / panic / HardFault を WATCHDOG.SCRATCH5〜7 に記録し、旧版がそれを LCD に出す ([wifi-ota.md §5.2](wifi-ota.md#52-起動診断-v024-巻き戻りの原因を旧版の画面で読む)) |
 | 新版は起きるが Wi-Fi 等の自己診断 NG | 起動 120 s まではウォッチドッグを延長して待つ。それでも通らなければ延長をやめ、explicit_buy も呼ばない → 最長 16.7 s 後に同上 |
+| 温かい再起動で CYW43439 が接続中の状態を引き継ぎ、join は通るが DHCP が通らない | `reboot(FLASH_UPDATE)` は RP2350 だけをリセットし、CYW43439 は通電・接続したまま。cyw43 の init は WL_REG_ON を 20 ms しか落とさないため内部状態が残ることがある (v0.2.5 の実機: `join1 dhcpto1` のまま 120 s で巻き戻り)。v0.2.6 から起動時に WL_REG_ON を 500 ms 落としてコールドスタートさせ、再起動前にも `leave()` + 電源断、DHCP タイムアウトごとに再 join する ([wifi-ota.md §5.3](wifi-ota.md#53-温かい再起動と-cyw43439-の状態-v026-join-は通るのに-dhcp-が通らない)) |
 | explicit_buy が失敗 (負値) | LCD にエラー表示。bootrom は explicit_buy の冒頭でウォッチドッグを止めるので自動では戻らず、次の電源投入 (通常起動) で旧版が選ばれる |
 | 旧版より低い版数を書いた (ダウングレード) | FLASH_UPDATE で起動し、buy 時に他方先頭セクタが消える。以後は低い版が起動 |
 | パーティションテーブル破損 | ハッシュ付きなので bootrom が無効と判断 → 起動不能。復旧は BOOTSEL で再投入 |

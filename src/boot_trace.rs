@@ -73,6 +73,10 @@ pub enum Stage {
     BuyFailed = 15,
     /// 自己診断の締め切りを過ぎ、延長をやめた
     SelftestTimedOut = 16,
+    /// CYW43 の電源断 (WL_REG_ON Low を `wifi::CYW43_POWER_OFF_MS` 保持) 中 (0.2.6〜)
+    WifiPowerCycle = 17,
+    /// DHCP タイムアウト後に AP から離脱し、再 join する (0.2.6〜)。次のループで `Joining` に進む
+    DhcpRetry = 18,
     /// panic ハンドラに入った (SCRATCH7 = 行番号)
     Panic = 0xE0,
     /// HardFault に入った (SCRATCH7 = PC)
@@ -99,6 +103,8 @@ impl Stage {
             14 => Self::Bought,
             15 => Self::BuyFailed,
             16 => Self::SelftestTimedOut,
+            17 => Self::WifiPowerCycle,
+            18 => Self::DhcpRetry,
             0xE0 => Self::Panic,
             0xE1 => Self::HardFault,
             _ => return None,
@@ -124,6 +130,8 @@ impl Stage {
             Self::Bought => "bought",
             Self::BuyFailed => "buy-failed",
             Self::SelftestTimedOut => "selftest-timeout",
+            Self::WifiPowerCycle => "cyw43-pwr-cycle",
+            Self::DhcpRetry => "dhcp-rejoin",
             Self::Panic => "PANIC",
             Self::HardFault => "HARDFAULT",
         }
@@ -136,8 +144,13 @@ impl Stage {
 }
 
 /// 自己診断の進み具合 (SCRATCH7、`Stage` が PANIC / HARDFAULT 以外のとき)
+///
+/// 4 × u8 で 32 bit を使い切っている。0.2.6 の DHCP 再試行 (leave → 再 join) は `join_attempts` に
+/// 含める (再 join 回数 = `join_attempts` − `join_failures` − 1)。旧版がこの語を復号して表示するので、
+/// 配置は変えない。
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, defmt::Format)]
 pub struct SelftestCounters {
+    /// join を呼んだ回数 (失敗後の再試行と、DHCP タイムアウト後の再 join を含む)
     pub join_attempts: u8,
     pub join_failures: u8,
     pub dhcp_timeouts: u8,
