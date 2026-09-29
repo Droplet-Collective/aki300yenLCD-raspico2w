@@ -112,3 +112,7 @@ path = "src/bin/sd_bmp_viewer.rs"
 [[bin]]
 name = "wifi_status"
 path = "src/bin/wifi_status.rs"
+
+[[bin]]
+name = "ota_selftest"
+path = "src/bin/ota_selftest.rs"
