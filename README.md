@@ -64,13 +64,13 @@ src/
   sdcard.rs         microSD (GPIO SPI) と FAT ボリューム
   ota/app.rs        OTA + TBYB + 接続管理の実行部 (ticker / wifi_ota 共用)
   ticker/           ticker の部品 (暦、ticker.txt、Open-Meteo、SNTP、時計の数字)
-  font/misaki.rs    美咲フォント (8×8 日本語) の検索と描画
+  font/shinonome.rs 東雲フォント (14 ドット日本語) の検索と描画
   bin/              下記の実行ファイル
 partition/          A/B パーティションテーブル (pico2w-ab.json → pico2w-ab.uf2)
 scripts/            make-ota-image.sh (ELF → .bin/.uf2/.sha256)、make-manifest.sh、make-partition-table.sh
-fonts/misaki/       美咲フォントのビットマップテーブルとライセンス
+fonts/shinonome/    東雲フォント (14 ドット) のビットマップテーブルとライセンス (Public Domain)
 ticker/message.txt  ticker が流す文字 (main を書き換えれば 5 分以内に反映)
-tools/              misaki2bin.py (BDF → テーブル)、ticker-tests (ホストでのユニットテスト)
+tools/              bdf2bin.py (BDF → フォントテーブル)、ticker-tests (ホストでのユニットテスト)
 .github/workflows/  build.yml (全 bin をビルド、v* タグで Release)、release.yml (workflow_dispatch で Release)
 docs/               設計・手順・実機で得た知見 (下記リンク)
 ```
@@ -79,7 +79,7 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 
 | bin | 内容 |
 |---|---|
-| `ticker` | **Release の OTA イメージ (v0.3.0〜)**。NTP 時計 + Open-Meteo 天気 + `ticker/message.txt` の流れる文字 (美咲フォント) + OTA。設定は SD の `TICKER.TXT` ([ticker.md](docs/ticker.md))。Release 用は `--features tbyb` |
+| `ticker` | **Release の OTA イメージ (v0.3.0〜)**。NTP 時計 + Open-Meteo 天気 + `ticker/message.txt` の流れる文字 (東雲フォント 14 ドット) + OTA。設定は SD の `TICKER.TXT` ([ticker.md](docs/ticker.md))。Release 用は `--features tbyb` |
 | `wifi_ota` | OTA の最小構成 (v0.2.x の OTA イメージ)。`wifi_status` の表示 + GitHub Release からの自己更新。OTA / TBYB の本体は `src/ota/app.rs` で `ticker` と共用 |
 | `wifi_status` | SD の `WIFI.TXT` で Wi-Fi に接続し、周辺 AP の RSSI を LCD に表示 ([wifi-status.md](docs/wifi-status.md)) |
 | `ota_selftest` | Wi-Fi 無しで A/B・TBYB を確認する診断 bin。起動区画・版数・TBYB 状態を表示して `explicit_buy` ([ota-setup.md](docs/ota-setup.md)) |

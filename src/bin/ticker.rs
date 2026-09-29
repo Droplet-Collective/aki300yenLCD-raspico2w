@@ -1,4 +1,4 @@
-//! ネットワーク・ティッカー (v0.3.0): NTP 時計 + Open-Meteo 天気 + GitHub の `message.txt` を流す + OTA
+//! ネットワーク・ティッカー (v0.3.0〜): NTP 時計 + Open-Meteo 天気 + GitHub の `message.txt` を流す + OTA
 //!
 //! `wifi_ota` の後継として Release の OTA イメージになる bin。TBYB / 接続管理 / OTA は `ota::app`
 //! (wifi_ota と共用) で、この bin は表示と 3 つの取得 (NTP / 天気 / 流れる文字) を持つ。
@@ -16,14 +16,20 @@
 //! # 画面 (400×96、外周 1 px は枠)
 //!
 //! ```text
-//!  y  3〜30  [21:53:44] (5×7 ドット ×4)   2026/09/29 (火)            ← 日付 + 曜日 (美咲 ×2)
-//!  y 19〜34                               東京 19.1℃ 晴れ時々くもり   ← 地名 / 現在気温 / 天気
-//!  y 35〜50  最高 21.9℃  最低 19.1℃  降水確率 100%                   ← 今日の予報 (美咲 ×2)
-//!  y 51〜66  ← こんにちは、おちょこさん。ネットワーク・ティッカー 0.3.0 が …  (流れる文字、美咲 ×2)
-//!  y 66     <SSID> 192.168.1.23 | NTP ok | WX ok | MSG ok            ← 起動 60 s は起動診断 / 設定の注意
-//!  y 76     ticker v0.3.0 via OTA slot B TBYB:bought OK               ← wifi_ota の行 1 と同じ
-//!  y 86     OTA: up to date (latest 0.3.0), next check in 45s        ← wifi_ota の行 2 と同じ
+//!  y  2〜29  [21:53:44] (5×7 ドット ×4)   2026/09/29 (火)            ← 日付 + 曜日 (東雲 14 px)
+//!  y 18〜33                               東京 19.1℃ 晴れ時々くもり   ← 地名 / 現在気温 / 天気
+//!  y 34〜49  最高 21.9℃  最低 19.1℃  降水確率 100%                   ← 今日の予報 (東雲 14 px)
+//!  y 50     ───────────── 区切り (暗灰) ─────────────
+//!  y 51〜66  ← こんにちは、おちょこさん。ネットワーク・ティッカー 0.3.1 が …  (流れる文字、東雲 14 px)
+//!  y 67     ───────────── 区切り (暗灰) ─────────────
+//!  y 68     <SSID> 192.168.1.23 | NTP ok | WX ok | MSG ok            ← 起動 60 s は起動診断 / 設定の注意
+//!  y 77     ticker v0.3.1 via OTA slot B TBYB:bought OK               ← wifi_ota の行 1 と同じ
+//!  y 86     OTA: up to date (latest 0.3.1), next check in 45s        ← wifi_ota の行 2 と同じ
 //! ```
+//!
+//! 日本語 (東雲 14 px) は 16 px の帯の中に上下 1 px の余白 (`JP_PAD`) を置いて描く。流れる文字の帯の
+//! 区切り線 (y 50 / 67) と文字 (y 52〜65)、区切り線と状態行 1 (文字は y 69〜) の間はそれぞれ 1 px 空く。
+//! 状態行 3 本は `FONT_6X10` を 9 px ピッチ (大文字は行 1〜7、下に伸びる字は行 8〜9 で、次の行の行 0 は空)。
 //!
 //! TBYB の自己診断 (buy 条件) は wifi_ota と同じ「LCD 走査中 + join + DHCP」だけ。NTP / 天気 / 文字の
 //! 取得の成否は buy に関係しない (それらは buy が済むまで始めない)。
@@ -55,7 +61,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
 use heapless::String;
 use pico2w_300yen_lcd::boot_trace::{self, Stage};
-use pico2w_300yen_lcd::font::misaki;
+use pico2w_300yen_lcd::font::shinonome;
 use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, TBYB};
 use pico2w_300yen_lcd::lcd::display::{BACK_HEIGHT, BACK_WIDTH, BackBuffer, Display, DisplayPins, FrameIrqHandler};
 use pico2w_300yen_lcd::lcd::framebuffer::{BLACK, rgb666};
@@ -289,20 +295,20 @@ const PENDING_COLOR: u32 = rgb666(32, 32, 32);
 
 /// レイアウト (y)。docs/ticker.md の図と合わせる
 const CLOCK_X: i32 = 6;
-const CLOCK_Y: i32 = 3;
+const CLOCK_Y: i32 = 2;
 const CLOCK_SCALE: i32 = 4;
 const RIGHT_X: i32 = 196;
-const DATE_Y: i32 = 3;
-const NOW_Y: i32 = 19;
-const FORECAST_Y: i32 = 35;
+const DATE_Y: i32 = 2;
+const NOW_Y: i32 = 18;
+const FORECAST_Y: i32 = 34;
 const MESSAGE_Y: i32 = 51;
 const MESSAGE_H: i32 = 16;
-const STATUS1_Y: i32 = 66;
-const STATUS2_Y: i32 = 76;
+const STATUS1_Y: i32 = 68;
+const STATUS2_Y: i32 = 77;
 const STATUS3_Y: i32 = 86;
 const TEXT_X: i32 = 2;
-/// 美咲フォントの倍率 (16×16)
-const JP_SCALE: u32 = 2;
+/// 日本語 (東雲 14 px) を 16 px の帯に置くときの上の余白 (px)。下にも 1 px 残る
+const JP_PAD: i32 = (MESSAGE_H - shinonome::HEIGHT as i32) / 2;
 
 fn tone_color(tone: Tone) -> Rgb666 {
     match tone {
@@ -328,9 +334,9 @@ fn fill_rect(frame: &mut BackBuffer, x: i32, y: i32, w: u32, h: u32, color: Rgb6
         .unwrap();
 }
 
-/// 美咲フォント (×2) で描き、次の x を返す
+/// 東雲フォント (14 px、等倍) で 16 px の帯 `y` に描き、次の x を返す
 fn draw_jp(frame: &mut BackBuffer, text: &str, x: i32, y: i32, color: u32) -> i32 {
-    misaki::draw_text(text, x, y, JP_SCALE, BACK_WIDTH as i32 - 1, |px, py| {
+    shinonome::draw_text(text, x, y + JP_PAD, BACK_WIDTH as i32 - 1, |px, py| {
         if px >= 1 && py >= 1 {
             frame.set_pixel(px as usize, py as usize, color);
         }
@@ -421,7 +427,7 @@ fn draw_screen(frame: &mut BackBuffer, m: &Shared, scroll_x: i32) {
         }
     }
 
-    // --- 流れる文字 (16 px の帯。上下に 1 px の区切り) ---
+    // --- 流れる文字 (16 px の帯。上下に 1 px の区切り。文字は帯の中央 14 px で区切りとは 1 px 空く) ---
     fill_rect(frame, 1, MESSAGE_Y - 1, BACK_WIDTH as u32 - 2, 1, DIM);
     fill_rect(frame, 1, MESSAGE_Y + MESSAGE_H, BACK_WIDTH as u32 - 2, 1, DIM);
     if !m.message.is_empty() {
@@ -448,12 +454,12 @@ fn draw_screen(frame: &mut BackBuffer, m: &Shared, scroll_x: i32) {
     let rest_x = TEXT_X + m.ident_head.len() as i32 * FONT_6X10.character_size.width as i32;
     draw_text(frame, &m.ident_rest, rest_x, STATUS2_Y, tone_color(m.ident_tone));
 
-    // --- 状態行 3: OTA (wifi_ota の行 2 と同じ)。ダウンロード中は行の上に進捗バー ---
+    // --- 状態行 3: OTA (wifi_ota の行 2 と同じ)。ダウンロード中は行の上 (行 0、文字は無い) に 1 px の進捗バー ---
     if let Some((done, total)) = m.progress {
         let width = (BACK_WIDTH as i32 - 2 * TEXT_X) as u32;
         let filled = if total > 0 { (done as u64 * width as u64 / total as u64) as u32 } else { 0 };
-        fill_rect(frame, TEXT_X, STATUS3_Y - 2, width, 2, DIM);
-        fill_rect(frame, TEXT_X, STATUS3_Y - 2, filled, 2, YELLOW);
+        fill_rect(frame, TEXT_X, STATUS3_Y, width, 1, DIM);
+        fill_rect(frame, TEXT_X, STATUS3_Y, filled, 1, YELLOW);
     }
     draw_text(frame, &m.ota, TEXT_X, STATUS3_Y, tone_color(m.ota_tone));
 }
@@ -469,7 +475,7 @@ async fn render_task(mut display: Display) {
             let m = cell.borrow();
             if m.message_gen != message_gen {
                 message_gen = m.message_gen;
-                message_width = misaki::text_width(&m.message, JP_SCALE) as i32;
+                message_width = shinonome::text_width(&m.message) as i32;
                 scroll_x = BACK_WIDTH as i32;
             }
             draw_screen(display.back(), &m, scroll_x);
