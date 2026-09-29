@@ -142,8 +142,9 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
                0x1C000000 + オフセット (§2.2 XIP_NOCACHE_NOALLOC_NOTRANSLATE) で行う
                (0x10000000 窓は自区画しか見えない)
 [5] 再起動     reboot(FLASH_UPDATE | NO_RETURN, 100 ms, 0x10000000 + 対象区画オフセット, 0)
-[6] 新版起動   TBYB 付きなので bootrom がウォッチドッグ下で起動。自己診断 OK →
-               explicit_buy → 確定。NG / ハング → 16.7 s で旧版に戻る
+[6] 新版起動   TBYB 付きなので bootrom がウォッチドッグ (16.7 s) 下で起動。buy 待ちの間は
+               2 s ごとに WATCHDOG.LOAD を再ロードして延長。自己診断 OK → explicit_buy → 確定。
+               起動 120 s までに NG → 延長をやめて旧版に戻る。ハング → 16.7 s で旧版に戻る
 ```
 
 補足
@@ -157,8 +158,12 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
 - [3] の先頭セクタは受信前に消去して無効化し、[4] の検証が全て通ってから最後に書く。
 - 対象区画に manifest と同じ SHA-256 のイメージが既にあれば「前回 TBYB で buy されずに
   戻ってきた」と判断してダウンロードせず、10 分後に FLASH_UPDATE 起動を再試行する。
-- 自己診断 [6] は「LCD 走査中 (起動 2 s 以上) + Wi-Fi join + DHCP で IP 取得」。ウォッチドッグは
-  16.7 s なので manifest 取得まで待つ余裕はない (join + DHCP で 5〜10 s 使う)。
+- 自己診断 [6] は「LCD 走査中 (起動 2 s 以上) + Wi-Fi join + DHCP で IP 取得」。bootrom の
+  ウォッチドッグは 16.7 s (24 bit × 1 µs、ハードウェア上限) で join + DHCP に足りないことが
+  実機で分かった (v0.2.2) ので、buy 待ちの間は `WATCHDOG.LOAD = 0xFFFFFF` を 2 s ごとに書いて
+  延長する (§5.1.17 が認める方法。`CTRL` / `SCRATCH` は触らない)。起動 120 s を締め切りとし、
+  それまでに通らなければ延長をやめて旧版へ戻す。詳細は
+  [wifi-ota.md §5.1](wifi-ota.md#51-自己診断とウォッチドッグ)。
 - フラッシュ操作中 (セクタ消去 数十〜数百 ms) は XIP が止まり、DMA からの XIP 読み出しは
   バスフォールトになる。LCD は §4.1 の条件 (DMA の読み出し元が全て SRAM) を満たしているので
   乱れない。cyw43 側は PIO SPI の DMA が停止中に完了しても割り込みが遅れるだけで、
@@ -174,9 +179,9 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
 |---|---|
 | ダウンロード中に切断・電源断 | 対象区画のみ不完全。起動側は無傷。次回また試す |
 | SHA-256 不一致 | FLASH_UPDATE 再起動しない。対象区画の先頭セクタを消しておく |
-| 新版が起動しない / ハング / パニック | bootrom のウォッチドッグ (16.7 s) で旧版へ。新版は TBYB のまま残り通常起動では選ばれない |
-| 新版は起きるが Wi-Fi 等の自己診断 NG | explicit_buy を呼ばない → 同上 |
-| explicit_buy が失敗 (負値) | LCD にエラー表示。ウォッチドッグで旧版へ |
+| 新版が起動しない / ハング / パニック | bootrom のウォッチドッグ (16.7 s) で旧版へ。新版は TBYB のまま残り通常起動では選ばれない (延長タスクも止まるので、延長中のハングでも同じ) |
+| 新版は起きるが Wi-Fi 等の自己診断 NG | 起動 120 s まではウォッチドッグを延長して待つ。それでも通らなければ延長をやめ、explicit_buy も呼ばない → 最長 16.7 s 後に同上 |
+| explicit_buy が失敗 (負値) | LCD にエラー表示。bootrom は explicit_buy の冒頭でウォッチドッグを止めるので自動では戻らず、次の電源投入 (通常起動) で旧版が選ばれる |
 | 旧版より低い版数を書いた (ダウングレード) | FLASH_UPDATE で起動し、buy 時に他方先頭セクタが消える。以後は低い版が起動 |
 | パーティションテーブル破損 | ハッシュ付きなので bootrom が無効と判断 → 起動不能。復旧は BOOTSEL で再投入 |
 
@@ -235,5 +240,7 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
 - ~~explicit_buy 中に LCD の DMA/PIO が乱れないか~~ → 原因 (§4.1) を修正し v0.1.4/v0.1.5 で乱れないことを確認済。
 - ~~embedded-tls の証明書検証 (webpki) が GitHub の証明書チェーン (ECDSA/RSA) で使えるか~~ → 使えない (§9)。
 - cyw43 ドライバがフラッシュ消去中の割り込み遅延に耐えるか (第 2 段階の実機試験で確認)。
-- 第 2 段階の HTTPS 取得・書き込み・検証・FLASH_UPDATE・自己診断の一連の流れ全体
-  ([wifi-ota.md §8](wifi-ota.md#8-未確認事項-実機))。
+- ~~第 2 段階の HTTPS 取得・書き込み・検証・FLASH_UPDATE・自己診断の一連の流れ全体~~ →
+  0.2.1 → 0.2.2 で HTTPS 取得・書き込み・検証・FLASH_UPDATE 起動まで実機確認済。自己診断は
+  DHCP 待ちで 16.7 s を超えて巻き戻ったため、v0.2.3 でウォッチドッグの延長を追加
+  ([wifi-ota.md §5.1](wifi-ota.md#51-自己診断とウォッチドッグ)、§8)。
