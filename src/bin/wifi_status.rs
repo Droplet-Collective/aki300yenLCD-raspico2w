@@ -4,7 +4,7 @@
 //! - SD (GPIO SPI: CS=GP26, CMD=GP27, CLK=GP28, DAT0=GP0) のルートにある
 //!   `WIFI.TXT` (1 行目 SSID、2 行目パスワード) を読む。
 //! - CYW43439 (PWR=GP23, CS=GP25, DIO=GP24, CLK=GP29) を PIO1 SM0 + DMA CH4 で
-//!   駆動し、embassy-net の DHCP で IP を取得する。
+//!   駆動し、embassy-net の DHCP で IP を取得する (立ち上げは `wifi::start`、`wifi_ota` と共用)。
 //! - LCD は `lcd::display` (PIO0 SM0/SM1 + DMA CH0-CH3 の自走リング、ダブルバッファ) で走査。
 //! - 約 10 秒ごとにパッシブスキャンし、RSSI 上位 8 件を SSID 付きで描画する。
 //! - picotool 用 USB reset interface を公開し、`picotool load -f` で書き換えられる。
@@ -13,13 +13,9 @@
 #![no_main]
 
 use core::fmt::Write as _;
-use cyw43::{JoinAuth, JoinOptions, PowerManagementMode, ScanOptions};
-use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
+use cyw43::{PowerManagementMode, ScanOptions};
 use embassy_executor::Spawner;
-use embassy_net::StackResources;
 use embassy_rp::bind_interrupts;
-use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::*;
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
@@ -31,14 +27,13 @@ use embedded_graphics::pixelcolor::Rgb666;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
-use embedded_sdmmc::{Mode, VolumeIdx};
 use heapless::{String, Vec};
 use pico2w_300yen_lcd::lcd::display::{BackBuffer, Display, DisplayPins, FrameIrqHandler};
 use pico2w_300yen_lcd::lcd::framebuffer::BLACK;
 use pico2w_300yen_lcd::lcd::timing::H_ACTIVE;
-use pico2w_300yen_lcd::sdcard::{SdVolumeManager, init_sd, volume_error};
+use pico2w_300yen_lcd::sdcard::init_sd;
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
-use static_cell::StaticCell;
+use pico2w_300yen_lcd::wifi::{self, ApEntry, Cyw43Pins, MAX_SCAN_APS, ascii_label, merge_ap, read_credentials};
 use {defmt_rtt as _, panic_probe as _};
 
 // RP2350 bootrom 用 IMAGE_DEF (版数付き) と picotool 用 binary_info を埋め込む
@@ -50,26 +45,6 @@ bind_interrupts!(struct Irqs {
     DMA_IRQ_1 => FrameIrqHandler;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
-
-// ============================================================
-// CYW43439 ファームウェア (Infineon Permissive Binary License)
-// ============================================================
-
-static CYW43_FW: &[u8] = include_bytes!("../../firmware/cyw43/43439A0.bin");
-static CYW43_CLM: &[u8] = include_bytes!("../../firmware/cyw43/43439A0_clm.bin");
-
-type Cyw43Spi = PioSpi<'static, PIO1, 0, DMA_CH4>;
-type Cyw43Runner = cyw43::Runner<'static, Output<'static>, Cyw43Spi>;
-
-#[embassy_executor::task]
-async fn cyw43_task(runner: Cyw43Runner) -> ! {
-    runner.run().await
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
-    runner.run().await
-}
 
 #[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, UsbDriver<'static, USB>>) -> ! {
@@ -84,124 +59,11 @@ async fn usb_task(mut device: UsbDevice<'static, UsbDriver<'static, USB>>) -> ! 
 const SCAN_PERIOD_SECS: u64 = 10;
 /// 表示する AP 数 (上位 RSSI)
 const MAX_DISPLAY_APS: usize = 8;
-/// スキャン結果の保持上限 (SSID ごとに集約)
-const MAX_SCAN_APS: usize = 32;
 /// DHCP 待ち時間
 const DHCP_TIMEOUT: Duration = Duration::from_secs(20);
 /// join 失敗時の初回リトライ間隔と上限
 const JOIN_RETRY_MIN: Duration = Duration::from_secs(5);
 const JOIN_RETRY_MAX: Duration = Duration::from_secs(60);
-
-// ============================================================
-// wifi.txt の読み込み
-// ============================================================
-
-struct WifiCredentials {
-    ssid: String<32>,
-    /// 空文字列ならオープンネットワークとして接続する
-    password: String<64>,
-}
-
-fn read_credentials(volume_mgr: &SdVolumeManager) -> Result<WifiCredentials, &'static str> {
-    let volume = volume_mgr.open_volume(VolumeIdx(0)).map_err(volume_error)?;
-    let root = volume.open_root_dir().map_err(|_| "ROOT DIR ERROR")?;
-    let file = root
-        .open_file_in_dir("WIFI.TXT", Mode::ReadOnly)
-        .map_err(|_| "wifi.txt not found")?;
-    let mut buf = [0u8; 256];
-    let mut len = 0;
-    while len < buf.len() {
-        let count = file
-            .read(&mut buf[len..])
-            .map_err(|_| "wifi.txt read error")?;
-        if count == 0 {
-            break;
-        }
-        len += count;
-    }
-    parse_credentials(&buf[..len])
-}
-
-/// 1 行目 SSID、2 行目パスワード。CR/LF のみ除去し、空行は読み飛ばす。
-fn parse_credentials(bytes: &[u8]) -> Result<WifiCredentials, &'static str> {
-    let text = core::str::from_utf8(bytes).map_err(|_| "wifi.txt: not UTF-8")?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut lines = text.lines().filter(|line| !line.is_empty());
-    let ssid = lines.next().ok_or("wifi.txt: SSID missing")?;
-    let password = lines.next().unwrap_or("");
-    if ssid.len() > 32 {
-        return Err("wifi.txt: SSID too long");
-    }
-    if !password.is_empty() && !(8..=63).contains(&password.len()) {
-        return Err("wifi.txt: password 8-63 chars");
-    }
-    let mut credentials = WifiCredentials {
-        ssid: String::new(),
-        password: String::new(),
-    };
-    credentials
-        .ssid
-        .push_str(ssid)
-        .map_err(|_| "wifi.txt: SSID too long")?;
-    credentials
-        .password
-        .push_str(password)
-        .map_err(|_| "wifi.txt: password too long")?;
-    Ok(credentials)
-}
-
-// ============================================================
-// スキャン結果
-// ============================================================
-
-#[derive(Clone, Copy)]
-struct ApEntry {
-    ssid: [u8; 32],
-    ssid_len: u8,
-    rssi: i16,
-    channel: u8,
-}
-
-impl ApEntry {
-    fn ssid(&self) -> &[u8] {
-        &self.ssid[..usize::from(self.ssid_len).min(32)]
-    }
-}
-
-/// SSID ごとに最大 RSSI を保持しつつ結果を集約する
-fn merge_ap(aps: &mut Vec<ApEntry, MAX_SCAN_APS>, bss: &cyw43::BssInfo) {
-    let ssid_len = usize::from(bss.ssid_len).min(32);
-    if ssid_len == 0 {
-        return; // ステルス AP は表示しない
-    }
-    let ssid = &bss.ssid[..ssid_len];
-    if let Some(existing) = aps.iter_mut().find(|ap| ap.ssid() == ssid) {
-        if bss.rssi > existing.rssi {
-            existing.rssi = bss.rssi;
-            existing.channel = (bss.chanspec & 0xff) as u8;
-        }
-        return;
-    }
-    let entry = ApEntry {
-        ssid: bss.ssid,
-        ssid_len: ssid_len as u8,
-        rssi: bss.rssi,
-        channel: (bss.chanspec & 0xff) as u8,
-    };
-    if aps.push(entry).is_err() {
-        // 満杯なら最も弱い AP を置き換える
-        let weakest = aps
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, ap)| ap.rssi)
-            .map(|(index, ap)| (index, ap.rssi));
-        if let Some((index, weakest_rssi)) = weakest
-            && bss.rssi > weakest_rssi
-        {
-            aps[index] = entry;
-        }
-    }
-}
 
 // ============================================================
 // 描画
@@ -216,22 +78,6 @@ const BAR_WIDTH: i32 = 186;
 const RSSI_X: i32 = 326; // "-100dBm ch11" = 12 文字 = 72px → 398px
 const RSSI_MIN: i32 = -100;
 const RSSI_MAX: i32 = -30;
-
-/// 表示不能なバイトは '?' に置き換えて ASCII に丸める
-fn ascii_label<const N: usize>(bytes: &[u8]) -> String<N> {
-    let mut label = String::new();
-    for &byte in bytes.iter().take(N) {
-        let ch = if (0x20..=0x7e).contains(&byte) {
-            byte as char
-        } else {
-            '?'
-        };
-        if label.push(ch).is_err() {
-            break;
-        }
-    }
-    label
-}
 
 fn rssi_color(rssi: i16) -> Rgb666 {
     if rssi >= -60 {
@@ -391,43 +237,25 @@ async fn main(spawner: Spawner) {
     let usb = build_usb_device(UsbDriver::new(p.USB, Irqs), "Wi-Fi Status");
     spawner.spawn(usb_task(usb)).unwrap();
 
-    // --- CYW43439 (PIO1 SM0 + DMA CH4; LCD の PIO0 / DMA CH0-3 とは独立) ---
-    let pwr = Output::new(p.PIN_23, Level::Low);
-    let cs = Output::new(p.PIN_25, Level::High);
-    let mut pio1 = Pio::new(p.PIO1, Irqs);
-    let spi: Cyw43Spi = PioSpi::new(
-        &mut pio1.common,
-        pio1.sm0,
-        DEFAULT_CLOCK_DIVIDER,
-        pio1.irq0,
-        cs,
-        p.PIN_24,
-        p.PIN_29,
-        p.DMA_CH4,
-    );
-
-    static STATE: StaticCell<cyw43::State> = StaticCell::new();
-    let state = STATE.init(cyw43::State::new());
-    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, CYW43_FW).await;
-    spawner.spawn(cyw43_task(runner)).unwrap();
-
-    control.init(CYW43_CLM).await;
-    control
-        .set_power_management(PowerManagementMode::PowerSave)
-        .await;
-    let mac = control.address().await;
-    defmt::info!("CYW43 MAC: {:02x}", mac);
-
-    // --- embassy-net (DHCP) ---
-    let seed = RoscRng.next_u64();
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
-    let (stack, net_runner) = embassy_net::new(
-        net_device,
-        embassy_net::Config::dhcpv4(Default::default()),
-        RESOURCES.init(StackResources::new()),
-        seed,
-    );
-    spawner.spawn(net_task(net_runner)).unwrap();
+    // --- CYW43439 (PIO1 SM0 + DMA CH4; LCD の PIO0 / DMA CH0-3 とは独立) + embassy-net (DHCP) ---
+    let pio1 = Pio::new(p.PIO1, Irqs);
+    let wifi::Network {
+        stack,
+        mut control,
+        ..
+    } = wifi::start(
+        &spawner,
+        pio1,
+        Cyw43Pins {
+            pwr: p.PIN_23,
+            cs: p.PIN_25,
+            dio: p.PIN_24,
+            clk: p.PIN_29,
+            dma: p.DMA_CH4,
+        },
+        PowerManagementMode::PowerSave,
+    )
+    .await;
 
     let mut link = match &credentials {
         Ok(_) => Link::Disconnected {
@@ -475,14 +303,7 @@ async fn main(spawner: Spawner) {
             draw_screen(display.back(), &status, &aps, None);
             display.present().await;
 
-            let options = if creds.password.is_empty() {
-                JoinOptions::new_open()
-            } else {
-                let mut options = JoinOptions::new(creds.password.as_bytes());
-                options.auth = JoinAuth::Wpa2;
-                options
-            };
-            match control.join(creds.ssid.as_str(), options).await {
+            match control.join(creds.ssid.as_str(), creds.join_options()).await {
                 Ok(()) => {
                     defmt::info!("joined {}", creds.ssid.as_str());
                     status.clear();
