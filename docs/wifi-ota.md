@@ -86,11 +86,15 @@ scripts/make-manifest.sh out/wifi_ota.bin 0.2.1 out/manifest.json
 
 ```
 MyWiFi 192.168.1.23 -52dBm  scan #12                                       ← 行 0: wifi_status と同じ
-wifi_ota v0.2.0  slot A (P0 app-a)  tbyb-build:yes  TBYB: bought OK        ← 行 1: 自分の版数 / 区画 / TBYB
+wifi_ota v0.2.1 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: bought OK ← 行 1: 自分の版数 / 区画 / TBYB
 OTA: 0.2.0 -> 0.2.1 downloading 45%  196608/435200 B                       ← 行 2: OTA の状態
 [====================                          ]                           ← 進捗バー (ダウンロード中のみ)
  SSID / RSSI 棒グラフ (上位 5 件)
 ```
+
+行 1 の `via OTA` は、今動いているイメージが `reboot(FLASH_UPDATE)` で起動されたとき
+(= OTA で書き込んだ側の区画から起動したとき) だけ版数の隣に出る (BOOT_INFO の boot_type)。
+USB で入れた版では出ないので、OTA 更新が実際に反映されたかを版数と合わせて一目で確認できる。
 
 行 1 の TBYB 表示 (ota_selftest と同じ色分け):
 
@@ -176,3 +180,10 @@ manifest 自体が同じ経路で来る以上、改竄対策にはならない�
   picotool `-x` と同じ形式。ストレージオフセットそのままの可能性が残る)。
 - スタック使用量 (43.6 kB の余裕で足りるか)。
 - 「巻き戻し」検出と 10 分後の再試行が意図どおり動くか。
+
+## 9. リリース履歴
+
+| 版 | 内容 |
+|---|---|
+| 0.2.0 | 初版 (wifi_ota の OTA 機能、release.yml) |
+| 0.2.1 | OTA 更新テスト用。FLASH_UPDATE 起動時に行 1 の版数の隣へ `via OTA` を表示 |
