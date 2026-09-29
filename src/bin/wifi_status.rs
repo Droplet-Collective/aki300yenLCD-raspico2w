@@ -254,6 +254,7 @@ async fn main(spawner: Spawner) {
             dma: p.DMA_CH4,
         },
         PowerManagementMode::PowerSave,
+        || {},
     )
     .await;
 

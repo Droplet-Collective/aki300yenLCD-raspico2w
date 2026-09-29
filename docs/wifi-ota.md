@@ -139,7 +139,8 @@ USB で入れた版では出ないので、OTA 更新が実際に反映された
 | ダウンロード途中で切断・電源断 | 対象区画は先頭セクタを消した状態 (無効)。起動側は無傷。次回また最初から |
 | 受信サイズ / SHA-256 / 読み戻しの不一致 | 対象区画の先頭セクタを消して終了。再起動しない。バックオフ後に再試行 |
 | 新版が起動しない / ハング (ウォッチドッグを延長するタスクまで届かない) | 16.7 s のウォッチドッグで旧版へ。旧版は manifest と対象区画の内容が一致することから「巻き戻された」と判断し、最初にそう判定してから 10 分後に FLASH_UPDATE 起動を再試行 (その後も 10 分ごと)。**v0.2.3 までは 60 s ごとの確認のたびに 10 分後へ延びるバグがあり、再試行は一度も起きなかった** (v0.2.4 で修正) |
-| 新版は起きるが Wi-Fi + DHCP が 120 s 以内に通らない | 延長をやめ、最長 16.7 s 後にウォッチドッグで旧版へ (§5.1)。以後は上と同じ |
+| 新版は起きるが Wi-Fi + DHCP が 120 s 以内に通らない | 延長をやめ、最長 16.7 s 後にウォッチドッグで旧版へ (§5.1)。以後は上と同じ。v0.2.6 からは DHCP が 20 s で通らないたびに AP から離脱して再 join する (§5.3) |
+| join は通るが DHCP が一度も通らない (温かい再起動で CYW43439 が接続中の状態を引き継いだ) | v0.2.5 の実機で発生。v0.2.6 から起動時に WL_REG_ON を 500 ms 落としてコールドスタートさせ、再起動前にも電源を切る (§5.3) |
 | explicit_buy 失敗 | LCD に表示。bootrom が explicit_buy の冒頭でウォッチドッグを止めるので、電源を入れ直すまで新版 (未確定) のまま動く。次の通常起動では旧版が選ばれる |
 | 電源断が「書き込み完了〜再起動」の間に起きた | 対象区画は有効な TBYB イメージ。通常起動では選ばれないが、次回起動時の確認で「巻き戻された」扱いになり 10 分後に FLASH_UPDATE 起動する |
 
@@ -176,8 +177,9 @@ v0.2.2 までの `wifi_ota` はこのウォッチドッグに一切触れず、1
 巻き戻ると新版の画面は消えるので、buy 待ちの新版は進行を `WATCHDOG.SCRATCH5〜7` に書き続ける
 (`src/boot_trace.rs`)。SCRATCH5 = 版 (識別用 magic 付き)、SCRATCH6 = 稼働時間 (0.1 s 単位) + 段階、
 SCRATCH7 = 付加情報 (join 回数 / join 失敗 / DHCP タイムアウト / 直近 join status、PANIC なら行番号、
-HARDFAULT なら PC)。段階は `main → wdt-feed → sd-read → lcd → cyw43-init → cyw43-ready → joining →
-(join-failed) → joined → dhcp-wait → (dhcp-timeout) → network-up → buy-called → bought / buy-failed`、
+HARDFAULT なら PC)。段階は `main → wdt-feed → sd-read → lcd → cyw43-pwr-cycle (0.2.6〜) → cyw43-init →
+cyw43-ready → joining → (join-failed) → joined → dhcp-wait → (dhcp-timeout → dhcp-rejoin (0.2.6〜) → joining …)
+→ network-up → buy-called → bought / buy-failed`、
 締め切り超過は `selftest-timeout`。延長タスクが 2 s ごとに稼働時間を更新する。`wifi_ota` は panic-probe の
 代わりに自前の panic / HardFault ハンドラを持ち、これらも記録してから止まる (止まり方は panic-probe と同じ)。
 
@@ -204,6 +206,34 @@ SCRATCH4 を 0 にするだけ。SCRATCH と `WATCHDOG.REASON` はチップレ�
 - 記録行 `selftest-timeout @120.0s` → 新版は動いたが Wi-Fi + DHCP が通らなかった。`join`/`fail`/`dhcpto`/`st` で内訳。
 - 記録行が `PANIC` / `HARDFAULT` → 新版のバグ。行番号 / PC で場所を特定できる。
 - 記録行の段階が途中で稼働時間が 16.7 s 未満 → 延長が始まる前に発火した (起動が 16.7 s 以上かかった)。
+
+### 5.3 温かい再起動と CYW43439 の状態 (v0.2.6): join は通るのに DHCP が通らない
+
+v0.2.5 の TBYB 起動 (0.2.4 からの FLASH_UPDATE) を §5.2 の記録で読むと
+`TBYB 0.2.5: selftest-timeout @120.1s join1 fail0 dhcpto1` / `NORMAL P1 A:000D imgdef B:506D launched reset:wdt`
+だった。つまり新版は起動し、ウォッチドッグの延長も 120 s まで効き、Wi-Fi の join は 1 回で成功したのに、
+DHCP は 20 s のタイムアウトが 1 回記録されたあと 120 s まで IP を取れず、締め切りで巻き戻った。
+同じイメージを電源投入や BOOTSEL から起動すると数秒で IP が取れるので、コードではなく起動経路の違いが原因と見る。
+
+- `reboot(FLASH_UPDATE)` は RP2350 だけをリセットする。CYW43439 は直前まで通電・AP に接続・DHCP 済みの
+  まま次の版に引き継がれる。cyw43 0.6 の `Bus::init` は WL_REG_ON (GP23) を **20 ms** 落として上げ、250 ms
+  待ってから WLAN / SOCSRAM コアをリセットしてファームウェアを転送するが、接続中だったチップに対しては
+  この電源断が短く、association はできるのにデータ経路 (DHCP のブロードキャスト) が通らない状態になり得る。
+- v0.2.5 までの接続管理は DHCP タイムアウト後も `Joined` のまま DHCP クライアントに任せ、リンクが落ちない
+  限り再 join しなかった (`join1 dhcpto1` のまま 120 s)。
+
+v0.2.6 の対策 (`src/wifi.rs` / `src/bin/wifi_ota.rs`):
+
+1. 起動時、cyw43 にピンを渡す前に WL_REG_ON を `CYW43_POWER_OFF_MS` = **500 ms** Low に保つ (`wifi::start`)。
+   起動経路にかかわらず毎回コールドスタートになる。LCD 行 0 には `Wi-Fi: power cycle (500 ms) + init...`、
+   §5.2 の記録には段階 `cyw43-pwr-cycle` が出る。`wifi_status` も同じ経路を通る。
+2. FLASH_UPDATE 再起動 (検証後・巻き戻り後の再試行の両方) の直前に `control.leave()` → WL_REG_ON Low →
+   100 ms → `reboot()` (`wifi::power_off_for_reboot`)。GP23 の `Output` は cyw43 の `Bus` が持っているので
+   `PIN_23::steal()` で作り直して Low に駆動し、drop で駆動が外れないよう `forget` する (Bus は init 後に
+   このピンへ触らない)。LCD 行 0 には `rebooting into slot B (P1)... wifi off`。
+3. DHCP が 20 s で通らなければ `leave()` して 0.5 s 後に再 join する (段階 `dhcp-timeout → dhcp-rejoin → joining`)。
+   記録の `join` は再 join も数えるので、`join3 fail0 dhcpto2` なら DHCP 再試行 2 回。TBYB の締め切り (120 s)
+   判定と延長タスクはこのループの外で回り続けるので、再試行しても 120 s で必ず巻き戻る。
 
 ## 6. セキュリティ (重要)
 
@@ -266,4 +296,5 @@ manifest 自体が同じ経路で来る以上、改竄対策にはならない�
 | 0.2.2 | 自動更新の実機テスト用（版数表示の色を変更）。実機で 0.2.1 → 0.2.2 の OTA (ダウンロード・検証・FLASH_UPDATE 起動) を確認したが、DHCP 待ち中に 16.7 s のウォッチドッグが尽きて旧版へ巻き戻った |
 | 0.2.3 | TBYB の buy 待ち中に bootrom のウォッチドッグを 2 s ごとに延長し、起動 120 s を自己診断の締め切りにする (§5.1)。LCD の TBYB 表示に経過秒 / 締め切りを表示。実機では 0.2.1 → 0.2.3 の FLASH_UPDATE 後にやはり 0.2.1 に戻った (原因未特定) |
 | 0.2.4 | (1) 巻き戻り後の 10 分再試行が 60 s ごとの確認で毎回延びて起きなかったバグを修正 (§5)。(2) buy 待ちの進行を WATCHDOG.SCRATCH5〜7 に記録し、旧版が `WATCHDOG.REASON` / BOOT_INFO 診断と共に LCD に出す (§5.2)。panic / HardFault も記録。(3) LCD の各行を 66 桁に収め、`WDT` 残り秒と再試行の残り秒が読めるようにした (§4) |
-| 0.2.5 | TBYB 起動診断付きの OTA 再テスト |
+| 0.2.5 | TBYB 起動診断付きの OTA 再テスト。実機では 0.2.4 → 0.2.5 の FLASH_UPDATE 後に `selftest-timeout @120.1s join1 fail0 dhcpto1` で巻き戻った。原因: 温かい再起動で CYW43439 が接続中の状態を引き継ぎ、join は通るが DHCP が通らない + DHCP タイムアウト後に再 join しない (§5.3) |
+| 0.2.6 | (1) 起動時に WL_REG_ON を 500 ms 落として CYW43439 をコールドスタート、FLASH_UPDATE 再起動前に `leave()` + 電源断。(2) DHCP タイムアウトごとに AP から離脱して再 join。(3) 起動診断に段階 `cyw43-pwr-cycle` / `dhcp-rejoin` を追加 (§5.3) |
