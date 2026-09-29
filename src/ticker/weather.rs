@@ -64,7 +64,7 @@ impl Weather {
         })
     }
 
-    /// 天気コードの日本語 (美咲フォントにある文字だけ)
+    /// 天気コードの日本語 (東雲フォントにある文字だけ)
     pub fn condition_ja(&self) -> &'static str {
         condition_ja(self.code)
     }

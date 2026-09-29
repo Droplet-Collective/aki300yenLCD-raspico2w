@@ -1,4 +1,4 @@
-# ticker の純粋なロジック (暦計算、ticker.txt、Open-Meteo JSON、SNTP パケット、美咲フォントの検索) を
+# ticker の純粋なロジック (暦計算、ticker.txt、Open-Meteo JSON、SNTP パケット、東雲フォントの検索) を
 # ホスト (x86_64) でテストする小さなクレート。本体クレートは embassy-rp に依存し thumbv8m でしか
 # ビルドできないので、対象のソースを #[path] で直接取り込む。
 #

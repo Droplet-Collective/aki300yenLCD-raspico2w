@@ -5,7 +5,7 @@
 //! lat=35.6812
 //! lon=139.7671
 //! tz=+9            # UTC からの時差 (時間。+9 / 9 / -5.5 / +05:30 の形も可)
-//! place=東京        # 天気の行の先頭に出す地名 (UTF-8、美咲フォントにある文字)
+//! place=東京        # 天気の行の先頭に出す地名 (UTF-8、東雲フォントにある文字)
 //! message_url=https://raw.githubusercontent.com/<owner>/<repo>/main/ticker/message.txt
 //! scroll=1         # スクロール速度 (px / フレーム、1〜8)
 //! ```

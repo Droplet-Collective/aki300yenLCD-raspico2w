@@ -10,8 +10,8 @@ pub mod digits;
 pub mod sntp;
 #[path = "../../../src/ticker/weather.rs"]
 pub mod weather;
-#[path = "../../../src/font/misaki.rs"]
-pub mod misaki;
+#[path = "../../../src/font/shinonome.rs"]
+pub mod shinonome;
 
 #[cfg(test)]
 mod tests {
@@ -154,31 +154,52 @@ mod tests {
     }
 
     #[test]
-    fn misaki_lookup() {
-        assert_eq!(misaki::glyph_count(), 7171);
-        let a = misaki::glyph('A').unwrap();
-        assert_eq!(a.advance, 4);
-        assert_eq!(a.rows, [0x40, 0xA0, 0xA0, 0xE0, 0xA0, 0xA0, 0x00, 0x00]);
-        let hi = misaki::glyph('火').unwrap();
-        assert_eq!(hi.advance, 8);
-        assert_eq!(hi.rows[0], 0b0001_0000);
-        assert_eq!(hi.rows[6], 0b1100_0110);
-        assert!(misaki::glyph('あ').is_some());
-        assert!(misaki::glyph('℃').is_some());
-        assert!(misaki::glyph('\u{1F600}').is_none()); // 絵文字は無い → 代替
-        assert_eq!(misaki::fallback_glyph().advance, 8);
-        // 幅: "OTA 0.3.0" は半角 9 文字 = 36 px、"東京" は 16 px、×2 で倍
-        assert_eq!(misaki::text_width("OTA 0.3.0", 1), 36);
-        assert_eq!(misaki::text_width("東京", 2), 32);
-        // 描画: 'A' を (10, 20) に ×2 で描くと左上の点は (10..12, 20..22)
+    fn shinonome_lookup() {
+        assert_eq!(shinonome::glyph_count(), 7047);
+        // 半角 'A' (shnm7x14r): 送り幅 7、上位バイトだけ。行 2〜11 に字体、行 0・1・12・13 は空
+        let a = shinonome::glyph('A').unwrap();
+        assert_eq!(a.advance, 7);
+        assert_eq!(a.rows[0], 0);
+        assert_eq!(a.rows[2], 0b0011_0000 << 8);
+        assert_eq!(a.rows[8], 0b1000_0100 << 8);
+        assert_eq!(a.rows[13], 0);
+        // 全角 '東' (shnmk14、JIS 0x456C): 送り幅 14、行 2 が横棒、行 13 に縦棒の下端
+        let east = shinonome::glyph('東').unwrap();
+        assert_eq!(east.advance, 14);
+        assert_eq!(east.rows[0], 0b0000_0001_0000_0000);
+        assert_eq!(east.rows[2], 0b0111_1111_1111_1100);
+        assert_eq!(east.rows[13], 0b0000_0001_0000_0000);
+        for ch in ['あ', '℃', '火', '、', '。', '…', 'ｱ', '□'] {
+            assert!(shinonome::glyph(ch).is_some(), "{ch}");
+        }
+        // 半角カナは 7 px、全角は 14 px。～ (U+FF5E) と 〜 (U+301C) は同じグリフ
+        assert_eq!(shinonome::advance_of('ｱ'), 7);
+        assert_eq!(shinonome::advance_of('あ'), 14);
+        assert_eq!(shinonome::glyph('～'), shinonome::glyph('〜'));
+        assert_eq!(shinonome::glyph('－'), shinonome::glyph('−'));
+        assert!(shinonome::glyph('\u{1F600}').is_none()); // 絵文字は無い → 代替
+        assert_eq!(shinonome::fallback_glyph().advance, 14);
+        assert_eq!(shinonome::advance_of('\u{1F600}'), 14);
+        // 幅: "OTA 0.3.1" は半角 9 文字 = 63 px、"東京" は 28 px、混在は足し算
+        assert_eq!(shinonome::text_width("OTA 0.3.1"), 63);
+        assert_eq!(shinonome::text_width("東京"), 28);
+        assert_eq!(shinonome::text_width("最高 21.9℃"), 28 + 5 * 7 + 14);
+        assert_eq!(shinonome::text_width("2026/09/29 (火)"), 13 * 7 + 14);
+        // 描画: 'A' を (10, 20) に描くと最初の点は行 2 の列 2・3 → (12, 22), (13, 22)。列 0 行 0 は無い
         let mut pts = Vec::new();
-        let adv = misaki::draw_text("A", 10, 20, 2, 400, |x, y| pts.push((x, y)));
-        assert_eq!(adv, 18);
-        assert!(pts.contains(&(12, 20)) && pts.contains(&(13, 21)));
+        let adv = shinonome::draw_text("A", 10, 20, 400, |x, y| pts.push((x, y)));
+        assert_eq!(adv, 17);
+        assert!(pts.contains(&(12, 22)) && pts.contains(&(13, 22)));
         assert!(!pts.contains(&(10, 20)));
+        assert!(pts.iter().all(|&(x, y)| (10..17).contains(&x) && (20..34).contains(&y)));
+        // 全角は 14 列すべて閉じる (bit15 → 列 0、bit2 → 列 13)。半角は 7 列より右に描かない
+        let mut pts = Vec::new();
+        shinonome::draw_text("東", 0, 0, 400, |x, y| pts.push((x, y)));
+        assert!(pts.iter().all(|&(x, y)| (0..14).contains(&x) && (0..14).contains(&y)));
+        assert!(pts.contains(&(1, 2)) && pts.contains(&(13, 2)));
         // 右端クリップ
         let mut n = 0;
-        misaki::draw_text("東京", 390, 0, 2, 400, |x, _| {
+        shinonome::draw_text("東京", 390, 0, 400, |x, _| {
             assert!(x < 400);
             n += 1;
         });
