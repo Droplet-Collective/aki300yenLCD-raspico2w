@@ -72,8 +72,7 @@ use embedded_graphics::text::{Baseline, Text};
 use heapless::{String, Vec};
 use pico2w_300yen_lcd::boot_trace::{self, Stage};
 use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, TBYB};
-use pico2w_300yen_lcd::lcd::display::{BACK_HEIGHT, BACK_WIDTH, BackBuffer, Display, DisplayPins, FrameIrqHandler};
-use pico2w_300yen_lcd::lcd::framebuffer::BLACK;
+use pico2w_300yen_lcd::lcd::display::{BACK_BLACK, BACK_HEIGHT, BACK_WIDTH, BackBuffer, Display, DisplayPins, FrameIrqHandler};
 use pico2w_300yen_lcd::lcd::timing::H_ACTIVE;
 use pico2w_300yen_lcd::ota::app::{
     self, BootStatus, Link, LinkManager, LinkUi, Net, NetBuffers, OtaPhase, OtaState, OtaUi, TcpState, Tone,
@@ -270,7 +269,7 @@ fn draw_frame_border(frame: &mut BackBuffer) {
 }
 
 fn draw_screen(frame: &mut BackBuffer, model: &Model) {
-    frame.clear(BLACK);
+    frame.clear(BACK_BLACK);
     draw_frame_border(frame);
 
     // 行 0: Wi-Fi ステータス (wifi_status と同じ)

@@ -29,7 +29,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
 use heapless::{String, Vec};
 use pico2w_300yen_lcd::lcd::display::{BackBuffer, Display, DisplayPins, FrameIrqHandler};
-use pico2w_300yen_lcd::lcd::framebuffer::BLACK;
+use pico2w_300yen_lcd::lcd::display::BACK_BLACK;
 use pico2w_300yen_lcd::lcd::timing::H_ACTIVE;
 use pico2w_300yen_lcd::sdcard::init_sd;
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
@@ -106,7 +106,7 @@ fn fill_rect(frame: &mut BackBuffer, x: i32, y: i32, w: u32, h: u32, color: Rgb6
 /// 1 行目にステータス、2 行目以降に AP 一覧をバックバッファへ描く。
 /// 画面への反映は呼び出し側の `display.present().await`。
 fn draw_screen(frame: &mut BackBuffer, status: &str, aps: &[ApEntry], joined_ssid: Option<&str>) {
-    frame.clear(BLACK);
+    frame.clear(BACK_BLACK);
     let status_color = if joined_ssid.is_some() {
         Rgb666::new(0, 63, 63)
     } else {

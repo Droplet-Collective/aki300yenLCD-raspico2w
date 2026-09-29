@@ -205,6 +205,37 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Host-side UI simulator (tools/ui-sim, docs/ui-sim.md): unit tests + preview PNG/GIF of the
+  # ticker screen rendered by the same src/ui code as the firmware. Informational only: it never
+  # blocks the firmware build or a release (skipped when release.yml calls this workflow).
+  ui-preview:
+    if: inputs.version == ''
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/ui-sim
+      - name: cargo test + render previews
+        working-directory: tools/ui-sim
+        run: |
+          set -euo pipefail
+          cargo test --release
+          for s in scenarios/*.json; do
+            cargo run --release -- --scenario "$s" --out out/
+          done
+          cargo run --release -- sheet --out out/ --bg samples/SUNSET.BMP --bg samples/CLOUDS.BMP --bg samples/BOKEH.BMP
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-preview-${{ github.sha }}
+          path: tools/ui-sim/out/
+          retention-days: 14
+
   # Only for tags pushed by hand. A tag pushed by release.yml (GITHUB_TOKEN) does not start
   # this workflow at all, and release.yml attaches the assets itself.
   release:

@@ -314,3 +314,4 @@ manifest 自体が同じ経路で来る以上、改竄対策にはならない�
 | 0.2.8 | 表示位置 106 を正式版に: 目盛りを削除、ota_selftest_min も 106 に統一、実機で四辺の枠線と目盛りの 0/390 を確認 (2026-09-29) |
 | 0.3.0 | **ネットワーク・ティッカー** ([ticker.md](ticker.md))。OTA / TBYB / 接続管理を `src/ota/app.rs` に共通化し、新 bin `ticker` (NTP 時計 + Open-Meteo 天気 + GitHub の `message.txt` を流す表示、美咲フォント) を追加。Release の `manifest.json` は `ticker.bin` を指すので、0.2.8 の `wifi_ota` は OTA でそのまま `ticker` に切り替わる。`wifi_ota` の挙動は変えていない |
 | 0.3.1 | `ticker` の日本語フォントを美咲 8×8 の 2 倍表示から東雲 14 ドット (Public Domain) の等倍に変更。実機の写真で 2 px の線が LCD 上で太く潰れて見えたため、線 1 px のフォントにした ([ticker.md §5](ticker.md))。流れる文字の帯の下の区切り線が状態行 1 の文字に重なっていた配置も修正。`wifi_ota` の挙動は変えていない |
+| 0.4.0 | `ticker` に SD の写真のスライドショー背景とガラス風の新しい画面 ([ticker.md](ticker.md) §1)、PC の画面シミュレータ `tools/ui-sim` ([ui-sim.md](ui-sim.md))。LCD のバックバッファを RGB666 `u32` から RGB565 `u16` にした (垂直ブランキングのコピーで表引きして 18 bit に広げる。全 bin 共通、`wifi_ota` の RAM も 76.8 kB 空く)。OTA / TBYB の手順は変えていない |
