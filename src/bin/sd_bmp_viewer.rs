@@ -2,14 +2,14 @@
 //!
 //! SD は基板配線に合わせた GPIO SPI（CS=GP26, CMD=GP27, CLK=GP28,
 //! DAT0=GP0）。FAT ボリュームのルートにある非圧縮 24-bit BMP を読む。
-//! 10秒ごとに走査と DMA を止め、次の BMP を同じバッファへ読んで再開する。
+//! 次の BMP を表示領域だけの一時領域へ先読みし、走査を続けたまま切り替える。
 
 #![no_std]
 #![no_main]
 
 use core::convert::Infallible;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
@@ -20,7 +20,7 @@ use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection,
 };
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
-use embassy_time::{Delay, Timer};
+use embassy_time::{Delay, Duration, Instant, Timer};
 use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
 use embassy_usb::msos::{
     CompatibleIdFeatureDescriptor, PropertyData, RegistryPropertyFeatureDescriptor, windows_version,
@@ -202,12 +202,7 @@ static SM1_FRAME_DATA: [u32; VIEWER_SM1_FRAME_SIZE] = viewer_sm1_frame_data();
 
 const SLIDES: [&str; 2] = ["IMAGE.BMP", "IMAGE2.BMP"];
 const SLIDE_SECONDS: u64 = 10;
-const SCAN_STARTING: u8 = 0;
-const SCAN_RUNNING: u8 = 1;
-const SCAN_PAUSE_REQUESTED: u8 = 2;
-const SCAN_PAUSED: u8 = 3;
-const SCAN_RESUME_REQUESTED: u8 = 4;
-static SCAN_STATE: AtomicU8 = AtomicU8::new(SCAN_STARTING);
+const STAGED_PIXELS: usize = H_ACTIVE as usize * ACTIVE_HEIGHT;
 
 // CH2/CH3 が各フレーム終端で読み、CH0/CH1 の読み出し先を再設定する。
 static DMA_PIXEL_FRAME_ADDR: AtomicU32 = AtomicU32::new(0);
@@ -253,6 +248,8 @@ struct DisplayPeripherals {
 
 /// フレームバッファ (BSS 配置、ゼロ初期化)
 static mut FB_DATA: FrameBuffer = FrameBuffer::new();
+/// 次の画像の有効画素だけを保持する。同期・ポーチ用の2枚目のフレームは作らない。
+static mut STAGED_IMAGE: [u32; STAGED_PIXELS] = [BLACK; STAGED_PIXELS];
 
 // 診断目盛りでは LCD 左端に x=98..99 の緑2画素、続いて x=100..103 の水色と
 // x=104..107 の青が見えた。実機の可視開始位置に合わせ、画像を10画素左へ置く。
@@ -269,6 +266,20 @@ fn align_image_to_visible_area(frame: &mut FrameBuffer) {
         // 画面外の残りは端の色で埋め、可視位置が数画素ずれても黒帯を出さない。
         let first = frame.data[target];
         let last = frame.data[target + width - 1];
+        frame.data[row_start..target].fill(first);
+        frame.data[target + width..row_start + LINE_WIDTH].fill(last);
+    }
+}
+
+fn show_staged_image(frame: &mut FrameBuffer, staged: &[u32; STAGED_PIXELS]) {
+    let width = H_ACTIVE as usize;
+    for y in 0..ACTIVE_HEIGHT {
+        let row_start = (ACTIVE_Y_OFFSET + y) * LINE_WIDTH;
+        let target = row_start + VIEWER_VISIBLE_X;
+        let source = y * width;
+        frame.data[target..target + width].copy_from_slice(&staged[source..source + width]);
+        let first = staged[source];
+        let last = staged[source + width - 1];
         frame.data[row_start..target].fill(first);
         frame.data[target + width..row_start + LINE_WIDTH].fill(last);
     }
@@ -508,7 +519,7 @@ fn init_sd(
 }
 
 async fn load_image(
-    frame: &mut FrameBuffer,
+    staged: &mut [u32; STAGED_PIXELS],
     volume_mgr: &SdVolumeManager,
     filename: &'static str,
 ) -> Result<(u32, u32), &'static str> {
@@ -520,23 +531,7 @@ async fn load_image(
             "IMAGE.BMP" => "IMAGE.BMP MISSING",
             _ => "IMAGE2.BMP MISSING",
         })?;
-    draw_bmp(frame, &file).await
-}
-
-async fn render_slide(
-    frame: &mut FrameBuffer,
-    volume_mgr: &SdVolumeManager,
-    filename: &'static str,
-) {
-    frame.clear(BLACK);
-    match load_image(frame, volume_mgr, filename).await {
-        Ok((width, height)) => defmt::info!("{} loaded: {}x{}", filename, width, height),
-        Err(message) => {
-            defmt::error!("{}: {}", filename, message);
-            draw_error(frame, message);
-        }
-    }
-    align_image_to_visible_area(frame);
+    draw_bmp(staged, &file).await
 }
 
 fn read_exact(file: &SdFile<'_>, mut bytes: &mut [u8]) -> Result<(), &'static str> {
@@ -550,7 +545,10 @@ fn read_exact(file: &SdFile<'_>, mut bytes: &mut [u8]) -> Result<(), &'static st
     Ok(())
 }
 
-async fn draw_bmp(frame: &mut FrameBuffer, file: &SdFile<'_>) -> Result<(u32, u32), &'static str> {
+async fn draw_bmp(
+    staged: &mut [u32; STAGED_PIXELS],
+    file: &SdFile<'_>,
+) -> Result<(u32, u32), &'static str> {
     let file_len = file.length();
     if file_len < 54 {
         return Err("BAD BMP HEADER");
@@ -601,6 +599,7 @@ async fn draw_bmp(frame: &mut FrameBuffer, file: &SdFile<'_>) -> Result<(u32, u3
     let dst_x = (H_ACTIVE as usize - draw_width) / 2;
     let dst_y = (ACTIVE_HEIGHT - draw_height) / 2;
     let mut row = [0u8; 64 * 3];
+    staged.fill(BLACK);
 
     for dy in 0..draw_height {
         let source_y = src_y + dy as u32;
@@ -616,14 +615,10 @@ async fn draw_bmp(frame: &mut FrameBuffer, file: &SdFile<'_>) -> Result<(u32, u3
             let count = (draw_width - x).min(64);
             read_exact(file, &mut row[..count * 3])?;
             for (dx, bgr) in row[..count * 3].chunks_exact(3).enumerate() {
-                frame.set_pixel(
-                    dst_x + x + dx,
-                    dst_y + dy,
-                    rgb666(
-                        (bgr[2] >> 2) as u32,
-                        (bgr[1] >> 2) as u32,
-                        (bgr[0] >> 2) as u32,
-                    ),
+                staged[(dst_y + dy) * H_ACTIVE as usize + dst_x + x + dx] = rgb666(
+                    (bgr[2] >> 2) as u32,
+                    (bgr[1] >> 2) as u32,
+                    (bgr[0] >> 2) as u32,
                 );
             }
         }
@@ -868,51 +863,12 @@ async fn display_task(res: DisplayPeripherals, frame_addr: u32) {
     };
 
     start_dma();
-    SCAN_STATE.store(SCAN_RUNNING, Ordering::SeqCst);
-    loop {
-        match SCAN_STATE.load(Ordering::SeqCst) {
-            SCAN_PAUSE_REQUESTED => {
-                // 現在のフレームは最後まで送り、次フレームへの連鎖だけ止める。
-                // RP2350 では連鎖 DMA の強制 abort を避ける。
-                let dma = embassy_rp::pac::DMA;
-                let ch0 = dma.ch(0);
-                let mut pixel_ctrl = embassy_rp::pac::dma::regs::CtrlTrig(ch0.al1_ctrl().read());
-                pixel_ctrl.set_chain_to(0);
-                ch0.al1_ctrl().write_value(pixel_ctrl.0);
-                let ch1 = dma.ch(1);
-                let mut timing_ctrl = embassy_rp::pac::dma::regs::CtrlTrig(ch1.al1_ctrl().read());
-                timing_ctrl.set_chain_to(1);
-                ch1.al1_ctrl().write_value(timing_ctrl.0);
-
-                // 1フレームより長く待ち、PIO の TX FIFO も空にする。
-                Timer::after_millis(20).await;
-                for channel in 0..4 {
-                    while dma.ch(channel).ctrl_trig().read().busy() {
-                        Timer::after_millis(1).await;
-                    }
-                }
-                SCAN_STATE.store(SCAN_PAUSED, Ordering::SeqCst);
-            }
-            SCAN_RESUME_REQUESTED => {
-                // SM は FIFO 待ちで止まっている。DMA を再供給して走査を続ける。
-                start_dma();
-                SCAN_STATE.store(SCAN_RUNNING, Ordering::SeqCst);
-            }
-            _ => {}
-        }
-        Timer::after_millis(2).await;
-    }
+    core::future::pending::<()>().await;
 }
 
 // ============================================================
-// main: 10秒表示してから走査を止め、同じバッファへ次の BMP を読む
+// main: 走査中に次の BMP を先読みし、10秒ごとに表示を切り替える
 // ============================================================
-
-async fn wait_for_scan_state(expected: u8) {
-    while SCAN_STATE.load(Ordering::SeqCst) != expected {
-        Timer::after_millis(2).await;
-    }
-}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -923,7 +879,20 @@ async fn main(spawner: Spawner) {
         // Safety: この時点では DMA は未起動。
         let frame = unsafe { &mut *addr_of_mut!(FB_DATA) };
         match &volume_mgr {
-            Ok(manager) => render_slide(frame, manager, SLIDES[0]).await,
+            Ok(manager) => {
+                let staged = unsafe { &mut *addr_of_mut!(STAGED_IMAGE) };
+                match load_image(staged, manager, SLIDES[0]).await {
+                    Ok((width, height)) => {
+                        defmt::info!("{} loaded: {}x{}", SLIDES[0], width, height);
+                        show_staged_image(frame, staged);
+                    }
+                    Err(message) => {
+                        defmt::error!("{}: {}", SLIDES[0], message);
+                        draw_error(frame, message);
+                        align_image_to_visible_area(frame);
+                    }
+                }
+            }
             Err(message) => {
                 defmt::error!("BMP viewer: {}", message);
                 draw_error(frame, message);
@@ -971,21 +940,33 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_task(usb)).unwrap();
 
     if let Ok(manager) = volume_mgr {
-        wait_for_scan_state(SCAN_RUNNING).await;
+        // display_task と USB task を起動させてから次の BMP を読む。
+        Timer::after_millis(1).await;
         let mut slide = 0;
+        let mut displayed_at = Instant::now();
         loop {
-            Timer::after_secs(SLIDE_SECONDS).await;
-            SCAN_STATE.store(SCAN_PAUSE_REQUESTED, Ordering::SeqCst);
-            wait_for_scan_state(SCAN_PAUSED).await;
+            let next_slide = (slide + 1) % SLIDES.len();
+            // DMA が現在の画像を走査中に、別の有効画素領域へ先読みする。
+            let staged = unsafe { &mut *addr_of_mut!(STAGED_IMAGE) };
+            let loaded = load_image(staged, &manager, SLIDES[next_slide]).await;
+            Timer::at(displayed_at + Duration::from_secs(SLIDE_SECONDS)).await;
 
-            slide = (slide + 1) % SLIDES.len();
-            // Safety: display_task は4本の DMA を停止した後に SCAN_PAUSED を返す。
-            // 再開要求までフレームバッファは main だけが変更する。
+            // Safety: CPU 側で FB_DATA を書くのは main のみ。DMA は読み出しを
+            // 続けるため、切替の1フレームだけ新旧の行が混ざることがある。
             let frame = unsafe { &mut *addr_of_mut!(FB_DATA) };
-            render_slide(frame, &manager, SLIDES[slide]).await;
-
-            SCAN_STATE.store(SCAN_RESUME_REQUESTED, Ordering::SeqCst);
-            wait_for_scan_state(SCAN_RUNNING).await;
+            match loaded {
+                Ok((width, height)) => {
+                    defmt::info!("{} loaded: {}x{}", SLIDES[next_slide], width, height);
+                    show_staged_image(frame, staged);
+                }
+                Err(message) => {
+                    defmt::error!("{}: {}", SLIDES[next_slide], message);
+                    draw_error(frame, message);
+                    align_image_to_visible_area(frame);
+                }
+            }
+            slide = next_slide;
+            displayed_at = Instant::now();
         }
     } else {
         core::future::pending::<()>().await;
