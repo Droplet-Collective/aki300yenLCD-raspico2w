@@ -56,6 +56,12 @@ jobs:
 
   build:
     needs: check
+    # build.yml's own `release` job (v* tag pushes only; skipped here) declares
+    # `contents: write`. A called workflow may not ask for more than the caller grants,
+    # and GitHub rejects the whole run at startup ("startup_failure") if it does, so the
+    # caller job must allow write even though the build job itself only reads.
+    permissions:
+      contents: write
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ inputs.ref }}
