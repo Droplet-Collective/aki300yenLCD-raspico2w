@@ -1,0 +1,10 @@
+{
+  "layout": "glass",
+  "background": "../samples/BOKEH.BMP",
+  "weather": { "temperature": 24.8, "code": 95, "max": 27.0, "min": 22.3, "rain_pct": 90 },
+  "place": "那覇",
+  "clock": { "year": 2026, "month": 7, "day": 3, "hour": 13, "minute": 20, "second": 2 },
+  "message": "台風接近中。外出は控えてください。",
+  "status": { "expanded": false, "wx": "error", "msg": "busy" },
+  "animation": { "duration_ms": 1000 }
+}

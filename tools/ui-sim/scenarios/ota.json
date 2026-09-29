@@ -1,0 +1,16 @@
+{
+  "layout": "glass",
+  "background": "../samples/CLOUDS.BMP",
+  "weather": { "temperature": -3.5, "code": 73, "max": -1.0, "min": -6.2, "rain_pct": 80 },
+  "place": "札幌",
+  "clock": { "year": 2026, "month": 12, "day": 24, "hour": 7, "minute": 5, "second": 9 },
+  "status": {
+    "expanded": true,
+    "line1": "aterm-abff4a-g 192.168.200.130 | NTP ok s1 | WX ok | MSG ok",
+    "line1_tone": "ok",
+    "ota": "OTA: downloading 0.4.1 612/1196 KB",
+    "ota_tone": "busy",
+    "progress": [612, 1196]
+  },
+  "animation": { "duration_ms": 1000 }
+}
