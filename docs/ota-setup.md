@@ -51,6 +51,34 @@ picotool load -v -x -t elf target/thumbv8m.main-none-eabihf/release/ota_selftest
   ファームが picotool の USB reset interface を持つので `picotool load -f ...` や
   `cargo run --release --bin ota_selftest` (runner は `-u -v -x`) で書き換えられる。
 
+### 2.1 BOOTSEL ドライブへドラッグ&ドロップする場合 (RP2350-E10)
+
+`picotool load` の代わりに UF2 を `RP2350` ドライブへ D&D しても書ける。ただし
+**パーティションテーブルがある RP2350 A2 (現行の Pico 2 W) では、UF2 の先頭に
+RP2350-E10 対策の「絶対ブロック」が必要** (データシート Errata RP2350-E10)。
+A2 の bootrom は D&D された UF2 を受けるとフラッシュを初期化する前にテーブルを
+読みに行くため、テーブルがあるとダウンロードが失敗する。症状は「ドライブが閉じず、
+再起動もせず、何も書かれない」(§5.5.2 NOTE: 失敗時は何も起きなかったように見える。
+BOOTSEL のまま `picotool uf2 info` を打つと失敗理由が読める)。
+
+- `scripts/make-ota-image.sh` は `picotool uf2 convert --abs-block 0x103FFF00` で
+  このブロックを自動で付ける (CI アーティファクトの `*.uf2` も同じ)。family
+  `absolute`、block 0/2、宛先はフラッシュ最終ページ (Pico 2 W は 4 MB なので
+  0x103FFF00。picotool 既定の 0x10FFFF00 は 16 MB 用)。最終セクタ 0x3FF000 は
+  `pico2w-ab.json` のどの区画にも属さないので、unpartitioned の `absolute` 許可で
+  書ける。このブロックは 2 個中 1 個しか来ないので「完了」にならず再起動を起こさず、
+  続く `rp2350-arm-s` ブロックが family 違いで新しい転送として本来どおり
+  A/B 区画へ入る。A3 以降の bootrom はこのブロックを無視する。
+- このブロックが無い UF2 (旧 CI 出力や素の `picotool uf2 convert`) は上記の症状で
+  失敗する。手元で作り直すか、`picotool uf2 convert --abs-block 0x103FFF00` を付ける。
+- `picotool load` (`cargo run` の runner も同じ) は USB PICOBOOT 経由でこの問題の
+  影響を受けない。付いたブロックは `load` では無害。
+- パーティションテーブル `pico2w-ab.uf2` 自体は family `absolute` なので不要
+  (テーブルが無い機体に初回で入れるときは E10 の条件にも当たらない)。
+- D&D でも書き込み完了後は `picotool load -x` と同じ FLASH_UPDATE 起動になる
+  (§5.5.2「flash update boot が行われる」、§5.1.16) ので、LCD は `type FLASH_UPDATE(4)`
+  と出る。
+
 ## 3. LCD の読み方
 
 ```
