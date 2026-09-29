@@ -6,6 +6,7 @@
 #![no_std]
 
 pub mod ab_boot;
+pub mod boot_trace;
 pub mod heap;
 pub mod image_def;
 pub mod lcd;

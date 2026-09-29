@@ -39,6 +39,42 @@ pub const TBYB_FLAG_OTP_VERSION_APPLIED: u8 = 0x2;
 /// 他方パーティションの先頭セクタが消去された (版数ダウングレード時)
 pub const TBYB_FLAG_OTHER_ERASED: u8 = 0x4;
 
+// ---- boot diagnostic (BOOT_INFO の 2 ワード目、pico-sdk bootrom_constants.h) ----
+// 下位 16 bit が A (slot 0 / 診断対象パーティション)、上位 16 bit が B (slot 1 / その B 区画)。
+pub const BOOT_DIAGNOSTIC_WINDOW_SEARCHED: u16 = 0x0001;
+pub const BOOT_DIAGNOSTIC_INVALID_BLOCK_LOOP: u16 = 0x0002;
+pub const BOOT_DIAGNOSTIC_VALID_BLOCK_LOOP: u16 = 0x0004;
+pub const BOOT_DIAGNOSTIC_VALID_IMAGE_DEF: u16 = 0x0008;
+pub const BOOT_DIAGNOSTIC_HAS_PARTITION_TABLE: u16 = 0x0010;
+pub const BOOT_DIAGNOSTIC_CONSIDERED: u16 = 0x0020;
+pub const BOOT_DIAGNOSTIC_CHOSEN: u16 = 0x0040;
+pub const BOOT_DIAGNOSTIC_IMAGE_DEF_VERIFIED_OK: u16 = 0x1000;
+pub const BOOT_DIAGNOSTIC_LOAD_MAP_ENTRIES_LOADED: u16 = 0x2000;
+pub const BOOT_DIAGNOSTIC_IMAGE_LAUNCHED: u16 = 0x4000;
+pub const BOOT_DIAGNOSTIC_IMAGE_CONDITION_FAILURE: u16 = 0x8000;
+
+/// 診断ワードの片側 (16 bit) を一語 (LCD 用に 9 字以内) に要約する。bootrom がその区画をどこまで進めたかの目安。
+pub fn diagnostic_summary(half: u16) -> &'static str {
+    if half & BOOT_DIAGNOSTIC_IMAGE_LAUNCHED != 0 {
+        "launched"
+    } else if half & BOOT_DIAGNOSTIC_IMAGE_CONDITION_FAILURE != 0 {
+        // 検証は通ったが起動条件で落ちた (TBYB だが FLASH_UPDATE の対象でない、等)
+        "cond-fail"
+    } else if half & BOOT_DIAGNOSTIC_CHOSEN != 0 {
+        "chosen"
+    } else if half & BOOT_DIAGNOSTIC_CONSIDERED != 0 {
+        "consid"
+    } else if half & BOOT_DIAGNOSTIC_VALID_IMAGE_DEF != 0 {
+        "imgdef"
+    } else if half & BOOT_DIAGNOSTIC_INVALID_BLOCK_LOOP != 0 {
+        "badloop"
+    } else if half & BOOT_DIAGNOSTIC_WINDOW_SEARCHED != 0 {
+        "searched"
+    } else {
+        "-"
+    }
+}
+
 // ---- get_partition_table_info flags -------------------------------------
 pub const PT_INFO_PT_INFO: u32 = 0x0001;
 pub const PT_INFO_PARTITION_LOCATION_AND_FLAGS: u32 = 0x0010;
@@ -135,6 +171,11 @@ impl BootInfo {
     /// TBYB イメージとして起動し、まだ explicit_buy していない
     pub fn buy_pending(&self) -> bool {
         self.tbyb_and_update_info & TBYB_FLAG_BUY_PENDING != 0
+    }
+
+    /// 診断ワードの A 側 (下位 16 bit) と B 側 (上位 16 bit)
+    pub fn diagnostic_halves(&self) -> (u16, u16) {
+        ((self.boot_diagnostic & 0xffff) as u16, (self.boot_diagnostic >> 16) as u16)
     }
 
     /// 起動種別の名前 (chain フラグは除く)
