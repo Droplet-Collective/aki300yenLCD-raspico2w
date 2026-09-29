@@ -27,8 +27,8 @@
 //!   それを読み、`WATCHDOG.REASON` と BOOT_INFO の診断ワードと共に LCD の下段に出す。
 //!
 //! - 表示位置の確認用に、画面の外周 1 px に暗い灰色の枠を常に描く (四辺が写真で見えれば 400×96 全体が
-//!   表示されている)。起動から `RULER_DURATION` (5 s) の間は行 0 の代わりに x 座標の目盛り (10 px ごと、
-//!   50 px ごとにラベル) と左右端の印を出す (v0.2.7。`lcd::display::VISIBLE_X_OFFSET` の補正値を実機で確かめるため)。
+//!   表示されている。`lcd::display::VISIBLE_X_OFFSET` = 106 は v0.2.7 の目盛り表示で実機確認し、
+//!   v0.2.8 で目盛りを削除して正式版にした)。
 //!
 //! TLS は `TlsVerify::None` (証明書検証なし)。理由と影響は docs/wifi-ota.md「セキュリティ」。
 //!
@@ -360,8 +360,6 @@ struct Model {
     aps: Vec<ApEntry, MAX_SCAN_APS>,
     boot: BootStatus,
     ota: OtaState,
-    /// この時刻までは行 0 の代わりに x 座標の目盛りを出す (起動から `RULER_DURATION`)
-    ruler_until: Instant,
 }
 
 struct Ui {
@@ -411,8 +409,6 @@ const RED: Rgb666 = Rgb666::new(63, 0, 0);
 const VERSION_COLOR: Rgb666 = Rgb666::new(63, 0, 63); // マゼンタ
 /// 画面の外周 1 px の枠の色 (暗い灰色)。四辺が写真で見えれば 400×96 の全体が表示されている
 const FRAME_COLOR: Rgb666 = Rgb666::new(24, 24, 24);
-/// 起動からこの時間だけ、行 0 の代わりに x 座標の目盛りを出す (表示位置の確認用)
-const RULER_DURATION: Duration = Duration::from_secs(5);
 
 fn draw_text(frame: &mut BackBuffer, text: &str, x: i32, y: i32, color: Rgb666) {
     let style = MonoTextStyle::new(&FONT_6X10, color);
@@ -454,38 +450,13 @@ fn draw_frame_border(frame: &mut BackBuffer) {
     fill_rect(frame, BACK_WIDTH as i32 - 1, 0, 1, h, FRAME_COLOR);
 }
 
-/// 起動直後だけ行 0 に出す x 座標の目盛り: 上辺に 10 px ごとの刻み (50 px ごとに長く、ラベル付き)、
-/// 右端の刻み 390 にもラベル、左右端の中央に 8 px の印。左端の `0` と右端の `390` の両方が読めれば
-/// 横方向の表示位置は正しい。
-fn draw_ruler(frame: &mut BackBuffer) {
-    for x in (0..BACK_WIDTH as i32).step_by(10) {
-        let len = if x % 50 == 0 { 7 } else { 4 };
-        fill_rect(frame, x, 0, 1, len, WHITE);
-    }
-    for x in (0..BACK_WIDTH as i32).step_by(50) {
-        let mut label: String<4> = String::new();
-        let _ = write!(label, "{}", x);
-        draw_text(frame, &label, x + 2, STATUS_Y, YELLOW);
-    }
-    // 390 のラベルは右端に寄せる (390 から描くと画面外に出る)
-    let last_label_x = BACK_WIDTH as i32 - 1 - 3 * FONT_6X10.character_size.width as i32;
-    draw_text(frame, "390", last_label_x, STATUS_Y, YELLOW);
-    let mid_y = BACK_HEIGHT as i32 / 2;
-    fill_rect(frame, 0, mid_y, 8, 1, WHITE);
-    fill_rect(frame, BACK_WIDTH as i32 - 8, mid_y, 8, 1, WHITE);
-}
-
 fn draw_screen(frame: &mut BackBuffer, model: &Model) {
     frame.clear(BLACK);
     draw_frame_border(frame);
 
-    // 行 0: Wi-Fi ステータス (wifi_status と同じ)。起動直後は代わりに目盛り
-    if Instant::now() < model.ruler_until {
-        draw_ruler(frame);
-    } else {
-        let status_color = if model.joined_ssid.is_some() { CYAN } else { WHITE };
-        draw_text(frame, &model.status, TEXT_X, STATUS_Y, status_color);
-    }
+    // 行 0: Wi-Fi ステータス (wifi_status と同じ)
+    let status_color = if model.joined_ssid.is_some() { CYAN } else { WHITE };
+    draw_text(frame, &model.status, TEXT_X, STATUS_Y, status_color);
 
     // 行 1: 自分の版数 / 区画 / TBYB
     // 版数の部分だけ VERSION_COLOR で描く (0.2.2 から。OTA 更新の前後を色でも見分けるため)。
@@ -1067,7 +1038,6 @@ async fn main(spawner: Spawner) {
                 checks: 0,
                 rejected: None,
             },
-            ruler_until: Instant::now() + RULER_DURATION,
         },
     };
     match &credentials {
