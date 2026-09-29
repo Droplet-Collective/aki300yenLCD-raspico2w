@@ -17,7 +17,8 @@
 //! LCD (400×96, 9 行):
 //! ```text
 //! <SSID> 192.168.1.23 -52dBm  scan #12                                   ← 行 0 (wifi_status と同じ)
-//! wifi_ota v0.2.0  slot A (P0 app-a)  tbyb-build:yes  TBYB: bought OK  WDT: off
+//! wifi_ota v0.2.1 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: bought OK  WDT: off
+//!                  ^^^^^^^ FLASH_UPDATE 起動 (= OTA で届いたイメージ) のときだけ出る
 //! OTA: 0.2.0 -> 0.2.1 downloading 45%  196608/435200 B
 //! [=================                       ]                                 ← 進捗バー (ダウンロード中のみ)
 //!  SSID ... RSSI 棒グラフ (上位 5 件)
@@ -198,6 +199,13 @@ impl BootStatus {
             boot_at: Instant::now(),
         }
     }
+
+    /// 今の起動が `reboot(FLASH_UPDATE)` 由来か (= OTA で書いたイメージが動いている)
+    fn is_ota_boot(&self) -> bool {
+        self.boot
+            .as_ref()
+            .is_some_and(|b| b.boot_type & !ab_boot::BOOT_TYPE_CHAINED_FLAG == ab_boot::BOOT_TYPE_FLASH_UPDATE)
+    }
 }
 
 /// OTA の進行状態 (LCD の OTA 行に出す)
@@ -317,7 +325,13 @@ fn draw_screen(frame: &mut BackBuffer, model: &Model) {
 
     // 行 1: 自分の版数 / 区画 / TBYB
     let mut line: String<96> = String::new();
-    let _ = write!(line, "wifi_ota v{}  ", FIRMWARE_VERSION);
+    let _ = write!(line, "wifi_ota v{}", FIRMWARE_VERSION);
+    // OTA で届いたイメージ (FLASH_UPDATE 起動) だと版数の隣に印を出す。TBYB を buy した後も
+    // BOOT_INFO の boot_type は変わらないので、電源を切るまで見える。
+    if model.boot.is_ota_boot() {
+        let _ = line.push_str(" via OTA");
+    }
+    let _ = line.push_str("  ");
     match &model.boot.slots {
         Ok(slots) => {
             let _ = write!(
