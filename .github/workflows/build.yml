@@ -1,7 +1,15 @@
 # Build every [[bin]] for the Pico 2 W (RP2350) and publish ELF + UF2 + raw
 # .bin (for OTA) plus the A/B partition table UF2 as an Actions artifact named
 # firmware-<sha>. Tags v* additionally get a GitHub Release with the UF2/.bin
-# files attached.
+# files, the OTA image and manifest.json attached (docs/wifi-ota.md).
+#
+# wifi_ota is built twice on every push:
+#   * plain (no TBYB flag) together with all other bins -> out/wifi_ota-plain.{uf2,bin,sha256}
+#     for a first install over USB when Wi-Fi is not set up yet.
+#   * --features tbyb -> out/wifi_ota.{uf2,bin,sha256} + out/manifest.json. This is the image
+#     the running wifi_ota downloads from the Release (bootrom starts it under the TBYB
+#     watchdog; the firmware calls explicit_buy after its self-test).
+# On v* tags the tag must equal Cargo.toml's version, otherwise the build fails.
 name: build
 
 on:
@@ -37,6 +45,17 @@ jobs:
           components: rust-src, llvm-tools
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Check that tag vX.Y.Z matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "Cargo.toml version: $cargo_version, tag: $GITHUB_REF_NAME"
+          if [ "v$cargo_version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
 
       - name: cargo build --release
         env:
@@ -92,9 +111,27 @@ jobs:
             cp "$elf" "out/$name.elf"
             scripts/make-ota-image.sh "$elf" out
           done
+          # The plain (non-TBYB) wifi_ota is kept as wifi_ota-plain.*; wifi_ota.* below is the TBYB build.
+          if [ -f out/wifi_ota.uf2 ]; then
+            for ext in elf uf2 bin; do mv "out/wifi_ota.$ext" "out/wifi_ota-plain.$ext"; done
+            (cd out && rm -f wifi_ota.sha256 && sha256sum wifi_ota-plain.bin > wifi_ota-plain.sha256)
+          fi
           echo "$GITHUB_SHA" > out/commit.txt
           ls -l out
           test -n "$(ls out/*.uf2)"
+
+      # OTA image: wifi_ota with the TBYB flag in IMAGE_DEF + manifest.json (scripts/make-manifest.sh).
+      - name: Build wifi_ota (--features tbyb) and manifest.json
+        if: inputs.bin == '' || inputs.bin == 'wifi_ota'
+        run: |
+          set -euo pipefail
+          cargo build --release --bin wifi_ota --features tbyb
+          cp "target/$TARGET/release/wifi_ota" out/wifi_ota.elf
+          scripts/make-ota-image.sh "target/$TARGET/release/wifi_ota" out
+          picotool info -a -t elf out/wifi_ota.elf | grep -E 'version|tbyb' || true
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          scripts/make-manifest.sh out/wifi_ota.bin "$version" out/manifest.json
+          ls -l out/wifi_ota* out/manifest.json
 
       # A/B partition table (docs/ota-setup.md): installed once via BOOTSEL.
       - name: Create A/B partition table UF2
@@ -122,12 +159,16 @@ jobs:
           name: firmware-${{ github.sha }}
           path: out
 
-      - name: Create GitHub Release with UF2s and OTA .bin files
+      - name: Create GitHub Release with UF2s, OTA .bin files and manifest.json
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           ls -l out
-          gh release create "$GITHUB_REF_NAME" out/*.uf2 out/*.bin out/*.sha256 \
+          test -f out/manifest.json
+          test -f out/wifi_ota.bin
+          # wifi_ota (running on the board) fetches releases/latest/download/manifest.json and
+          # then the "bin" named in it, so both must be attached to the same Release.
+          gh release create "$GITHUB_REF_NAME" out/*.uf2 out/*.bin out/*.sha256 out/manifest.json \
             --verify-tag --generate-notes
