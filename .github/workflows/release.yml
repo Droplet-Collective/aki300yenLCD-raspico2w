@@ -107,8 +107,9 @@ jobs:
           set -euo pipefail
           ls -l out
           test -f out/manifest.json
-          test -f out/wifi_ota.bin
-          # wifi_ota (running on the board) fetches releases/latest/download/manifest.json and
-          # then the "bin" named in it, so both must be attached to the same Release.
+          test -f out/ticker.bin
+          # The firmware running on the board fetches releases/latest/download/manifest.json and
+          # then the "bin" named in it (ticker.bin since v0.3.0), so both must be attached to the
+          # same Release.
           gh release create "v$VERSION" out/*.uf2 out/*.bin out/*.sha256 out/manifest.json \
             --verify-tag --generate-notes --title "v$VERSION"

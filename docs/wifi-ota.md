@@ -3,6 +3,11 @@
 設計の全体は [ota-design.md](ota-design.md)、パーティションテーブルの導入と A/B・TBYB の
 実機確認は [ota-setup.md](ota-setup.md)。ここでは `wifi_ota` bin の使い方と挙動をまとめる。
 
+> **v0.3.0 から**: Release の OTA イメージ (`manifest.json` の `bin`) は `wifi_ota.bin` ではなく
+> [`ticker`](ticker.md) の `ticker.bin`。OTA / TBYB / 接続管理の本体は `src/ota/app.rs` に移して両 bin で
+> 共用しており、この文書の手順・LCD の文言・失敗時の挙動はそのまま `ticker` の下 2 行に当てはまる。
+> 実機は manifest の `bin` の名前をそのまま取りに行くので、0.2.8 の `wifi_ota` からも `ticker` へ更新される。
+
 ## 1. 仕組み
 
 `wifi_ota` は `wifi_status` (SD カードの `WIFI.TXT` で Wi-Fi に接続し、周辺 AP の RSSI を表示) に
@@ -307,3 +312,4 @@ manifest 自体が同じ経路で来る以上、改竄対策にはならない�
 | 0.2.6 | (1) 起動時に WL_REG_ON を 500 ms 落として CYW43439 をコールドスタート、FLASH_UPDATE 再起動前に `leave()` + 電源断。(2) DHCP タイムアウトごとに AP から離脱して再 join。(3) 起動診断に段階 `cyw43-pwr-cycle` / `dhcp-rejoin` を追加 (§5.3)。実機で 0.2.6 への OTA (ダウンロード → 検証 → FLASH_UPDATE → 自己診断 → buy) が通ることを確認 (2026-09-29) |
 | 0.2.7 | 表示位置の補正 + 確認用の枠線。実機の写真で左端の 1 文字 (6 px) が全行で欠けていたため、バックバッファをフレーム行へ置く位置 `VISIBLE_X_OFFSET` を 98 → 106 に補正 (HSYNC の取り込みがフレーム行の x=−1 に当たり、バックポーチ 107 clk 後の x=106 が最初の表示画素。`src/lcd/display.rs` のコメント)。画面の外周 1 px に暗い灰色の枠を常に描き、起動から 5 秒間は x 座標の目盛りを出す (§4)。PIO のタイミングは変更なし |
 | 0.2.8 | 表示位置 106 を正式版に: 目盛りを削除、ota_selftest_min も 106 に統一、実機で四辺の枠線と目盛りの 0/390 を確認 (2026-09-29) |
+| 0.3.0 | **ネットワーク・ティッカー** ([ticker.md](ticker.md))。OTA / TBYB / 接続管理を `src/ota/app.rs` に共通化し、新 bin `ticker` (NTP 時計 + Open-Meteo 天気 + GitHub の `message.txt` を流す表示、美咲フォント) を追加。Release の `manifest.json` は `ticker.bin` を指すので、0.2.8 の `wifi_ota` は OTA でそのまま `ticker` に切り替わる。`wifi_ota` の挙動は変えていない |

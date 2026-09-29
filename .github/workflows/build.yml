@@ -3,12 +3,13 @@
 # firmware-<sha>. Tags v* additionally get a GitHub Release with the UF2/.bin
 # files, the OTA image and manifest.json attached (docs/wifi-ota.md).
 #
-# wifi_ota is built twice on every push:
-#   * plain (no TBYB flag) together with all other bins -> out/wifi_ota-plain.{uf2,bin,sha256}
+# The OTA-capable bins (ticker, wifi_ota) are built twice on every push:
+#   * plain (no TBYB flag) together with all other bins -> out/<bin>-plain.{uf2,bin,sha256}
 #     for a first install over USB when Wi-Fi is not set up yet.
-#   * --features tbyb -> out/wifi_ota.{uf2,bin,sha256} + out/manifest.json. This is the image
-#     the running wifi_ota downloads from the Release (bootrom starts it under the TBYB
-#     watchdog; the firmware calls explicit_buy after its self-test).
+#   * --features tbyb -> out/<bin>.{uf2,bin,sha256}. out/manifest.json names ticker.bin (since
+#     v0.3.0; wifi_ota.bin up to v0.2.8): the running firmware downloads whatever "bin" the
+#     manifest names (bootrom starts it under the TBYB watchdog; the firmware calls explicit_buy
+#     after its self-test), so a board running wifi_ota 0.2.8 updates itself into ticker.
 # On v* tags the tag must equal Cargo.toml's version, otherwise the build fails.
 #
 # The build job is also a reusable workflow (workflow_call): release.yml calls it with
@@ -157,27 +158,38 @@ jobs:
             cp "$elf" "out/$name.elf"
             scripts/make-ota-image.sh "$elf" out
           done
-          # The plain (non-TBYB) wifi_ota is kept as wifi_ota-plain.*; wifi_ota.* below is the TBYB build.
-          if [ -f out/wifi_ota.uf2 ]; then
-            for ext in elf uf2 bin; do mv "out/wifi_ota.$ext" "out/wifi_ota-plain.$ext"; done
-            (cd out && rm -f wifi_ota.sha256 && sha256sum wifi_ota-plain.bin > wifi_ota-plain.sha256)
-          fi
+          # The plain (non-TBYB) ticker / wifi_ota are kept as <bin>-plain.*; <bin>.* below is the TBYB build.
+          for b in ticker wifi_ota; do
+            if [ -f "out/$b.uf2" ]; then
+              for ext in elf uf2 bin; do mv "out/$b.$ext" "out/$b-plain.$ext"; done
+              (cd out && rm -f "$b.sha256" && sha256sum "$b-plain.bin" > "$b-plain.sha256")
+            fi
+          done
           git rev-parse HEAD > out/commit.txt
           ls -l out
           test -n "$(ls out/*.uf2)"
 
-      # OTA image: wifi_ota with the TBYB flag in IMAGE_DEF + manifest.json (scripts/make-manifest.sh).
-      - name: Build wifi_ota (--features tbyb) and manifest.json
-        if: inputs.bin == '' || inputs.bin == 'wifi_ota'
+      # OTA images: ticker and wifi_ota with the TBYB flag in IMAGE_DEF. manifest.json
+      # (scripts/make-manifest.sh) names ticker.bin, which is what a running board downloads.
+      - name: Build ticker + wifi_ota (--features tbyb) and manifest.json
+        if: inputs.bin == '' || inputs.bin == 'ticker' || inputs.bin == 'wifi_ota'
+        env:
+          BIN: ${{ inputs.bin }}
         run: |
           set -euo pipefail
-          cargo build --release --bin wifi_ota --features tbyb
-          cp "target/$TARGET/release/wifi_ota" out/wifi_ota.elf
-          scripts/make-ota-image.sh "target/$TARGET/release/wifi_ota" out
-          picotool info -a -t elf out/wifi_ota.elf | grep -E 'version|tbyb' || true
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          scripts/make-manifest.sh out/wifi_ota.bin "$version" out/manifest.json
-          ls -l out/wifi_ota* out/manifest.json
+          bins="ticker wifi_ota"
+          [ -n "$BIN" ] && bins="$BIN"
+          for b in $bins; do
+            cargo build --release --bin "$b" --features tbyb
+            cp "target/$TARGET/release/$b" "out/$b.elf"
+            scripts/make-ota-image.sh "target/$TARGET/release/$b" out
+            picotool info -a -t elf "out/$b.elf" | grep -E 'version|tbyb' || true
+          done
+          if [ -f out/ticker.bin ]; then
+            version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+            scripts/make-manifest.sh out/ticker.bin "$version" out/manifest.json
+          fi
+          ls -l out/ticker* out/wifi_ota* out/manifest.json || true
 
       # A/B partition table (docs/ota-setup.md): installed once via BOOTSEL.
       - name: Create A/B partition table UF2
@@ -219,8 +231,8 @@ jobs:
           fi
           ls -l out
           test -f out/manifest.json
-          test -f out/wifi_ota.bin
-          # wifi_ota (running on the board) fetches releases/latest/download/manifest.json and
-          # then the "bin" named in it, so both must be attached to the same Release.
+          test -f out/ticker.bin
+          # The firmware running on the board fetches releases/latest/download/manifest.json and
+          # then the "bin" named in it (ticker.bin), so both must be attached to the same Release.
           gh release create "$GITHUB_REF_NAME" out/*.uf2 out/*.bin out/*.sha256 out/manifest.json \
             --verify-tag --generate-notes

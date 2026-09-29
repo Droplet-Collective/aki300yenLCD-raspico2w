@@ -1,0 +1,17 @@
+# ticker の純粋なロジック (暦計算、ticker.txt、Open-Meteo JSON、SNTP パケット、美咲フォントの検索) を
+# ホスト (x86_64) でテストする小さなクレート。本体クレートは embassy-rp に依存し thumbv8m でしか
+# ビルドできないので、対象のソースを #[path] で直接取り込む。
+#
+#   cd tools/ticker-tests && cargo test
+[package]
+name = "ticker-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+heapless = "0.8"
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde-json-core = { version = "0.6", default-features = false }
+
+[workspace]
