@@ -5,6 +5,8 @@
 
 #![no_std]
 
+pub mod ab_boot;
+pub mod image_def;
 pub mod lcd;
 pub mod pins;
 pub mod sdcard;
