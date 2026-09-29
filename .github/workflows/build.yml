@@ -1,0 +1,124 @@
+# Build every [[bin]] for the Pico 2 W (RP2350) and publish ELF + UF2 as an
+# Actions artifact named firmware-<sha>. Tags v* additionally get a GitHub
+# Release with the UF2 files attached.
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      bin:
+        description: 'Build only this [[bin]] (empty = all bins)'
+        default: sd_bmp_viewer
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET: thumbv8m.main-none-eabihf
+  PICOTOOL_RELEASE: v2.3.1-0   # raspberrypi/pico-sdk-tools tag (prebuilt binaries)
+  PICOTOOL_SRC_TAG: '2.3.1'    # raspberrypi/picotool + pico-sdk tag (source fallback)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml already pins stable + target + components;
+      # the action only pre-installs them so the first cargo call is quiet.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+          components: rust-src, llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        env:
+          BIN: ${{ inputs.bin }}
+        run: |
+          if [ -n "$BIN" ]; then
+            cargo build --release --bin "$BIN"
+          else
+            cargo build --release
+          fi
+
+      - name: Install picotool (prebuilt Linux tarball from pico-sdk-tools)
+        id: picotool_prebuilt
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libusb-1.0-0 >/dev/null
+          gh release download "$PICOTOOL_RELEASE" -R raspberrypi/pico-sdk-tools \
+            -p 'picotool-*x86_64-lin.tar.gz' -O picotool.tgz
+          mkdir -p "$RUNNER_TEMP/pt"
+          tar -xzf picotool.tgz -C "$RUNNER_TEMP/pt"
+          bin="$(find "$RUNNER_TEMP/pt" -type f -name picotool -perm -u+x | head -n 1)"
+          test -n "$bin"
+          "$bin" version
+          dirname "$bin" >> "$GITHUB_PATH"
+
+      - name: Build picotool from source (fallback)
+        if: steps.picotool_prebuilt.outcome != 'success'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake build-essential pkg-config libusb-1.0-0-dev >/dev/null
+          git clone --depth 1 --branch "$PICOTOOL_SRC_TAG" https://github.com/raspberrypi/pico-sdk "$RUNNER_TEMP/pico-sdk"
+          git clone --depth 1 --branch "$PICOTOOL_SRC_TAG" https://github.com/raspberrypi/picotool "$RUNNER_TEMP/picotool"
+          cmake -S "$RUNNER_TEMP/picotool" -B "$RUNNER_TEMP/picotool/build" \
+            -DPICO_SDK_PATH="$RUNNER_TEMP/pico-sdk" -DCMAKE_BUILD_TYPE=Release
+          make -C "$RUNNER_TEMP/picotool/build" -j"$(nproc)"
+          "$RUNNER_TEMP/picotool/build/picotool" version
+          echo "$RUNNER_TEMP/picotool/build" >> "$GITHUB_PATH"
+
+      - name: Convert ELF -> UF2 (rp2350-arm-s) and collect
+        run: |
+          set -euo pipefail
+          picotool version
+          mkdir -p out
+          for elf in "target/$TARGET/release"/*; do
+            [ -f "$elf" ] && [ -x "$elf" ] || continue   # skip deps/, build/, *.d
+            name="$(basename "$elf")"
+            case "$name" in *.*) continue ;; esac        # only extension-less executables
+            cp "$elf" "out/$name.elf"
+            picotool uf2 convert -t elf "$elf" "out/$name.uf2" --family rp2350-arm-s
+          done
+          echo "$GITHUB_SHA" > out/commit.txt
+          ls -l out
+          test -n "$(ls out/*.uf2)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: out
+
+      - name: Create GitHub Release with UF2s
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -l out
+          gh release create "$GITHUB_REF_NAME" out/*.uf2 --verify-tag --generate-notes
