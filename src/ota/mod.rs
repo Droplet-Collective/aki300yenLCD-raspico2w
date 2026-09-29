@@ -5,9 +5,10 @@
 //! - [`manifest`]: `manifest.json` の解釈と semver 比較
 //! - [`http`]: reqwless (HTTPS, TLS 1.3) でのダウンロード。GitHub の 302 リダイレクトを自前で追う
 //! - [`slot`]: 書き込み先区画の決定、セクタ消去 / ページ書き込み、SHA-256、ATRANS を通さない読み戻し
-//!
-//! bin 側 (`src/bin/wifi_ota.rs`) がこれらを組み合わせ、LCD に進捗を表示する。
+//! - [`app`]: 上の 3 つを組み合わせた実行部 (TBYB のウォッチドッグ延長と自己診断、join / DHCP の接続管理、
+//!   定期的な更新確認と書き込み、LCD 用の状態文字列)。`wifi_ota` と `ticker` が共用し、bin 側は描画だけを持つ。
 
+pub mod app;
 pub mod http;
 pub mod manifest;
 pub mod slot;

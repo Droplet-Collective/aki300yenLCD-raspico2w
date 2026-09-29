@@ -1,8 +1,11 @@
 //! `manifest.json` の解釈と semver 比較
 //!
 //! ```json
-//! {"version":"0.2.0","bin":"wifi_ota.bin","size":435200,"sha256":"<64 hex>"}
+//! {"version":"0.3.0","bin":"ticker.bin","size":1058560,"sha256":"<64 hex>"}
 //! ```
+//!
+//! `bin` は Release のアセット名で、実機はこの名前をそのまま取りに行く (v0.2.x は `wifi_ota.bin`、
+//! v0.3.0 からは `ticker.bin`。名前が変わっても古い版はそのまま新しい bin に切り替わる)。
 //!
 //! `scripts/make-manifest.sh` が生成し、CI が Release に添付する。
 
@@ -64,7 +67,7 @@ struct RawManifest<'a> {
 #[derive(Clone, Debug)]
 pub struct Manifest {
     pub version: Version,
-    /// Release アセット名 (例 `wifi_ota.bin`)
+    /// Release アセット名 (例 `ticker.bin`)
     pub bin: String<64>,
     pub size: u32,
     pub sha256: [u8; 32],
