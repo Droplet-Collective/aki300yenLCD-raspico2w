@@ -17,8 +17,8 @@
 //! LCD (400×96, 9 行):
 //! ```text
 //! <SSID> 192.168.1.23 -52dBm  scan #12                                   ← 行 0 (wifi_status と同じ)
-//! wifi_ota v0.2.1 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: bought OK  WDT: off
-//!                  ^^^^^^^ FLASH_UPDATE 起動 (= OTA で届いたイメージ) のときだけ出る
+//! wifi_ota v0.2.2 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: bought OK  WDT: off
+//! ^^^^^^^^^^^^^^^^^^^^^^^^ 版数はマゼンタ (0.2.2〜)。via OTA は FLASH_UPDATE 起動 (= OTA で届いたイメージ) のときだけ出る
 //! OTA: 0.2.0 -> 0.2.1 downloading 45%  196608/435200 B
 //! [=================                       ]                                 ← 進捗バー (ダウンロード中のみ)
 //!  SSID ... RSSI 棒グラフ (上位 5 件)
@@ -289,6 +289,8 @@ const CYAN: Rgb666 = Rgb666::new(0, 63, 63);
 const GREEN: Rgb666 = Rgb666::new(0, 63, 0);
 const YELLOW: Rgb666 = Rgb666::new(63, 63, 0);
 const RED: Rgb666 = Rgb666::new(63, 0, 0);
+/// 行 1 の版数 (`wifi_ota vX.Y.Z [via OTA]`) の色。0.2.1 以前は TBYB の状態色と同じだった。
+const VERSION_COLOR: Rgb666 = Rgb666::new(63, 0, 63); // マゼンタ
 
 fn draw_text(frame: &mut BackBuffer, text: &str, x: i32, y: i32, color: Rgb666) {
     let style = MonoTextStyle::new(&FONT_6X10, color);
@@ -326,13 +328,18 @@ fn draw_screen(frame: &mut BackBuffer, model: &Model) {
     draw_text(frame, &model.status, TEXT_X, STATUS_Y, status_color);
 
     // 行 1: 自分の版数 / 区画 / TBYB
-    let mut line: String<96> = String::new();
-    let _ = write!(line, "wifi_ota v{}", FIRMWARE_VERSION);
+    // 版数の部分だけ VERSION_COLOR で描く (0.2.2 から。OTA 更新の前後を色でも見分けるため)。
+    let mut head: String<32> = String::new();
+    let _ = write!(head, "wifi_ota v{}", FIRMWARE_VERSION);
     // OTA で届いたイメージ (FLASH_UPDATE 起動) だと版数の隣に印を出す。TBYB を buy した後も
     // BOOT_INFO の boot_type は変わらないので、電源を切るまで見える。
     if model.boot.is_ota_boot() {
-        let _ = line.push_str(" via OTA");
+        let _ = head.push_str(" via OTA");
     }
+    draw_text(frame, &head, TEXT_X, OTA_ID_Y, VERSION_COLOR);
+    // 残り (区画 / TBYB) は版数の右に続けて TBYB の状態色で描く。head は ASCII のみなので 6px/文字。
+    let rest_x = TEXT_X + head.len() as i32 * FONT_6X10.character_size.width as i32;
+    let mut line: String<96> = String::new();
     let _ = line.push_str("  ");
     match &model.boot.slots {
         Ok(slots) => {
@@ -370,7 +377,7 @@ fn draw_screen(frame: &mut BackBuffer, model: &Model) {
     if let Some(t) = watchdog_remaining_tenths() {
         let _ = write!(line, "  WDT {}.{}s", t / 10, t % 10);
     }
-    draw_text(frame, &line, TEXT_X, OTA_ID_Y, tbyb_color);
+    draw_text(frame, &line, rest_x, OTA_ID_Y, tbyb_color);
 
     // 行 2: OTA の状態
     line.clear();
