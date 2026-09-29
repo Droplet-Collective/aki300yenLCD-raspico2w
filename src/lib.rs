@@ -7,3 +7,5 @@
 
 pub mod lcd;
 pub mod pins;
+pub mod sdcard;
+pub mod usb_reset;
