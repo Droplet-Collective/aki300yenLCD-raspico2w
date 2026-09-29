@@ -1,6 +1,7 @@
-# Build every [[bin]] for the Pico 2 W (RP2350) and publish ELF + UF2 as an
-# Actions artifact named firmware-<sha>. Tags v* additionally get a GitHub
-# Release with the UF2 files attached.
+# Build every [[bin]] for the Pico 2 W (RP2350) and publish ELF + UF2 + raw
+# .bin (for OTA) plus the A/B partition table UF2 as an Actions artifact named
+# firmware-<sha>. Tags v* additionally get a GitHub Release with the UF2/.bin
+# files attached.
 name: build
 
 on:
@@ -79,7 +80,7 @@ jobs:
           "$RUNNER_TEMP/picotool/build/picotool" version
           echo "$RUNNER_TEMP/picotool/build" >> "$GITHUB_PATH"
 
-      - name: Convert ELF -> UF2 (rp2350-arm-s) and collect
+      - name: Convert ELF -> UF2 / .bin (scripts/make-ota-image.sh) and collect
         run: |
           set -euo pipefail
           picotool version
@@ -89,11 +90,18 @@ jobs:
             name="$(basename "$elf")"
             case "$name" in *.*) continue ;; esac        # only extension-less executables
             cp "$elf" "out/$name.elf"
-            picotool uf2 convert -t elf "$elf" "out/$name.uf2" --family rp2350-arm-s
+            scripts/make-ota-image.sh "$elf" out
           done
           echo "$GITHUB_SHA" > out/commit.txt
           ls -l out
           test -n "$(ls out/*.uf2)"
+
+      # A/B partition table (docs/ota-setup.md): installed once via BOOTSEL.
+      - name: Create A/B partition table UF2
+        run: |
+          set -euo pipefail
+          scripts/make-partition-table.sh out/pico2w-ab.uf2
+          picotool info -t uf2 out/pico2w-ab.uf2
 
       - uses: actions/upload-artifact@v4
         with:
@@ -114,11 +122,12 @@ jobs:
           name: firmware-${{ github.sha }}
           path: out
 
-      - name: Create GitHub Release with UF2s
+      - name: Create GitHub Release with UF2s and OTA .bin files
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           ls -l out
-          gh release create "$GITHUB_REF_NAME" out/*.uf2 --verify-tag --generate-notes
+          gh release create "$GITHUB_REF_NAME" out/*.uf2 out/*.bin out/*.sha256 \
+            --verify-tag --generate-notes
