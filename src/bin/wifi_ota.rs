@@ -14,17 +14,26 @@
 //!   ウォッチドッグで旧版に戻る。`explicit_buy` は bootrom 側が最初にウォッチドッグを止める。
 //! - 失敗 (DNS/TLS/HTTP/フラッシュ/ハッシュ) は LCD に表示し、60 s → 最大 10 min のバックオフで再試行。
 //!   検証を通らないイメージで再起動することはない。
+//! - 対象区画に manifest と同じイメージが既にある (= 前回 TBYB 起動で buy されず巻き戻った) ときは
+//!   `Rejected` とし、最初にそう判定した時刻 + `REJECTED_RETRY_DELAY` に FLASH_UPDATE 起動を再試行する。
+//!   60 s ごとの確認で同じ判定が続いても再試行時刻は動かさない (`OtaState::rejected`。v0.2.3 までは
+//!   確認ごとに 10 分後へ延びて永遠に再試行しなかった)。
+//! - 巻き戻りの原因が分かるように、buy 待ちの新版は進行段階と稼働時間を WATCHDOG.SCRATCH5〜7 に
+//!   書き続ける (`boot_trace`)。panic / HardFault も記録する。巻き戻り後に起動した旧版は起動時に
+//!   それを読み、`WATCHDOG.REASON` と BOOT_INFO の診断ワードと共に LCD の下段に出す。
 //!
 //! TLS は `TlsVerify::None` (証明書検証なし)。理由と影響は docs/wifi-ota.md「セキュリティ」。
 //!
-//! LCD (400×96, 9 行):
+//! LCD (400×96 = FONT_6X10 で 66 桁 × 9 行。各行は 66 桁に収める: 末尾の残り秒 / WDT が切れないように):
 //! ```text
 //! <SSID> 192.168.1.23 -52dBm  scan #12                                   ← 行 0 (wifi_status と同じ)
-//! wifi_ota v0.2.3 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: pending (self-test 37/120 s)  WDT 15.1s
-//! ^^^^^^^^^^^^^^^^^^^^^^^^ 版数はマゼンタ (0.2.2〜)。via OTA は FLASH_UPDATE 起動 (= OTA で届いたイメージ) のときだけ出る
+//! wifi_ota v0.2.4 via OTA slot B TBYB:pending 37/120s WDT 15.1s
+//! ^^^^^^^^^^^^^^^^^^^^^^^ 版数はマゼンタ (0.2.2〜)。via OTA は FLASH_UPDATE 起動 (= OTA で届いたイメージ) のときだけ出る
 //! OTA: 0.2.0 -> 0.2.1 downloading 45%  196608/435200 B
 //! [=================                       ]                                 ← 進捗バー (ダウンロード中のみ)
-//!  SSID ... RSSI 棒グラフ (上位 5 件)
+//!  SSID ... RSSI 棒グラフ (上位 5 件。下の診断行が出るときは 3〜4 件)
+//! TBYB 0.2.3: dhcp-wait @121.3s join3 fail2 dhcpto1              ← 前回の TBYB 起動の記録 (あるときだけ)
+//! NORMAL P0 A:4C4D launched B:000D imgdef reset:wdt              ← 起動種別 / 診断ワード / リセット理由 (ウォッチドッグ起動のとき)
 //! ```
 
 #![no_std]
@@ -56,6 +65,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
 use heapless::{String, Vec};
 use pico2w_300yen_lcd::ab_boot::{self, BootInfo};
+use pico2w_300yen_lcd::boot_trace::{self, ResetReason, SelftestCounters, Stage, Trace};
 use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, TBYB};
 use pico2w_300yen_lcd::lcd::display::{BackBuffer, Display, DisplayPins, FrameIrqHandler};
 use pico2w_300yen_lcd::lcd::framebuffer::BLACK;
@@ -70,10 +80,30 @@ use pico2w_300yen_lcd::wifi::{
     self, ApEntry, Cyw43Pins, MAX_SCAN_APS, WifiCredentials, ascii_label, merge_ap, read_credentials,
 };
 use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
-use {defmt_rtt as _, panic_probe as _};
+use defmt_rtt as _;
 
 // RP2350 bootrom 用 IMAGE_DEF (版数付き、--features tbyb で TBYB フラグ) と picotool 用 binary_info
 pico2w_300yen_lcd::firmware_image_def!();
+
+/// panic: 段階と行番号を SCRATCH に記録 → defmt に出力 → `udf` で HardFault (panic-probe と同じ止まり方)。
+/// TBYB 起動中なら延長タスクも止まるので最長 16.7 s 後にウォッチドッグで旧版へ戻り、旧版の LCD に
+/// `PANIC @12.3s line=N` が出る。通常起動では panic-probe と同様に止まったまま (LCD は最後の画面のまま)。
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    boot_trace::fault(Stage::Panic, info.location().map_or(0, |l| l.line()));
+    defmt::error!("{}", defmt::Display2Format(info));
+    cortex_m::asm::udf()
+}
+
+/// HardFault (スタック溢れ、バスフォールト、panic からの `udf` など): 段階と PC を記録して止まる。
+/// panic 経由のときは `fault` が最初の PANIC 記録を残す。
+#[cortex_m_rt::exception]
+unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    boot_trace::fault(Stage::HardFault, frame.pc());
+    loop {
+        cortex_m::asm::nop();
+    }
+}
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -211,6 +241,7 @@ async fn tbyb_watchdog_task(deadline: Instant) {
             break;
         }
         feed_watchdog();
+        boot_trace::heartbeat();
         Timer::after(TBYB_WATCHDOG_FEED_INTERVAL).await;
     }
     defmt::info!("tbyb_watchdog_task done");
@@ -238,9 +269,14 @@ struct BootStatus {
     slots: Result<Slots, OtaError>,
     buy: BuyState,
     boot_at: Instant,
+    /// 直前のリセットがウォッチドッグ由来か (FLASH_UPDATE 再起動も TBYB の巻き戻りもこれ)
+    reset_reason: ResetReason,
+    /// 前回の TBYB 起動が SCRATCH5〜7 に残した記録 (巻き戻り後の旧版で見える)
+    prev_trace: Option<Trace>,
 }
 
 impl BootStatus {
+    /// `boot_trace::arm()` より前に呼ぶ (前回の記録を読んでから上書きする)
     fn collect() -> Self {
         let boot = BootInfo::read();
         let buy = match boot {
@@ -252,7 +288,14 @@ impl BootStatus {
             slots: slot::find_slots(),
             buy,
             boot_at: Instant::now(),
+            reset_reason: ResetReason::read(),
+            prev_trace: boot_trace::read(),
         }
+    }
+
+    /// 起動診断行 (起動種別 / 診断ワード / リセット理由) を出すか。電源投入直後の通常起動では出さない
+    fn show_boot_line(&self) -> bool {
+        self.reset_reason != ResetReason::Hardware || self.prev_trace.is_some()
     }
 
     /// TBYB 自己診断の締め切り時刻
@@ -293,6 +336,10 @@ struct OtaState {
     next_check: Option<Instant>,
     backoff: Duration,
     checks: u32,
+    /// 最初に `Rejected` と判定した版とその再試行時刻。`run_ota_check` は開始時に phase を `Checking` に
+    /// するので、phase からは「前回も同じ版で Rejected だった」ことが分からない。ここに保ち、同じ版なら
+    /// 再試行時刻を動かさない。別の結果 (最新 / 新版あり / Release 無し) が出たら消す。
+    rejected: Option<(Version, Instant)>,
 }
 
 /// 画面に出す情報一式 (描画関数はこれだけを見る)
@@ -396,58 +443,52 @@ fn draw_screen(frame: &mut BackBuffer, model: &Model) {
     }
     draw_text(frame, &head, TEXT_X, OTA_ID_Y, VERSION_COLOR);
     // 残り (区画 / TBYB) は版数の右に続けて TBYB の状態色で描く。head は ASCII のみなので 6px/文字。
+    // 行全体で 66 桁 (400 px) に収める: "wifi_ota v0.2.4 via OTA" (23) + " slot B" (7) +
+    // " TBYB:timeout->rollback" (23) + " WDT 16.7s" (10) = 63。v0.2.3 までは 100 桁を超え、WDT が画面外だった。
     let rest_x = TEXT_X + head.len() as i32 * FONT_6X10.character_size.width as i32;
     let mut line: String<96> = String::new();
-    let _ = line.push_str("  ");
     match &model.boot.slots {
         Ok(slots) => {
-            let _ = write!(
-                line,
-                "slot {} (P{} {})  ",
-                slot_label(&slots.own),
-                slots.own.index,
-                slots.own.name()
-            );
+            let _ = write!(line, " slot {}", slot_label(&slots.own));
         }
         Err(e) => {
-            let _ = write!(line, "slot ? ({})  ", e.label());
+            let _ = write!(line, " slot ?({})", e.label());
         }
     }
-    let _ = write!(line, "tbyb-build:{}  ", if TBYB { "yes" } else { "no" });
+    // TBYB フラグ無しのビルド (USB で入れる wifi_ota-plain) だけ印を出す。OTA で届くイメージは常に TBYB 付き
+    if !TBYB {
+        let _ = line.push_str(" plain");
+    }
     let tbyb_color = match model.boot.buy {
         BuyState::NotTbyb => {
-            let _ = line.push_str("TBYB: no");
+            let _ = line.push_str(" TBYB:no");
             GRAY
         }
         BuyState::Pending => {
             // ウォッチドッグを延長しながら自己診断中。締め切りまでの経過秒を出す
             let _ = write!(
                 line,
-                "TBYB: pending (self-test {}/{} s)",
+                " TBYB:pending {}/{}s",
                 model.boot.boot_at.elapsed().as_secs().min(TBYB_SELFTEST_DEADLINE_SECS),
                 TBYB_SELFTEST_DEADLINE_SECS
             );
             YELLOW
         }
         BuyState::TimedOut => {
-            let _ = write!(
-                line,
-                "TBYB: self-test timed out ({} s), rolling back",
-                TBYB_SELFTEST_DEADLINE_SECS
-            );
+            let _ = line.push_str(" TBYB:timeout->rollback");
             RED
         }
         BuyState::Bought => {
-            let _ = line.push_str("TBYB: bought OK");
+            let _ = line.push_str(" TBYB:bought OK");
             GREEN
         }
         BuyState::Failed(rc) => {
-            let _ = write!(line, "TBYB: buy FAILED rc={}", rc);
+            let _ = write!(line, " TBYB:buy FAILED rc={}", rc);
             RED
         }
     };
     if let Some(t) = watchdog_remaining_tenths() {
-        let _ = write!(line, "  WDT {}.{}s", t / 10, t % 10);
+        let _ = write!(line, " WDT {}.{}s", t / 10, t % 10);
     }
     draw_text(frame, &line, rest_x, OTA_ID_Y, tbyb_color);
 
@@ -533,7 +574,7 @@ fn draw_screen(frame: &mut BackBuffer, model: &Model) {
                 .unwrap_or("?");
             let _ = write!(
                 line,
-                "OTA: {} already in slot {} but was rolled back; retry boot in {}s",
+                "OTA: {} in slot {} was rolled back; retry boot in {}s",
                 version,
                 slot,
                 secs_until(retry_at)
@@ -570,11 +611,80 @@ fn draw_screen(frame: &mut BackBuffer, model: &Model) {
         None => fill_rect(frame, 0, PROGRESS_Y + 1, H_ACTIVE, 1, DIM),
     }
 
-    // 行 4〜: AP 一覧
+    // 行 4〜: 上段に AP 一覧、下段に起動診断 (前回の TBYB 記録 / 起動種別)。診断行の分だけ AP を減らす
+    let mut diag_rows = 0;
+    if model.boot.show_boot_line() {
+        diag_rows += 1;
+    }
+    if model.boot.prev_trace.is_some() {
+        diag_rows += 1;
+    }
+    let ap_rows = MAX_DISPLAY_APS - diag_rows;
+    let mut next_diag_y = LIST_TOP + ap_rows as i32 * ROW_HEIGHT;
+    if let Some(trace) = &model.boot.prev_trace {
+        line.clear();
+        let _ = write!(
+            line,
+            "TBYB {}.{}.{}: {} @{}.{}s",
+            trace.major,
+            trace.minor / 100,
+            trace.minor % 100,
+            trace.stage_label(),
+            trace.uptime_ds / 10,
+            trace.uptime_ds % 10
+        );
+        let color = match trace.stage {
+            Some(Stage::Panic) => {
+                let _ = write!(line, " line={}", trace.info);
+                RED
+            }
+            Some(Stage::HardFault) => {
+                let _ = write!(line, " pc={:#010x}", trace.info);
+                RED
+            }
+            Some(Stage::BuyFailed) => {
+                let _ = write!(line, " rc={}", trace.info as i32);
+                RED
+            }
+            stage => {
+                let c = trace.counters();
+                let _ = write!(line, " join{} fail{} dhcpto{}", c.join_attempts, c.join_failures, c.dhcp_timeouts);
+                if c.last_join_status != 0 {
+                    let _ = write!(line, " st{}", c.last_join_status);
+                }
+                if stage == Some(Stage::SelftestTimedOut) { RED } else { YELLOW }
+            }
+        };
+        draw_text(frame, &line, TEXT_X, next_diag_y, color);
+        next_diag_y += ROW_HEIGHT;
+    }
+    if model.boot.show_boot_line() {
+        line.clear();
+        match &model.boot.boot {
+            Some(b) => {
+                let (a, bh) = b.diagnostic_halves();
+                let _ = write!(
+                    line,
+                    "{} P{} A:{:04X} {} B:{:04X} {}",
+                    b.boot_type_name(),
+                    b.partition,
+                    a,
+                    ab_boot::diagnostic_summary(a),
+                    bh,
+                    ab_boot::diagnostic_summary(bh)
+                );
+            }
+            None => {
+                let _ = line.push_str("boot ? (BOOT_INFO n/a)");
+            }
+        }
+        let _ = write!(line, " reset:{}", model.boot.reset_reason.label());
+        draw_text(frame, &line, TEXT_X, next_diag_y, GRAY);
+    }
     if model.aps.is_empty() {
         draw_text(frame, "(no scan results yet)", TEXT_X, LIST_TOP, GRAY);
     }
-    for (index, ap) in model.aps.iter().take(MAX_DISPLAY_APS).enumerate() {
+    for (index, ap) in model.aps.iter().take(ap_rows).enumerate() {
         let y = LIST_TOP + index as i32 * ROW_HEIGHT;
         let label: String<SSID_CHARS> = ascii_label(ap.ssid());
         let is_joined = model
@@ -811,12 +921,20 @@ async fn main(spawner: Spawner) {
         boot.boot,
         boot.slots.as_ref().map(|s| (s.own.index, s.target.index)).map_err(|e| *e)
     );
+    defmt::info!("reset reason: {:?}", boot.reset_reason);
+    if let Some(trace) = &boot.prev_trace {
+        defmt::warn!("previous TBYB boot left a trace: {:?}", trace);
+    }
     // TBYB 起動なら bootrom のウォッチドッグ (16.7 s) が既に走っている。SD / LCD / Wi-Fi の初期化が
-    // 先に来るので、まず一度再ロードし、以後は tbyb_watchdog_task に任せる。
+    // 先に来るので、まず一度再ロードし、以後は tbyb_watchdog_task に任せる。進行は boot_trace に記録する
+    // (巻き戻ったときに旧版が読む。prev_trace を読んだ後に arm する)。
     if boot.buy == BuyState::Pending {
         feed_watchdog();
+        boot_trace::arm();
+        boot_trace::stage(Stage::MainEntered);
         TBYB_FEEDING.store(true, Ordering::Relaxed);
         spawner.spawn(tbyb_watchdog_task(boot.selftest_deadline())).unwrap();
+        boot_trace::stage(Stage::FeedStarted);
         defmt::info!(
             "TBYB buy pending: extending the watchdog every {} s until self-test passes (deadline {} s)",
             TBYB_WATCHDOG_FEED_INTERVAL.as_secs(),
@@ -833,6 +951,7 @@ async fn main(spawner: Spawner) {
         Ok(c) => defmt::info!("wifi.txt: SSID={}", c.ssid.as_str()),
         Err(message) => defmt::warn!("wifi.txt: {}", message),
     }
+    boot_trace::stage(Stage::SdRead);
 
     // --- 初期画面をバックバッファに描いてから LCD 走査を開始 ---
     let display = Display::new(DisplayPins {
@@ -875,6 +994,7 @@ async fn main(spawner: Spawner) {
                 next_check: None,
                 backoff: OTA_BACKOFF_MIN,
                 checks: 0,
+                rejected: None,
             },
         },
     };
@@ -896,12 +1016,14 @@ async fn main(spawner: Spawner) {
     }
     draw_screen(ui.display.back(), &ui.model);
     ui.display.start(Irqs);
+    boot_trace::stage(Stage::DisplayStarted);
 
     // --- picotool 用 USB reset interface ---
     let usb = build_usb_device(UsbDriver::new(p.USB, Irqs), "Wi-Fi OTA");
     spawner.spawn(usb_task(usb)).unwrap();
 
     // --- CYW43439 + embassy-net (DHCP)。ダウンロード速度のため Performance ---
+    boot_trace::stage(Stage::WifiInit);
     let pio1 = Pio::new(p.PIO1, Irqs);
     let wifi::Network {
         stack,
@@ -920,6 +1042,7 @@ async fn main(spawner: Spawner) {
         PowerManagementMode::Performance,
     )
     .await;
+    boot_trace::stage(Stage::WifiReady);
 
     // --- フラッシュと HTTP クライアントの資源 ---
     let mut flash: OtaFlash = Flash::new_blocking(p.FLASH);
@@ -945,6 +1068,9 @@ async fn main(spawner: Spawner) {
     let mut next_scan = Instant::now();
     let mut scan_count: u32 = 0;
     let ota_possible = credentials.is_ok() && ui.model.boot.slots.is_ok();
+    // TBYB 自己診断の進み具合 (boot_trace の SCRATCH7 に書く。巻き戻ったとき旧版に見える)
+    let mut counters = SelftestCounters::default();
+    let mut network_was_up = false;
 
     loop {
         let now = Instant::now();
@@ -972,9 +1098,13 @@ async fn main(spawner: Spawner) {
                 ascii_label::<32>(creds.ssid.as_bytes())
             );
             ui.present().await;
+            counters.join_attempts = counters.join_attempts.saturating_add(1);
+            boot_trace::stage(Stage::Joining);
+            boot_trace::info(counters.pack());
             match control.join(creds.ssid.as_str(), creds.join_options()).await {
                 Ok(()) => {
                     defmt::info!("joined {}", creds.ssid.as_str());
+                    boot_trace::stage(Stage::Joined);
                     ui.model.status.clear();
                     let _ = write!(
                         ui.model.status,
@@ -983,8 +1113,12 @@ async fn main(spawner: Spawner) {
                     );
                     ui.model.joined_ssid = Some(creds.ssid.clone());
                     ui.present().await;
+                    boot_trace::stage(Stage::DhcpWait);
                     if with_timeout(DHCP_TIMEOUT, stack.wait_config_up()).await.is_err() {
                         defmt::warn!("DHCP timeout");
+                        counters.dhcp_timeouts = counters.dhcp_timeouts.saturating_add(1);
+                        boot_trace::stage(Stage::DhcpTimeout);
+                        boot_trace::info(counters.pack());
                     } else if ui.model.ota.next_check.is_none() {
                         ui.model.ota.next_check = Some(Instant::now() + OTA_FIRST_CHECK_DELAY);
                     }
@@ -992,6 +1126,10 @@ async fn main(spawner: Spawner) {
                 }
                 Err(error) => {
                     defmt::error!("join failed: status {}", error.status);
+                    counters.join_failures = counters.join_failures.saturating_add(1);
+                    counters.last_join_status = (error.status & 0xff) as u8;
+                    boot_trace::stage(Stage::JoinFailed);
+                    boot_trace::info(counters.pack());
                     link = Link::Disconnected {
                         next_attempt: Instant::now() + retry,
                         retry: (retry * 2).min(JOIN_RETRY_MAX),
@@ -1001,6 +1139,10 @@ async fn main(spawner: Spawner) {
             }
         }
         let network_up = matches!(link, Link::Joined) && stack.is_config_up();
+        if network_up && !network_was_up {
+            network_was_up = true;
+            boot_trace::stage(Stage::NetworkUp);
+        }
         if network_up && ui.model.ota.next_check.is_none() {
             ui.model.ota.next_check = Some(Instant::now() + OTA_FIRST_CHECK_DELAY);
         }
@@ -1011,6 +1153,7 @@ async fn main(spawner: Spawner) {
         if ui.model.boot.buy == BuyState::Pending && Instant::now() >= ui.model.boot.selftest_deadline() {
             TBYB_FEEDING.store(false, Ordering::Relaxed);
             ui.model.boot.buy = BuyState::TimedOut;
+            boot_trace::stage(Stage::SelftestTimedOut);
             defmt::warn!("TBYB self-test timed out; not buying, waiting for the watchdog to roll back");
         }
         if ui.model.boot.buy == BuyState::Pending
@@ -1022,13 +1165,17 @@ async fn main(spawner: Spawner) {
             // bootrom の explicit_buy は最初に WATCHDOG.CTRL.ENABLE を落とす (成否によらず) ので、
             // 以後の再ロードは不要。先にフラグを落としてタスクを終わらせる。
             TBYB_FEEDING.store(false, Ordering::Relaxed);
+            boot_trace::stage(Stage::BuyCalled);
             ui.model.boot.buy = match ab_boot::explicit_buy() {
                 Ok(()) => {
                     defmt::info!("explicit_buy OK (watchdog enabled: {})", WATCHDOG.ctrl().read().enable());
+                    boot_trace::stage(Stage::Bought);
                     BuyState::Bought
                 }
                 Err(rc) => {
                     defmt::error!("explicit_buy failed: {}", rc);
+                    boot_trace::stage(Stage::BuyFailed);
+                    boot_trace::info(rc as u32);
                     BuyState::Failed(rc)
                 }
             };
@@ -1049,27 +1196,32 @@ async fn main(spawner: Spawner) {
             let now = Instant::now();
             match result {
                 Ok(phase @ (OtaPhase::NoRelease | OtaPhase::UpToDate { .. })) => {
+                    ui.model.ota.rejected = None;
                     ui.model.ota.backoff = OTA_BACKOFF_MIN;
                     ui.model.ota.phase = phase;
                     ui.model.ota.next_check = Some(now + OTA_CHECK_INTERVAL);
                 }
                 Ok(OtaPhase::Rejected { version, retry_at }) => {
-                    // 同じ版の Rejected が続いているなら最初の retry_at を保つ
-                    let retry_at = match ui.model.ota.phase {
-                        OtaPhase::Rejected {
-                            version: v,
-                            retry_at: previous,
-                        } if v == version => previous,
-                        _ => retry_at,
+                    // 同じ版の Rejected が続いているなら最初の retry_at を保つ (phase は Checking になっているので
+                    // ota.rejected で判定する。v0.2.3 までは phase を見ていたため毎回 10 分後へ延び、再試行しなかった)
+                    let retry_at = match ui.model.ota.rejected {
+                        Some((v, first)) if v == version => first,
+                        _ => {
+                            defmt::warn!("{} rejected before; FLASH_UPDATE retry in {} s", version, REJECTED_RETRY_DELAY.as_secs());
+                            ui.model.ota.rejected = Some((version, retry_at));
+                            retry_at
+                        }
                     };
                     ui.model.ota.backoff = OTA_BACKOFF_MIN;
                     ui.model.ota.phase = OtaPhase::Rejected { version, retry_at };
                     ui.model.ota.next_check = Some(now + OTA_CHECK_INTERVAL);
                 }
                 Ok(phase @ OtaPhase::Rebooting { .. }) => {
+                    ui.model.ota.rejected = None;
                     ui.model.ota.phase = phase;
                 }
                 Ok(other) => {
+                    ui.model.ota.rejected = None;
                     ui.model.ota.phase = other;
                     ui.model.ota.next_check = Some(now + OTA_CHECK_INTERVAL);
                 }

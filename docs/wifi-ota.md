@@ -26,7 +26,8 @@ OTA 機能を足したもの。
 [6] reboot(FLASH_UPDATE, p0 = 対象区画) → 新版が TBYB (ウォッチドッグ 16.7 s) で起動
 [7] 新版: ウォッチドッグを 2 s ごとに延長しながら LCD 走査 + Wi-Fi join + DHCP 完了を待つ
       → explicit_buy → 確定。起動から 120 s (TBYB_SELFTEST_DEADLINE_SECS) までに通らなければ
-      延長をやめ、ウォッチドッグで旧版へ戻る (§5.1)
+      延長をやめ、ウォッチドッグで旧版へ戻る (§5.1)。進行は WATCHDOG.SCRATCH5〜7 に記録し、
+      巻き戻り後の旧版が LCD に出す (§5.2)
 ```
 
 - 更新元のリポジトリ名は `src/ota/mod.rs` の `REPO` に固定 (SD カードからは読まない)。
@@ -88,11 +89,16 @@ scripts/make-manifest.sh out/wifi_ota.bin 0.2.1 out/manifest.json
 
 ```
 MyWiFi 192.168.1.23 -52dBm  scan #12                                       ← 行 0: wifi_status と同じ
-wifi_ota v0.2.1 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: bought OK ← 行 1: 自分の版数 / 区画 / TBYB
+wifi_ota v0.2.4 via OTA slot B TBYB:bought OK                              ← 行 1: 自分の版数 / 区画 / TBYB
 OTA: 0.2.0 -> 0.2.1 downloading 45%  196608/435200 B                       ← 行 2: OTA の状態
 [====================                          ]                           ← 進捗バー (ダウンロード中のみ)
- SSID / RSSI 棒グラフ (上位 5 件)
+ SSID / RSSI 棒グラフ (上位 5 件。下の診断行が出るときは 3〜4 件)
+TBYB 0.2.3: dhcp-wait @121.3s join3 fail2 dhcpto1                          ← 前回の TBYB 起動の記録 (あるとき、§5.2)
+NORMAL P0 A:4C4D launched B:000D imgdef reset:wdt                          ← 起動種別 / 診断 / リセット理由 (ウォッチドッグ起動のとき、§5.2)
 ```
+
+各行は FONT_6X10 で 66 桁 (400 px) に収まるように書いている (v0.2.3 までの行 1 は 100 桁を超え、
+末尾の `WDT` が画面外だった。行 2 の `retry boot in NNNs` も末尾が切れていた)。
 
 行 1 の `via OTA` は、今動いているイメージが `reboot(FLASH_UPDATE)` で起動されたとき
 (= OTA で書き込んだ側の区画から起動したとき) だけ版数の隣に出る (BOOT_INFO の boot_type)。
@@ -102,11 +108,13 @@ USB で入れた版では出ないので、OTA 更新が実際に反映された
 
 | 表示 | 意味 |
 |---|---|
-| `TBYB: no` (灰) | TBYB でない通常起動 |
-| `TBYB: pending (self-test 37/120 s)  WDT 15.1s` (黄) | TBYB 起動。Wi-Fi + DHCP が通れば buy。`37/120 s` は起動からの経過秒 / 自己診断の締め切り (§5.1)。`WDT` は bootrom のウォッチドッグ残り秒で、延長中は 16.7 → 14.7 s を繰り返す |
-| `TBYB: self-test timed out (120 s), rolling back` (赤) | 締め切りまでに Wi-Fi + DHCP が通らなかった。延長をやめたので最長 16.7 s 後に旧版へ戻る |
-| `TBYB: bought OK` (緑) | explicit_buy 成功 (bootrom がウォッチドッグを止めるので `WDT` 表示も消える)。以後この版が通常起動で選ばれる |
-| `TBYB: buy FAILED rc=-N` (赤) | explicit_buy 失敗。bootrom は explicit_buy の冒頭でウォッチドッグを止めるため自動では戻らない。電源を入れ直せば旧版 (非 TBYB) が選ばれる |
+| `TBYB:no` (灰) | TBYB でない通常起動 |
+| `TBYB:pending 37/120s WDT 15.1s` (黄) | TBYB 起動。Wi-Fi + DHCP が通れば buy。`37/120s` は起動からの経過秒 / 自己診断の締め切り (§5.1)。`WDT` は bootrom のウォッチドッグ残り秒で、延長中は 16.7 → 14.7 s を繰り返す |
+| `TBYB:timeout->rollback` (赤) | 締め切り (120 s) までに Wi-Fi + DHCP が通らなかった。延長をやめたので最長 16.7 s 後に旧版へ戻る |
+| `TBYB:bought OK` (緑) | explicit_buy 成功 (bootrom がウォッチドッグを止めるので `WDT` 表示も消える)。以後この版が通常起動で選ばれる |
+| `TBYB:buy FAILED rc=-N` (赤) | explicit_buy 失敗。bootrom は explicit_buy の冒頭でウォッチドッグを止めるため自動では戻らない。電源を入れ直せば旧版 (非 TBYB) が選ばれる |
+
+版数の隣の `slot A` / `slot B` は起動中の区画。TBYB フラグ無しのビルド (`wifi_ota-plain`) では `plain` が付く。
 
 行 2 の OTA 表示:
 
@@ -120,7 +128,7 @@ USB で入れた版では出ないので、OTA 更新が実際に反映された
 | `OTA: 0.2.0 -> 0.2.1 downloading 45%  ...` (黄) | 書き込み中。進捗バー付き |
 | `OTA: 0.2.1 downloaded, verifying (sha256 + readback)...` (黄) | 先頭セクタ書き込みと読み戻し検証 |
 | `OTA: 0.2.1 verified -> reboot into slot B in 2s (TBYB)` (緑) | 直後に FLASH_UPDATE 再起動 |
-| `OTA: 0.2.1 already in slot B but was rolled back; retry boot in 590s` (赤) | 前回の TBYB 起動で buy されなかった (§5) |
+| `OTA: 0.2.1 in slot B was rolled back; retry boot in 590s` (赤) | 前回の TBYB 起動で buy されなかった (§5)。残り秒は最初にそう判定した時刻から数える (60 s ごとの確認で延びない) |
 | `OTA: TLS failed, retry in 120s` (赤) | 失敗。理由 (`DNS failed` / `network error` / `TLS failed` / `bad HTTP response` / `HTTP 5xx` / `bad manifest.json` / `bad image size` / `size mismatch` / `sha256 mismatch` / `flash readback mismatch` / `flash error` / `timeout`) とバックオフ後の再試行時刻 |
 
 ## 5. 失敗時の挙動
@@ -130,7 +138,7 @@ USB で入れた版では出ないので、OTA 更新が実際に反映された
 | DNS / TCP / TLS / HTTP エラー、タイムアウト (manifest 30 s、ダウンロード 300 s、ソケット無通信 20 s) | LCD に表示。60 s → 120 s → … → 最大 10 min のバックオフで再試行。成功したらバックオフは 60 s に戻る |
 | ダウンロード途中で切断・電源断 | 対象区画は先頭セクタを消した状態 (無効)。起動側は無傷。次回また最初から |
 | 受信サイズ / SHA-256 / 読み戻しの不一致 | 対象区画の先頭セクタを消して終了。再起動しない。バックオフ後に再試行 |
-| 新版が起動しない / ハング (ウォッチドッグを延長するタスクまで届かない) | 16.7 s のウォッチドッグで旧版へ。旧版は manifest と対象区画の内容が一致することから「巻き戻された」と判断し、10 分後に一度だけ FLASH_UPDATE 起動を再試行 (その後も同じ) |
+| 新版が起動しない / ハング (ウォッチドッグを延長するタスクまで届かない) | 16.7 s のウォッチドッグで旧版へ。旧版は manifest と対象区画の内容が一致することから「巻き戻された」と判断し、最初にそう判定してから 10 分後に FLASH_UPDATE 起動を再試行 (その後も 10 分ごと)。**v0.2.3 までは 60 s ごとの確認のたびに 10 分後へ延びるバグがあり、再試行は一度も起きなかった** (v0.2.4 で修正) |
 | 新版は起きるが Wi-Fi + DHCP が 120 s 以内に通らない | 延長をやめ、最長 16.7 s 後にウォッチドッグで旧版へ (§5.1)。以後は上と同じ |
 | explicit_buy 失敗 | LCD に表示。bootrom が explicit_buy の冒頭でウォッチドッグを止めるので、電源を入れ直すまで新版 (未確定) のまま動く。次の通常起動では旧版が選ばれる |
 | 電源断が「書き込み完了〜再起動」の間に起きた | 対象区画は有効な TBYB イメージ。通常起動では選ばれないが、次回起動時の確認で「巻き戻された」扱いになり 10 分後に FLASH_UPDATE 起動する |
@@ -162,6 +170,40 @@ v0.2.2 までの `wifi_ota` はこのウォッチドッグに一切触れず、1
   buy 後は `WDT` 表示が消える。成功・失敗にかかわらず延長タスクも終わる。
 - buy 条件そのものは v0.2.2 から変えていない。締め切りの 120 s は join の再試行 (5 → 10 → 20 s
   間隔) と DHCP (20 s タイムアウト) を数回やり直せる長さとして決めた。
+
+### 5.2 起動診断 (v0.2.4): 巻き戻りの原因を旧版の画面で読む
+
+巻き戻ると新版の画面は消えるので、buy 待ちの新版は進行を `WATCHDOG.SCRATCH5〜7` に書き続ける
+(`src/boot_trace.rs`)。SCRATCH5 = 版 (識別用 magic 付き)、SCRATCH6 = 稼働時間 (0.1 s 単位) + 段階、
+SCRATCH7 = 付加情報 (join 回数 / join 失敗 / DHCP タイムアウト / 直近 join status、PANIC なら行番号、
+HARDFAULT なら PC)。段階は `main → wdt-feed → sd-read → lcd → cyw43-init → cyw43-ready → joining →
+(join-failed) → joined → dhcp-wait → (dhcp-timeout) → network-up → buy-called → bought / buy-failed`、
+締め切り超過は `selftest-timeout`。延長タスクが 2 s ごとに稼働時間を更新する。`wifi_ota` は panic-probe の
+代わりに自前の panic / HardFault ハンドラを持ち、これらも記録してから止まる (止まり方は panic-probe と同じ)。
+
+SCRATCH5〜7 を使える根拠 (pico-bootrom-rp2350): bootrom が SCRATCH5〜7 を書くのは FLASH_UPDATE など
+NORMAL 以外の `reboot()` のときだけ (`varm_apis.c s_varm_hx_reboot`)。TBYB 起動時に仕掛けるウォッチドッグは
+NORMAL 型で SCRATCH2〜4 しか書かず、起動時の `try_vector` (`varm_boot_path.c`) も magic が合ったときに
+SCRATCH4 を 0 にするだけ。SCRATCH と `WATCHDOG.REASON` はチップレベルリセット / RUN ピンで消えるが
+(データシート §12.9.5)、bootrom のウォッチドッグは PSM リセット (`PSM_WDSEL`) なので残る。
+
+巻き戻り後に起動した旧版は起動時にこれを読み、LCD の下段 2 行に出す (AP 一覧はその分減る):
+
+| 行 | 例 | 意味 |
+|---|---|---|
+| 記録 (あるときだけ) | `TBYB 0.2.3: dhcp-wait @121.3s join3 fail2 dhcpto1` (黄) | 0.2.3 の TBYB 起動は 121.3 s 時点で DHCP 待ち、join 3 回 (失敗 2)、DHCP タイムアウト 1 回 まで進んで巻き戻った |
+| | `TBYB 0.2.3: selftest-timeout @120.0s ...` (赤) | 締め切りで自ら延長をやめた (Wi-Fi + DHCP が 120 s で通らなかった) |
+| | `TBYB 0.2.3: PANIC @12.3s line=1234` / `HARDFAULT @12.3s pc=0x1001abcd` (赤) | panic / HardFault で止まりウォッチドッグが発火した (`line` は panic 箇所の行番号、`pc` はフォルト時の PC) |
+| | 段階が途中で `@16.xs` 前後 | 延長タスクが動く前 / 延長が効かずに 16.7 s で発火した (`main`〜`lcd` で止まる等) |
+| 起動 (ウォッチドッグ経由の起動のとき) | `NORMAL P0 A:4C4D launched B:000D imgdef reset:wdt` (灰) | 起動種別 / 起動パーティション、BOOT_INFO 診断ワードの A 側・B 側 (16 進と要約: `launched` / `cond-fail` (検証は通ったが TBYB 条件などで起動せず) / `chosen` / `consid` (検証対象になった) / `imgdef` / `badloop` / `searched` / `-`)、`WATCHDOG.REASON` (`wdt` = タイマ満了。bootrom の `reboot()` も `wdt` になる、`force`、`hw` = 電源投入等) |
+
+読み方の例:
+
+- 記録行が無く、起動行が `FLASH_UPDATE P0 ... B:xxxx consid/cond-fail` → bootrom が新版を起動せず旧版を直接
+  起動した (新版は一度も走っていない)。このとき旧版の行 1 には `via OTA` が出る。
+- 記録行 `selftest-timeout @120.0s` → 新版は動いたが Wi-Fi + DHCP が通らなかった。`join`/`fail`/`dhcpto`/`st` で内訳。
+- 記録行が `PANIC` / `HARDFAULT` → 新版のバグ。行番号 / PC で場所を特定できる。
+- 記録行の段階が途中で稼働時間が 16.7 s 未満 → 延長が始まる前に発火した (起動が 16.7 s 以上かかった)。
 
 ## 6. セキュリティ (重要)
 
@@ -210,7 +252,10 @@ manifest 自体が同じ経路で来る以上、改竄対策にはならない�
 - スタック使用量 (43.6 kB の余裕で足りるか)。
 - 「巻き戻し」検出と 10 分後の再試行が意図どおり動くか。
 - ウォッチドッグの延長 (§5.1) で DHCP 待ちを越えて buy まで到達するか、120 s の締め切り後に
-  本当に旧版へ戻るか (v0.2.3 で実機確認予定)。
+  本当に旧版へ戻るか。v0.2.3 の実機では 0.2.3 が buy に至らず 0.2.1 に戻った (原因未特定。
+  0.2.1 の再試行が §5 のバグで起きず、再現観察もできなかった)。v0.2.4 は原因を §5.2 の記録で
+  切り分けるための版。
+- §5.2 の記録が実機で残るか (SCRATCH5〜7 が PSM リセットを越えて保持されることの確認)。
 
 ## 9. リリース履歴
 
@@ -219,4 +264,5 @@ manifest 自体が同じ経路で来る以上、改竄対策にはならない�
 | 0.2.0 | 初版 (wifi_ota の OTA 機能、release.yml) |
 | 0.2.1 | OTA 更新テスト用。FLASH_UPDATE 起動時に行 1 の版数の隣へ `via OTA` を表示 |
 | 0.2.2 | 自動更新の実機テスト用（版数表示の色を変更）。実機で 0.2.1 → 0.2.2 の OTA (ダウンロード・検証・FLASH_UPDATE 起動) を確認したが、DHCP 待ち中に 16.7 s のウォッチドッグが尽きて旧版へ巻き戻った |
-| 0.2.3 | TBYB の buy 待ち中に bootrom のウォッチドッグを 2 s ごとに延長し、起動 120 s を自己診断の締め切りにする (§5.1)。LCD の TBYB 表示に経過秒 / 締め切りを表示 |
+| 0.2.3 | TBYB の buy 待ち中に bootrom のウォッチドッグを 2 s ごとに延長し、起動 120 s を自己診断の締め切りにする (§5.1)。LCD の TBYB 表示に経過秒 / 締め切りを表示。実機では 0.2.1 → 0.2.3 の FLASH_UPDATE 後にやはり 0.2.1 に戻った (原因未特定) |
+| 0.2.4 | (1) 巻き戻り後の 10 分再試行が 60 s ごとの確認で毎回延びて起きなかったバグを修正 (§5)。(2) buy 待ちの進行を WATCHDOG.SCRATCH5〜7 に記録し、旧版が `WATCHDOG.REASON` / BOOT_INFO 診断と共に LCD に出す (§5.2)。panic / HardFault も記録。(3) LCD の各行を 66 桁に収め、`WDT` 残り秒と再試行の残り秒が読めるようにした (§4) |
