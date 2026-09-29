@@ -1,0 +1,9 @@
+ui-sim — ticker の画面シミュレータ (docs/ui-sim.md)
+
+  ui-sim [render] [--scenario FILE] [--out DIR] [--layout glass|dock|classic]
+                  [--bg FILE.BMP [--bg NEXT.BMP]] [--name NAME] [--no-gif]
+      NAME.png (1x), NAME@3x.png (3x nearest), NAME.gif (scroll + slide transition)
+  ui-sim sheet [--scenario FILE] [--out DIR] --bg A.BMP --bg B.BMP ... [--name NAME]
+      NAME.png: layouts (glass / dock / classic) x backgrounds, 2x. --bg gradient = built-in gradient
+  ui-sim samples [--out samples/]
+      regenerate the procedural sample BMPs

@@ -1,0 +1,24 @@
+# ticker の画面をホスト (PC) で描いて PNG / GIF にするシミュレータ。
+# 描画コードは本体の src/ui/ と src/font/ を #[path] でそのまま取り込む (実機と同じ画素になる)。
+# 本体クレート (thumbv8m) のビルドとは無関係。使い方は docs/ui-sim.md。
+#
+#   cd tools/ui-sim && cargo run --release -- --scenario scenarios/default.json --out out/
+[package]
+name = "ui-sim"
+version = "0.4.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+embedded-graphics = "0.8"
+heapless = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"
+gif = "0.13"
+serde-json-core = { version = "0.6", default-features = false }
+
+[profile.release]
+opt-level = 3
+
+[workspace]

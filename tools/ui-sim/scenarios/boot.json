@@ -1,0 +1,19 @@
+{
+  "layout": "glass",
+  "background": null,
+  "clock": null,
+  "weather": null,
+  "message": "",
+  "status": {
+    "expanded": true,
+    "line1": "boot: FLASH_UPDATE into slot B (TBYB), previous run OK",
+    "line1_tone": "muted",
+    "ident_head": "ticker v0.4.0 via OTA",
+    "ident_rest": " slot B TBYB:self-test (join+DHCP)",
+    "ident_tone": "busy",
+    "ota": "OTA: waiting for Wi-Fi",
+    "ota_tone": "muted",
+    "wifi": "busy", "ntp": "muted", "wx": "muted", "msg": "muted"
+  },
+  "animation": { "duration_ms": 1000 }
+}

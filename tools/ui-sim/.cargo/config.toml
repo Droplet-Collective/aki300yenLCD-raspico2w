@@ -1,0 +1,3 @@
+# 親 (リポジトリ直下) の .cargo/config.toml は thumbv8m 向け。このシミュレータはホスト (PC) 向けにビルドする
+[build]
+target = "host-tuple"

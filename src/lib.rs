@@ -15,5 +15,6 @@ pub mod ota;
 pub mod pins;
 pub mod sdcard;
 pub mod ticker;
+pub mod ui;
 pub mod usb_reset;
 pub mod wifi;
