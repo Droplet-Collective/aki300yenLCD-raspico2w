@@ -39,6 +39,13 @@ embedded-graphics = "0.8"
 embedded-hal = "1.0"
 embedded-sdmmc = { version = "0.10", default-features = false }
 
+# Wi-Fi (CYW43439, wifi_status で使用)
+# cyw43-pio 0.9 / cyw43 0.6 / embassy-net 0.8 が embassy-rp 0.9 と組み合わせられる世代
+cyw43 = { version = "0.6", features = ["defmt"] }
+cyw43-pio = { version = "0.9", features = ["defmt"] }
+embassy-net = { version = "0.8", features = ["defmt", "proto-ipv4", "dhcpv4", "tcp", "udp", "dns", "medium-ethernet"] }
+heapless = "0.8"
+
 [profile.dev]
 debug = 2
 opt-level = 2
@@ -91,3 +98,7 @@ path = "src/bin/layer7_single_buffer_dma.rs"
 [[bin]]
 name = "sd_bmp_viewer"
 path = "src/bin/sd_bmp_viewer.rs"
+
+[[bin]]
+name = "wifi_status"
+path = "src/bin/wifi_status.rs"
