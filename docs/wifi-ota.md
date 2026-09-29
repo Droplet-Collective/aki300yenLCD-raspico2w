@@ -56,11 +56,21 @@ Release (または CI アーティファクト `firmware-<sha>`) から次のど
 ## 3. 更新を配る (開発者側)
 
 1. `Cargo.toml` の `version` を上げる (例 `0.2.0` → `0.2.1`)。IMAGE_DEF の版数 (`0.201`) は自動で決まる。
-2. コミットして push。`git tag v0.2.1 && git push origin v0.2.1`。
-3. CI (`.github/workflows/build.yml`) がタグと `Cargo.toml` の版数が一致することを確認し、
-   `wifi_ota` を `--features tbyb` でビルドして `wifi_ota.bin` / `wifi_ota.uf2` / `wifi_ota.sha256` /
-   `manifest.json` (`scripts/make-manifest.sh`) と他 bin の UF2 を Release に添付する。
-   タグが版数と違えばビルドは失敗し、Release は作られない。
+2. コミットして main に push (PR 経由でも直接でも)。
+3. Release を作る。方法は 2 つあり、どちらも **タグ `vX.Y.Z` の X.Y.Z が `Cargo.toml` の `version` と
+   一致していなければ失敗し、Release は作られない**。
+   - (a) 手でタグを push する: `git tag v0.2.1 && git push origin v0.2.1`。
+     `.github/workflows/build.yml` の `push: tags` がビルドし、`release` ジョブが Release を作る。
+   - (b) `release` ワークフローを実行する (タグを手で打てない環境や自動化向け):
+     Actions タブ → `release` → Run workflow で `version` に `0.2.1` を入れる、または
+     `gh workflow run release.yml -f version=0.2.1` (`-f ref=<ブランチ>` で main 以外も可、既定 main)。
+     `.github/workflows/release.yml` が `Cargo.toml` の版数一致とタグ未存在を確認してから
+     build.yml のビルドジョブを呼び出し、ビルドしたコミットに注釈付きタグ `v0.2.1` を打って Release を作る。
+     GITHUB_TOKEN で push したタグは他のワークフローを起動しない (GitHub の規則) ため、
+     アセットの添付も release.yml 自身が行う。
+
+   どちらの経路でも `wifi_ota` を `--features tbyb` でビルドして `wifi_ota.bin` / `wifi_ota.uf2` /
+   `wifi_ota.sha256` / `manifest.json` (`scripts/make-manifest.sh`) と他 bin の UF2 を Release に添付する。
 4. 実機は 60 秒以内に manifest を見に行き、新しければダウンロード → 検証 → 再起動 → 自己診断 → 確定。
    400 kB 台のイメージで、LAN 内なら 1〜2 分で完了する見込み (実測はまだ)。
 

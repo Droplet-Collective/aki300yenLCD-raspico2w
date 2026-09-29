@@ -10,6 +10,10 @@
 #     the running wifi_ota downloads from the Release (bootrom starts it under the TBYB
 #     watchdog; the firmware calls explicit_buy after its self-test).
 # On v* tags the tag must equal Cargo.toml's version, otherwise the build fails.
+#
+# The build job is also a reusable workflow (workflow_call): release.yml calls it with
+# `ref` + `version` and then creates the tag and the Release itself, because a tag pushed
+# with GITHUB_TOKEN never triggers this workflow's push:tags path.
 name: build
 
 on:
@@ -22,6 +26,30 @@ on:
         description: 'Build only this [[bin]] (empty = all bins)'
         default: sd_bmp_viewer
         required: false
+  workflow_call:
+    inputs:
+      bin:
+        description: 'Build only this [[bin]] (empty = all bins)'
+        type: string
+        default: ''
+      ref:
+        description: 'Branch, tag or commit to build (empty = the caller''s commit)'
+        type: string
+        default: ''
+      version:
+        description: 'If set, Cargo.toml version must equal this (X.Y.Z) or the build fails'
+        type: string
+        default: ''
+    outputs:
+      artifact:
+        description: 'Name of the uploaded Actions artifact (firmware-<sha>)'
+        value: ${{ jobs.build.outputs.artifact }}
+      sha:
+        description: 'Commit that was built'
+        value: ${{ jobs.build.outputs.sha }}
+      version:
+        description: 'Cargo.toml version of the built commit'
+        value: ${{ jobs.build.outputs.version }}
 
 permissions:
   contents: read
@@ -34,8 +62,14 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.meta.outputs.artifact }}
+      sha: ${{ steps.meta.outputs.sha }}
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       # rust-toolchain.toml already pins stable + target + components;
       # the action only pre-installs them so the first cargo call is quiet.
@@ -46,16 +80,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check that tag vX.Y.Z matches Cargo.toml version
-        if: startsWith(github.ref, 'refs/tags/v')
+      # On v* tags the tag must equal Cargo.toml's version; when called from release.yml the
+      # `version` input must. Also records the built commit for the artifact name / outputs.
+      - name: Check that the version to release matches Cargo.toml
+        id: meta
+        env:
+          WANT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          echo "Cargo.toml version: $cargo_version, tag: $GITHUB_REF_NAME"
-          if [ "v$cargo_version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+          want="$WANT_VERSION"
+          case "$GITHUB_REF" in refs/tags/v*) want="${GITHUB_REF_NAME#v}" ;; esac
+          echo "Cargo.toml version: $cargo_version, wanted: ${want:-(none)}"
+          if [ -n "$want" ] && [ "$want" != "$cargo_version" ]; then
+            echo "::error::version $want (tag or release input) does not match Cargo.toml version $cargo_version" >&2
             exit 1
           fi
+          sha="$(git rev-parse HEAD)"
+          {
+            echo "sha=$sha"
+            echo "version=$cargo_version"
+            echo "artifact=firmware-$sha"
+          } >> "$GITHUB_OUTPUT"
 
       - name: cargo build --release
         env:
@@ -116,7 +162,7 @@ jobs:
             for ext in elf uf2 bin; do mv "out/wifi_ota.$ext" "out/wifi_ota-plain.$ext"; done
             (cd out && rm -f wifi_ota.sha256 && sha256sum wifi_ota-plain.bin > wifi_ota-plain.sha256)
           fi
-          echo "$GITHUB_SHA" > out/commit.txt
+          git rev-parse HEAD > out/commit.txt
           ls -l out
           test -n "$(ls out/*.uf2)"
 
@@ -142,11 +188,13 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ github.sha }}
+          name: ${{ steps.meta.outputs.artifact }}
           path: out/
           if-no-files-found: error
           retention-days: 14
 
+  # Only for tags pushed by hand. A tag pushed by release.yml (GITHUB_TOKEN) does not start
+  # this workflow at all, and release.yml attaches the assets itself.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
@@ -156,7 +204,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: firmware-${{ github.sha }}
+          name: ${{ needs.build.outputs.artifact }}
           path: out
 
       - name: Create GitHub Release with UF2s, OTA .bin files and manifest.json
@@ -165,6 +213,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::notice::Release $GITHUB_REF_NAME already exists (created by release.yml?); nothing to do"
+            exit 0
+          fi
           ls -l out
           test -f out/manifest.json
           test -f out/wifi_ota.bin

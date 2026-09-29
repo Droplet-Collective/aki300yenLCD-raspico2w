@@ -11,6 +11,8 @@ picotool で ELF → UF2（`--family rp2350-arm-s`）に変換します。
   保持期間は 14 日です。
 - **リリース**: `v*` 形式のタグ（例 `v0.1.0`）を push すると、同名の GitHub Release が
   自動作成され、全 bin の UF2 が添付されます。こちらは無期限に残ります。
+  タグを手で打たずに Actions → `release` → Run workflow（`version` = `Cargo.toml` の版数）でも
+  同じ Release を作れます（`.github/workflows/release.yml`、詳細は [wifi-ota.md §3](wifi-ota.md#3-更新を配る-開発者側)）。
 - **手動実行**: Actions → `build` → Run workflow。`bin` 入力に bin 名を入れると
   その 1 つだけをビルドします（既定は `sd_bmp_viewer`）。
 

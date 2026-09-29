@@ -1,0 +1,108 @@
+# Cut a release from the Actions tab (or `gh workflow run release.yml -f version=X.Y.Z`)
+# without pushing a tag by hand:
+#   1. check: Cargo.toml version == inputs.version and tag v<version> does not exist yet
+#   2. build: the reusable build job from build.yml (same steps as the v* tag path)
+#   3. release: create the annotated tag v<version> on the built commit with GITHUB_TOKEN
+#      and attach the UF2 / OTA .bin / .sha256 / manifest.json to a GitHub Release.
+# A tag pushed with GITHUB_TOKEN does not trigger build.yml (GitHub rule), so this
+# workflow has to attach the assets itself. See docs/wifi-ota.md §3.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.2.0 (must equal Cargo.toml version; creates tag v0.2.0)'
+        required: true
+      ref:
+        description: 'Branch or commit to release'
+        default: main
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Check version format, Cargo.toml version and that tag v<version> is new
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version must look like X.Y.Z (got '$VERSION')" >&2
+            exit 1
+          fi
+          cargo_version="$(python3 -c 'import tomllib,sys; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')"
+          echo "Cargo.toml version: $cargo_version, requested: $VERSION"
+          if [ "$cargo_version" != "$VERSION" ]; then
+            echo "::error::Cargo.toml version $cargo_version != requested $VERSION; bump Cargo.toml first" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION already exists; bump Cargo.toml and try again" >&2
+            exit 1
+          fi
+
+  build:
+    needs: check
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version }}
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: out
+
+      - name: Create annotated tag v<version> on the built commit
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILT_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BUILT_SHA"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION appeared while building; not overwriting it" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION (release.yml, run ${GITHUB_RUN_ID})"
+          git push origin "refs/tags/v$VERSION"
+
+      - name: Create GitHub Release with UF2s, OTA .bin files and manifest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l out
+          test -f out/manifest.json
+          test -f out/wifi_ota.bin
+          # wifi_ota (running on the board) fetches releases/latest/download/manifest.json and
+          # then the "bin" named in it, so both must be attached to the same Release.
+          gh release create "v$VERSION" out/*.uf2 out/*.bin out/*.sha256 out/manifest.json \
+            --verify-tag --generate-notes --title "v$VERSION"
