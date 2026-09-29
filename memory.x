@@ -1,5 +1,12 @@
+/*
+ * FLASH の LENGTH は A/B パーティション 1 スロット分 (partition/pico2w-ab.json の
+ * app-a / app-b = 1920K) に合わせている。イメージは常に 0x10000000 でリンクし、
+ * どちらのスロットに置かれても bootrom の QMI アドレス変換 (RP2350 データシート
+ * 5.1.19) で 0x10000000 に見える。スロットを超えるサイズはリンク時に検出する。
+ * (パーティションテーブル無しで先頭に置く従来の使い方でもそのまま動く)
+ */
 MEMORY {
-    FLASH : ORIGIN = 0x10000000, LENGTH = 4096K
+    FLASH : ORIGIN = 0x10000000, LENGTH = 1920K
     RAM   : ORIGIN = 0x20000000, LENGTH = 512K
     SRAM4 : ORIGIN = 0x20080000, LENGTH = 4K
     SRAM5 : ORIGIN = 0x20081000, LENGTH = 4K

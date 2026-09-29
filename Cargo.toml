@@ -7,7 +7,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # Embassy core
 embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "defmt"] }
-embassy-rp = { version = "0.9", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xa"] }
+# imagedef-none: IMAGE_DEF は embassy ではなく本クレートの image_def モジュールで定義する
+# (版数 VERSION 項目と TBYB フラグを載せるため)。binary-info: picotool info 用のメタデータ。
+embassy-rp = { version = "0.9", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xa", "imagedef-none", "binary-info"] }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-sync = { version = "0.7", features = ["defmt"] }
 embassy-futures = { version = "0.1" }
@@ -45,6 +47,14 @@ cyw43 = { version = "0.6", features = ["defmt"] }
 cyw43-pio = { version = "0.9", features = ["defmt"] }
 embassy-net = { version = "0.8", features = ["defmt", "proto-ipv4", "dhcpv4", "tcp", "udp", "dns", "medium-ethernet"] }
 heapless = "0.8"
+
+[features]
+default = []
+# IMAGE_DEF に TBYB (Try Before You Buy) フラグを立てる。OTA で書き込む
+# イメージ用。FLASH_UPDATE 起動でのみ選ばれ、explicit_buy するまで確定しない。
+tbyb = []
+# テスト用: ota_selftest が explicit_buy を呼ばない (ウォッチドッグで旧イメージへ戻る)。
+skip-buy = []
 
 [profile.dev]
 debug = 2

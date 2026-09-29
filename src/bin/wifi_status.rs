@@ -48,6 +48,9 @@ use pico2w_300yen_lcd::usb_reset::build_usb_device;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
+// RP2350 bootrom 用 IMAGE_DEF (版数付き) と picotool 用 binary_info を埋め込む
+pico2w_300yen_lcd::firmware_image_def!();
+
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     PIO1_IRQ_0 => InterruptHandler<PIO1>;

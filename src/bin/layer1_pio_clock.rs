@@ -22,6 +22,9 @@ use fixed::types::extra::U8;
 use pico2w_300yen_lcd::lcd::timing::{PIO_CLK_DIV_FRAC, PIO_CLK_DIV_INT};
 use {defmt_rtt as _, panic_probe as _};
 
+// RP2350 bootrom 用 IMAGE_DEF (版数付き) と picotool 用 binary_info を埋め込む
+pico2w_300yen_lcd::firmware_image_def!();
+
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });

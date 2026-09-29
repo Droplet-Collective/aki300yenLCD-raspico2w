@@ -10,6 +10,9 @@ use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
 use {defmt_rtt as _, panic_probe as _};
 
+// RP2350 bootrom 用 IMAGE_DEF (版数付き) と picotool 用 binary_info を埋め込む
+pico2w_300yen_lcd::firmware_image_def!();
+
 // LCD ドライバモジュールはライブラリクレート (lib.rs) で定義
 // Layer 3 以降で使用: use pico2w_300yen_lcd::{lcd, pins};
 

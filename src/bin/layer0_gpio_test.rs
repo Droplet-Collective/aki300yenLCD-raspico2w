@@ -17,6 +17,9 @@ use embassy_rp::gpio::{Level, Output};
 use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
+// RP2350 bootrom 用 IMAGE_DEF (版数付き) と picotool 用 binary_info を埋め込む
+pico2w_300yen_lcd::firmware_image_def!();
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
