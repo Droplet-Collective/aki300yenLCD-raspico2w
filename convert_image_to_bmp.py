@@ -10,9 +10,16 @@ from PIL import Image, ImageOps
 LCD_SIZE = (400, 96)
 
 
-def convert(source_path: Path, output_path: Path) -> None:
+def convert(
+    source_path: Path, output_path: Path, crop_box: tuple[int, int, int, int] | None = None
+) -> None:
     with Image.open(source_path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
+        if crop_box is not None:
+            left, top, right, bottom = crop_box
+            if not (0 <= left < right <= image.width and 0 <= top < bottom <= image.height):
+                raise ValueError("Crop must fit inside the source image")
+            image = image.crop(crop_box)
         # Fill the LCD without bars. Bias the vertical crop upward so the bear
         # and the avatar's face both stay inside the 1200x400 source viewport.
         frame = ImageOps.fit(
@@ -42,8 +49,15 @@ def main() -> None:
     parser.add_argument(
         "output", type=Path, nargs="?", default=Path("IMAGE.BMP"), help="Output BMP path"
     )
+    parser.add_argument(
+        "--crop",
+        type=int,
+        nargs=4,
+        metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
+        help="Optional source crop before resizing; coordinates are after EXIF rotation",
+    )
     args = parser.parse_args()
-    convert(args.source, args.output)
+    convert(args.source, args.output, tuple(args.crop) if args.crop else None)
     print(f"Wrote {args.output} ({LCD_SIZE[0]}x{LCD_SIZE[1]}, 24-bit BMP)")
 
 

@@ -1,16 +1,15 @@
-//! SD カードの IMAGE.BMP を単一フレームバッファへ読み込み、LCD に表示する。
+//! SD カードの IMAGE.BMP と IMAGE2.BMP を単一フレームバッファで交互に表示する。
 //!
 //! SD は基板配線に合わせた GPIO SPI（CS=GP26, CMD=GP27, CLK=GP28,
 //! DAT0=GP0）。FAT ボリュームのルートにある非圧縮 24-bit BMP を読む。
-//! 読み込みを終えてから全フレーム DMA を起動するため、表示中のバッファは
-//! CPU から書き換えない。
+//! 10秒ごとに走査と DMA を止め、次の BMP を同じバッファへ読んで再開する。
 
 #![no_std]
 #![no_main]
 
 use core::convert::Infallible;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
@@ -21,7 +20,7 @@ use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection,
 };
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
-use embassy_time::Delay;
+use embassy_time::{Delay, Timer};
 use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
 use embassy_usb::msos::{
     CompatibleIdFeatureDescriptor, PropertyData, RegistryPropertyFeatureDescriptor, windows_version,
@@ -200,6 +199,15 @@ const fn viewer_sm1_frame_data() -> [u32; VIEWER_SM1_FRAME_SIZE] {
 }
 
 static SM1_FRAME_DATA: [u32; VIEWER_SM1_FRAME_SIZE] = viewer_sm1_frame_data();
+
+const SLIDES: [&str; 2] = ["IMAGE.BMP", "IMAGE2.BMP"];
+const SLIDE_SECONDS: u64 = 10;
+const SCAN_STARTING: u8 = 0;
+const SCAN_RUNNING: u8 = 1;
+const SCAN_PAUSE_REQUESTED: u8 = 2;
+const SCAN_PAUSED: u8 = 3;
+const SCAN_RESUME_REQUESTED: u8 = 4;
+static SCAN_STATE: AtomicU8 = AtomicU8::new(SCAN_STARTING);
 
 // CH2/CH3 が各フレーム終端で読み、CH0/CH1 の読み出し先を再設定する。
 static DMA_PIXEL_FRAME_ADDR: AtomicU32 = AtomicU32::new(0);
@@ -465,14 +473,14 @@ fn volume_error(error: FsError<SdCardError>) -> &'static str {
 }
 
 type SdFile<'a> = File<'a, ReadOnlyVolumeDevice, FixedTime, 4, 4, 1>;
+type SdVolumeManager = VolumeManager<ReadOnlyVolumeDevice, FixedTime>;
 
-fn load_image(
-    frame: &mut FrameBuffer,
+fn init_sd(
     miso: Peri<'static, PIN_0>,
     cs: Peri<'static, PIN_26>,
     mosi: Peri<'static, PIN_27>,
     clk: Peri<'static, PIN_28>,
-) -> Result<(u32, u32), &'static str> {
+) -> Result<SdVolumeManager, &'static str> {
     let sdcard = SdCard::new(BitBangSd::new(miso, cs, mosi, clk), Delay);
     let card_bytes = sdcard.num_bytes().map_err(|_| "SD INIT FAILED")?;
     let card_blocks = u32::try_from(card_bytes / 512).map_err(|_| "SD CARD TOO LARGE")?;
@@ -496,13 +504,39 @@ fn load_image(
         superfloppy,
         fat32,
     };
-    let volume_mgr = VolumeManager::new(device, FixedTime);
+    Ok(VolumeManager::new(device, FixedTime))
+}
+
+async fn load_image(
+    frame: &mut FrameBuffer,
+    volume_mgr: &SdVolumeManager,
+    filename: &'static str,
+) -> Result<(u32, u32), &'static str> {
     let volume = volume_mgr.open_volume(VolumeIdx(0)).map_err(volume_error)?;
     let root = volume.open_root_dir().map_err(|_| "ROOT DIR ERROR")?;
     let file = root
-        .open_file_in_dir("IMAGE.BMP", Mode::ReadOnly)
-        .map_err(|_| "IMAGE.BMP MISSING")?;
-    draw_bmp(frame, &file)
+        .open_file_in_dir(filename, Mode::ReadOnly)
+        .map_err(|_| match filename {
+            "IMAGE.BMP" => "IMAGE.BMP MISSING",
+            _ => "IMAGE2.BMP MISSING",
+        })?;
+    draw_bmp(frame, &file).await
+}
+
+async fn render_slide(
+    frame: &mut FrameBuffer,
+    volume_mgr: &SdVolumeManager,
+    filename: &'static str,
+) {
+    frame.clear(BLACK);
+    match load_image(frame, volume_mgr, filename).await {
+        Ok((width, height)) => defmt::info!("{} loaded: {}x{}", filename, width, height),
+        Err(message) => {
+            defmt::error!("{}: {}", filename, message);
+            draw_error(frame, message);
+        }
+    }
+    align_image_to_visible_area(frame);
 }
 
 fn read_exact(file: &SdFile<'_>, mut bytes: &mut [u8]) -> Result<(), &'static str> {
@@ -516,7 +550,7 @@ fn read_exact(file: &SdFile<'_>, mut bytes: &mut [u8]) -> Result<(), &'static st
     Ok(())
 }
 
-fn draw_bmp(frame: &mut FrameBuffer, file: &SdFile<'_>) -> Result<(u32, u32), &'static str> {
+async fn draw_bmp(frame: &mut FrameBuffer, file: &SdFile<'_>) -> Result<(u32, u32), &'static str> {
     let file_len = file.length();
     if file_len < 54 {
         return Err("BAD BMP HEADER");
@@ -593,6 +627,8 @@ fn draw_bmp(frame: &mut FrameBuffer, file: &SdFile<'_>) -> Result<(u32, u32), &'
                 );
             }
         }
+        // GPIO SPI は同期処理。各行の後で USB reset task に実行機会を渡す。
+        Timer::after_millis(1).await;
     }
     Ok((width, height))
 }
@@ -726,135 +762,174 @@ async fn display_task(res: DisplayPeripherals, frame_addr: u32) {
     // DMA 書き込み先アドレス (PIO0 TX FIFO) — ループ中不変
     let sm0_txf_addr = embassy_rp::pac::PIO0.txf(0).as_ptr() as u32;
     let sm1_txf_addr = embassy_rp::pac::PIO0.txf(1).as_ptr() as u32;
-    DMA_PIXEL_FRAME_ADDR.store(frame_addr, Ordering::SeqCst);
-    DMA_TIMING_FRAME_ADDR.store(SM1_FRAME_DATA.as_ptr() as u32, Ordering::SeqCst);
+    let start_dma = || {
+        DMA_PIXEL_FRAME_ADDR.store(frame_addr, Ordering::SeqCst);
+        DMA_TIMING_FRAME_ADDR.store(SM1_FRAME_DATA.as_ptr() as u32, Ordering::SeqCst);
 
-    // PAC で直接管理する4チャネルの完了フラグは display_task がポーリングする。
-    let dma = embassy_rp::pac::DMA;
-    dma.inte(0).write_value(dma.inte(0).read() & !0b1111);
-    dma.intr(0).write_value(0b1111);
-
-    // === 初回 DMA 設定: WRITE_ADDR と CTRL は固定のため一度だけ設定 ===
-    {
+        // 4チャネルの割り込みを使わず、前回の完了フラグを消す。
         let dma = embassy_rp::pac::DMA;
+        dma.inte(0).write_value(dma.inte(0).read() & !0b1111);
+        dma.intr(0).write_value(0b1111);
 
-        // --- CH0 (SM0: ピクセルデータ) WRITE_ADDR + CTRL ---
-        let ch0 = dma.ch(0);
-        ch0.write_addr().write_value(sm0_txf_addr);
-        // al1_ctrl: 非トリガーエイリアス — 書き込んでもDMA起動しない
+        // === DMA 設定: 再開時にも全アドレスと制御値を復元する ===
         {
-            let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
-            ctrl.set_en(true);
-            ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            ctrl.set_incr_read(true);
-            ctrl.set_incr_write(false);
-            ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PIO0_TX0);
-            ctrl.set_chain_to(2); // CH0 完了後、CH2 が次フレームを起動
-            ch0.al1_ctrl().write_value(ctrl.0);
+            let dma = embassy_rp::pac::DMA;
+
+            // --- CH0 (SM0: ピクセルデータ) WRITE_ADDR + CTRL ---
+            let ch0 = dma.ch(0);
+            ch0.write_addr().write_value(sm0_txf_addr);
+            // al1_ctrl: 非トリガーエイリアス — 書き込んでもDMA起動しない
+            {
+                let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
+                ctrl.set_en(true);
+                ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+                ctrl.set_incr_read(true);
+                ctrl.set_incr_write(false);
+                ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PIO0_TX0);
+                ctrl.set_chain_to(2); // CH0 完了後、CH2 が次フレームを起動
+                ch0.al1_ctrl().write_value(ctrl.0);
+            }
+
+            // --- CH1 (SM1: HSYNC/VSYNC タイミング) WRITE_ADDR + CTRL ---
+            let ch1 = dma.ch(1);
+            ch1.write_addr().write_value(sm1_txf_addr);
+            {
+                let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
+                ctrl.set_en(true);
+                ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+                ctrl.set_incr_read(true);
+                ctrl.set_incr_write(false);
+                ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PIO0_TX1);
+                ctrl.set_chain_to(3); // CH1 完了後、CH3 が次フレームを起動
+                ch1.al1_ctrl().write_value(ctrl.0);
+            }
+
+            // CH2: ピクセルフレーム先頭アドレスを CH0 のトリガー別名へ1ワード転送。
+            // 転送数はハードウェアの RELOAD 値から毎回復元される。
+            let ch2 = dma.ch(2);
+            ch2.read_addr()
+                .write_value(DMA_PIXEL_FRAME_ADDR.as_ptr() as u32);
+            ch2.write_addr()
+                .write_value(ch0.al3_read_addr_trig().as_ptr() as u32);
+            ch2.trans_count().write(|w| w.set_count(1));
+            {
+                let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
+                ctrl.set_en(true);
+                ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+                ctrl.set_incr_read(false);
+                ctrl.set_incr_write(false);
+                ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PERMANENT);
+                ctrl.set_chain_to(2); // 自CHへのチェインは無効
+                ch2.al1_ctrl().write_value(ctrl.0);
+            }
+
+            // CH3: 同期フレーム先頭アドレスを CH1 のトリガー別名へ1ワード転送。
+            let ch3 = dma.ch(3);
+            ch3.read_addr()
+                .write_value(DMA_TIMING_FRAME_ADDR.as_ptr() as u32);
+            ch3.write_addr()
+                .write_value(ch1.al3_read_addr_trig().as_ptr() as u32);
+            ch3.trans_count().write(|w| w.set_count(1));
+            {
+                let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
+                ctrl.set_en(true);
+                ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+                ctrl.set_incr_read(false);
+                ctrl.set_incr_write(false);
+                ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PERMANENT);
+                ctrl.set_chain_to(3); // 自CHへのチェインは無効
+                ch3.al1_ctrl().write_value(ctrl.0);
+            }
         }
 
-        // --- CH1 (SM1: HSYNC/VSYNC タイミング) WRITE_ADDR + CTRL ---
-        let ch1 = dma.ch(1);
-        ch1.write_addr().write_value(sm1_txf_addr);
-        {
-            let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
-            ctrl.set_en(true);
-            ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            ctrl.set_incr_read(true);
-            ctrl.set_incr_write(false);
-            ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PIO0_TX1);
-            ctrl.set_chain_to(3); // CH1 完了後、CH3 が次フレームを起動
-            ch1.al1_ctrl().write_value(ctrl.0);
-        }
+        // === フレームループ: 初回のみ同時起動し、以後は DMA チェインで連続供給 ===
+        // CH0→CH2→CH0、CH1→CH3→CH1 とハードウェアで再起動する。
+        // CPU はフレーム境界の転送再設定に関与しない。
+        // 初回フレーム起動（クリティカルセクション内）
+        cortex_m::interrupt::free(|_| {
+            let dma = embassy_rp::pac::DMA;
 
-        // CH2: ピクセルフレーム先頭アドレスを CH0 のトリガー別名へ1ワード転送。
-        // 転送数はハードウェアの RELOAD 値から毎回復元される。
-        let ch2 = dma.ch(2);
-        ch2.read_addr()
-            .write_value(DMA_PIXEL_FRAME_ADDR.as_ptr() as u32);
-        ch2.write_addr()
-            .write_value(ch0.al3_read_addr_trig().as_ptr() as u32);
-        ch2.trans_count().write(|w| w.set_count(1));
-        {
-            let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
-            ctrl.set_en(true);
-            ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            ctrl.set_incr_read(false);
-            ctrl.set_incr_write(false);
-            ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PERMANENT);
-            ctrl.set_chain_to(2); // 自CHへのチェインは無効
-            ch2.al1_ctrl().write_value(ctrl.0);
-        }
+            let ch0 = dma.ch(0);
+            ch0.read_addr().write_value(frame_addr);
+            ch0.trans_count().write(|w| {
+                w.set_count(FB_SIZE as u32);
+            });
 
-        // CH3: 同期フレーム先頭アドレスを CH1 のトリガー別名へ1ワード転送。
-        let ch3 = dma.ch(3);
-        ch3.read_addr()
-            .write_value(DMA_TIMING_FRAME_ADDR.as_ptr() as u32);
-        ch3.write_addr()
-            .write_value(ch1.al3_read_addr_trig().as_ptr() as u32);
-        ch3.trans_count().write(|w| w.set_count(1));
-        {
-            let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
-            ctrl.set_en(true);
-            ctrl.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            ctrl.set_incr_read(false);
-            ctrl.set_incr_write(false);
-            ctrl.set_treq_sel(embassy_rp::pac::dma::vals::TreqSel::PERMANENT);
-            ctrl.set_chain_to(3); // 自CHへのチェインは無効
-            ch3.al1_ctrl().write_value(ctrl.0);
+            let ch1 = dma.ch(1);
+            ch1.read_addr().write_value(SM1_FRAME_DATA.as_ptr() as u32);
+            ch1.trans_count().write(|w| {
+                w.set_count(VIEWER_SM1_FRAME_SIZE as u32);
+            });
+
+            dma.multi_chan_trigger().write(|w| {
+                w.set_multi_chan_trigger(0b11);
+            });
+        });
+    };
+
+    start_dma();
+    SCAN_STATE.store(SCAN_RUNNING, Ordering::SeqCst);
+    loop {
+        match SCAN_STATE.load(Ordering::SeqCst) {
+            SCAN_PAUSE_REQUESTED => {
+                // 現在のフレームは最後まで送り、次フレームへの連鎖だけ止める。
+                // RP2350 では連鎖 DMA の強制 abort を避ける。
+                let dma = embassy_rp::pac::DMA;
+                let ch0 = dma.ch(0);
+                let mut pixel_ctrl = embassy_rp::pac::dma::regs::CtrlTrig(ch0.al1_ctrl().read());
+                pixel_ctrl.set_chain_to(0);
+                ch0.al1_ctrl().write_value(pixel_ctrl.0);
+                let ch1 = dma.ch(1);
+                let mut timing_ctrl = embassy_rp::pac::dma::regs::CtrlTrig(ch1.al1_ctrl().read());
+                timing_ctrl.set_chain_to(1);
+                ch1.al1_ctrl().write_value(timing_ctrl.0);
+
+                // 1フレームより長く待ち、PIO の TX FIFO も空にする。
+                Timer::after_millis(20).await;
+                for channel in 0..4 {
+                    while dma.ch(channel).ctrl_trig().read().busy() {
+                        Timer::after_millis(1).await;
+                    }
+                }
+                SCAN_STATE.store(SCAN_PAUSED, Ordering::SeqCst);
+            }
+            SCAN_RESUME_REQUESTED => {
+                // SM は FIFO 待ちで止まっている。DMA を再供給して走査を続ける。
+                start_dma();
+                SCAN_STATE.store(SCAN_RUNNING, Ordering::SeqCst);
+            }
+            _ => {}
         }
+        Timer::after_millis(2).await;
     }
-
-    // === フレームループ: 初回のみ同時起動し、以後は DMA チェインで連続供給 ===
-    // CH0→CH2→CH0、CH1→CH3→CH1 とハードウェアで再起動する。
-    // CPU はフレーム境界の転送再設定に関与しない。
-    // 初回フレーム起動（クリティカルセクション内）
-    cortex_m::interrupt::free(|_| {
-        let dma = embassy_rp::pac::DMA;
-
-        let ch0 = dma.ch(0);
-        ch0.read_addr().write_value(frame_addr);
-        ch0.trans_count().write(|w| {
-            w.set_count(FB_SIZE as u32);
-        });
-
-        let ch1 = dma.ch(1);
-        ch1.read_addr().write_value(SM1_FRAME_DATA.as_ptr() as u32);
-        ch1.trans_count().write(|w| {
-            w.set_count(VIEWER_SM1_FRAME_SIZE as u32);
-        });
-
-        dma.multi_chan_trigger().write(|w| {
-            w.set_multi_chan_trigger(0b11);
-        });
-    });
-
-    // 静止画像なので、DMA 開始後はフレームバッファへ一切書き込まない。
-    core::future::pending::<()>().await;
 }
 
 // ============================================================
-// main: SD 読み込みが完了してからスキャンアウト開始
+// main: 10秒表示してから走査を止め、同じバッファへ次の BMP を読む
 // ============================================================
+
+async fn wait_for_scan_state(expected: u8) {
+    while SCAN_STATE.load(Ordering::SeqCst) != expected {
+        Timer::after_millis(2).await;
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    let volume_mgr = init_sd(p.PIN_0, p.PIN_26, p.PIN_27, p.PIN_28);
 
     let frame_addr = {
-        // Safety: DMA 起動前は main だけが FB_DATA を読み書きする。
-        // DMA 起動後はこのバッファへ一切書き込まない。
+        // Safety: この時点では DMA は未起動。
         let frame = unsafe { &mut *addr_of_mut!(FB_DATA) };
-        match load_image(frame, p.PIN_0, p.PIN_26, p.PIN_27, p.PIN_28) {
-            Ok((width, height)) => {
-                defmt::info!("IMAGE.BMP loaded: {}x{}", width, height);
-            }
+        match &volume_mgr {
+            Ok(manager) => render_slide(frame, manager, SLIDES[0]).await,
             Err(message) => {
                 defmt::error!("BMP viewer: {}", message);
                 draw_error(frame, message);
+                align_image_to_visible_area(frame);
             }
         }
-        align_image_to_visible_area(frame);
         frame.frame_data().as_ptr() as u32
     };
 
@@ -895,7 +970,26 @@ async fn main(spawner: Spawner) {
     let usb = build_usb_device(UsbDriver::new(p.USB, Irqs));
     spawner.spawn(usb_task(usb)).unwrap();
 
-    core::future::pending::<()>().await;
+    if let Ok(manager) = volume_mgr {
+        wait_for_scan_state(SCAN_RUNNING).await;
+        let mut slide = 0;
+        loop {
+            Timer::after_secs(SLIDE_SECONDS).await;
+            SCAN_STATE.store(SCAN_PAUSE_REQUESTED, Ordering::SeqCst);
+            wait_for_scan_state(SCAN_PAUSED).await;
+
+            slide = (slide + 1) % SLIDES.len();
+            // Safety: display_task は4本の DMA を停止した後に SCAN_PAUSED を返す。
+            // 再開要求までフレームバッファは main だけが変更する。
+            let frame = unsafe { &mut *addr_of_mut!(FB_DATA) };
+            render_slide(frame, &manager, SLIDES[slide]).await;
+
+            SCAN_STATE.store(SCAN_RESUME_REQUESTED, Ordering::SeqCst);
+            wait_for_scan_state(SCAN_RUNNING).await;
+        }
+    } else {
+        core::future::pending::<()>().await;
+    }
 }
 
 fn draw_error(frame: &mut FrameBuffer, message: &'static str) {
