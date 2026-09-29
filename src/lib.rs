@@ -6,8 +6,10 @@
 #![no_std]
 
 pub mod ab_boot;
+pub mod heap;
 pub mod image_def;
 pub mod lcd;
+pub mod ota;
 pub mod pins;
 pub mod sdcard;
 pub mod usb_reset;
