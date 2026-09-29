@@ -7,8 +7,11 @@
 //!   (`ota::slot`)。SHA-256 と読み戻しで検証した後、`reboot(FLASH_UPDATE)` で新版を起動する。
 //! - 新版は TBYB (Try Before You Buy) 付きなので bootrom のウォッチドッグ (16.7 s) 下で起動する。
 //!   本 bin は自己診断 = 「LCD 走査中 + Wi-Fi join + DHCP で IP 取得」が成立したら
-//!   `explicit_buy` で確定する。成立しなければ buy せず、ウォッチドッグで旧版に戻る
-//!   (何もウォッチドッグを叩かない)。
+//!   `explicit_buy` で確定する。join + DHCP は 16.7 s に収まらないことがある (v0.2.2 の実機で
+//!   DHCP 待ち中に巻き戻った) ので、buy 待ちの間は `tbyb_watchdog_task` が 2 s ごとに
+//!   WATCHDOG.LOAD を再ロードして延長する (データシート §5.1.17 が認める方法)。ただし起動から
+//!   `TBYB_SELFTEST_DEADLINE_SECS` 経っても成立しなければ延長をやめ、bootrom の設定どおり
+//!   ウォッチドッグで旧版に戻る。`explicit_buy` は bootrom 側が最初にウォッチドッグを止める。
 //! - 失敗 (DNS/TLS/HTTP/フラッシュ/ハッシュ) は LCD に表示し、60 s → 最大 10 min のバックオフで再試行。
 //!   検証を通らないイメージで再起動することはない。
 //!
@@ -17,7 +20,7 @@
 //! LCD (400×96, 9 行):
 //! ```text
 //! <SSID> 192.168.1.23 -52dBm  scan #12                                   ← 行 0 (wifi_status と同じ)
-//! wifi_ota v0.2.2 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: bought OK  WDT: off
+//! wifi_ota v0.2.3 via OTA  slot B (P1 app-b)  tbyb-build:yes  TBYB: pending (self-test 37/120 s)  WDT 15.1s
 //! ^^^^^^^^^^^^^^^^^^^^^^^^ 版数はマゼンタ (0.2.2〜)。via OTA は FLASH_UPDATE 起動 (= OTA で届いたイメージ) のときだけ出る
 //! OTA: 0.2.0 -> 0.2.1 downloading 45%  196608/435200 B
 //! [=================                       ]                                 ← 進捗バー (ダウンロード中のみ)
@@ -30,6 +33,7 @@
 use core::fmt::Write as _;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use cyw43::{PowerManagementMode, ScanOptions};
 use embassy_executor::Spawner;
@@ -38,6 +42,7 @@ use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::flash::Flash;
+use embassy_rp::pac::WATCHDOG;
 use embassy_rp::peripherals::*;
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
@@ -115,6 +120,16 @@ const PROGRESS_REDRAW: Duration = Duration::from_millis(250);
 
 /// TBYB 起動時、explicit_buy を許す最短稼働時間 (LCD 走査が回っていることの確認)
 const BUY_MIN_UPTIME: Duration = Duration::from_secs(2);
+/// TBYB 自己診断の締め切り (起動からの秒数)。この間は `tbyb_watchdog_task` が bootrom のウォッチドッグを
+/// 延長し続ける。過ぎたら延長をやめて buy もしない (最長 16.7 s 後にウォッチドッグで旧版へ戻る)。
+/// join 再試行 (5〜60 s) + DHCP (最大 20 s) を数回やり直せる長さ。
+const TBYB_SELFTEST_DEADLINE_SECS: u64 = 120;
+/// ウォッチドッグを再ロードする周期 (16.7 s に対して十分短く、フラッシュ操作や scan の待ちより長い)
+const TBYB_WATCHDOG_FEED_INTERVAL: Duration = Duration::from_secs(2);
+/// WATCHDOG.LOAD に書く値。24 bit × 1 µs = 16.7 s で、bootrom が TBYB 起動時に設定するのと同じ最大値。
+/// LOAD は書き込み専用でカウンタを再ロードするだけ (CTRL の ENABLE / PAUSE_* や、reboot パラメータが
+/// 入っている SCRATCH2〜7 には触れない)。
+const WATCHDOG_LOAD_MAX: u32 = 0x00ff_ffff;
 
 /// wifi_status と同じスキャン / 接続パラメータ
 const SCAN_PERIOD: Duration = Duration::from_secs(10);
@@ -167,6 +182,41 @@ static mut TCP_STATE: TcpClientState<1, TCP_TX_SIZE, TCP_RX_SIZE> = TcpClientSta
 static mut SECTOR_BUFFERS: SectorBuffers = SectorBuffers::new();
 
 // ============================================================
+// TBYB: bootrom のウォッチドッグの延長
+// ============================================================
+
+/// true の間 `tbyb_watchdog_task` がウォッチドッグを再ロードする。main が buy 待ちの開始時に立て、
+/// explicit_buy の後 (成否によらず) に落とす。締め切りを過ぎたらタスク自身が落とす。
+static TBYB_FEEDING: AtomicBool = AtomicBool::new(false);
+
+/// ウォッチドッグのカウンタを最大値 (16.7 s) に再ロードする。embassy の `Watchdog` は使わない
+/// (`Watchdog::start` は CTRL / PAUSE / SCRATCH を書き換え、bootrom が TBYB 用に設定した状態を壊す)。
+fn feed_watchdog() {
+    WATCHDOG.load().write(|w| w.set_load(WATCHDOG_LOAD_MAX));
+}
+
+/// buy 待ちの間、`TBYB_WATCHDOG_FEED_INTERVAL` ごとに bootrom のウォッチドッグを再ロードする。
+/// main ループは join / DHCP / scan で数秒〜20 s 待つので、独立したタスクで回す。
+/// `deadline` (起動 + `TBYB_SELFTEST_DEADLINE_SECS`) を過ぎたら再ロードをやめて終わる。以後は
+/// 最長 16.7 s でウォッチドッグが発火し、旧版で通常起動する (データシート §5.1.17)。
+#[embassy_executor::task]
+async fn tbyb_watchdog_task(deadline: Instant) {
+    while TBYB_FEEDING.load(Ordering::Relaxed) {
+        if Instant::now() >= deadline {
+            defmt::warn!(
+                "TBYB self-test deadline ({} s) passed without explicit_buy; stop feeding, watchdog will roll back",
+                TBYB_SELFTEST_DEADLINE_SECS
+            );
+            TBYB_FEEDING.store(false, Ordering::Relaxed);
+            break;
+        }
+        feed_watchdog();
+        Timer::after(TBYB_WATCHDOG_FEED_INTERVAL).await;
+    }
+    defmt::info!("tbyb_watchdog_task done");
+}
+
+// ============================================================
 // 状態
 // ============================================================
 
@@ -174,8 +224,11 @@ static mut SECTOR_BUFFERS: SectorBuffers = SectorBuffers::new();
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuyState {
     NotTbyb,
-    /// TBYB 起動。自己診断 (Wi-Fi + DHCP) が通ったら buy する
+    /// TBYB 起動。自己診断 (Wi-Fi + DHCP) が通ったら buy する。この間はウォッチドッグを延長している
     Pending,
+    /// 締め切り (`TBYB_SELFTEST_DEADLINE_SECS`) までに自己診断が通らなかった。延長をやめ、buy もしない。
+    /// 最長 16.7 s 後にウォッチドッグで旧版へ戻る
+    TimedOut,
     Bought,
     Failed(i32),
 }
@@ -200,6 +253,11 @@ impl BootStatus {
             buy,
             boot_at: Instant::now(),
         }
+    }
+
+    /// TBYB 自己診断の締め切り時刻
+    fn selftest_deadline(&self) -> Instant {
+        self.boot_at + Duration::from_secs(TBYB_SELFTEST_DEADLINE_SECS)
     }
 
     /// 今の起動が `reboot(FLASH_UPDATE)` 由来か (= OTA で書いたイメージが動いている)
@@ -362,8 +420,22 @@ fn draw_screen(frame: &mut BackBuffer, model: &Model) {
             GRAY
         }
         BuyState::Pending => {
-            let _ = line.push_str("TBYB: pending (buy after Wi-Fi up)");
+            // ウォッチドッグを延長しながら自己診断中。締め切りまでの経過秒を出す
+            let _ = write!(
+                line,
+                "TBYB: pending (self-test {}/{} s)",
+                model.boot.boot_at.elapsed().as_secs().min(TBYB_SELFTEST_DEADLINE_SECS),
+                TBYB_SELFTEST_DEADLINE_SECS
+            );
             YELLOW
+        }
+        BuyState::TimedOut => {
+            let _ = write!(
+                line,
+                "TBYB: self-test timed out ({} s), rolling back",
+                TBYB_SELFTEST_DEADLINE_SECS
+            );
+            RED
         }
         BuyState::Bought => {
             let _ = line.push_str("TBYB: bought OK");
@@ -739,6 +811,18 @@ async fn main(spawner: Spawner) {
         boot.boot,
         boot.slots.as_ref().map(|s| (s.own.index, s.target.index)).map_err(|e| *e)
     );
+    // TBYB 起動なら bootrom のウォッチドッグ (16.7 s) が既に走っている。SD / LCD / Wi-Fi の初期化が
+    // 先に来るので、まず一度再ロードし、以後は tbyb_watchdog_task に任せる。
+    if boot.buy == BuyState::Pending {
+        feed_watchdog();
+        TBYB_FEEDING.store(true, Ordering::Relaxed);
+        spawner.spawn(tbyb_watchdog_task(boot.selftest_deadline())).unwrap();
+        defmt::info!(
+            "TBYB buy pending: extending the watchdog every {} s until self-test passes (deadline {} s)",
+            TBYB_WATCHDOG_FEED_INTERVAL.as_secs(),
+            TBYB_SELFTEST_DEADLINE_SECS
+        );
+    }
 
     // --- SD カードから wifi.txt (GPIO SPI は同期処理なので走査開始前に済ませる) ---
     let credentials: Result<WifiCredentials, &'static str> = match init_sd(p.PIN_0, p.PIN_26, p.PIN_27, p.PIN_28) {
@@ -922,16 +1006,25 @@ async fn main(spawner: Spawner) {
         }
 
         // --- TBYB: 自己診断 = LCD 走査中 (BUY_MIN_UPTIME) + Wi-Fi join + DHCP で IP 取得 → explicit_buy ---
-        // 成立しないうちは buy しない (ウォッチドッグを叩くコードは無いので 16.7 s で旧版へ戻る)。
+        // 成立するまでは tbyb_watchdog_task がウォッチドッグを延長する。締め切りを過ぎたら延長も buy も
+        // やめ、最長 16.7 s 後にウォッチドッグで旧版へ戻る。
+        if ui.model.boot.buy == BuyState::Pending && Instant::now() >= ui.model.boot.selftest_deadline() {
+            TBYB_FEEDING.store(false, Ordering::Relaxed);
+            ui.model.boot.buy = BuyState::TimedOut;
+            defmt::warn!("TBYB self-test timed out; not buying, waiting for the watchdog to roll back");
+        }
         if ui.model.boot.buy == BuyState::Pending
             && network_up
             && ui.model.boot.boot_at.elapsed() >= BUY_MIN_UPTIME
             && ui.display.is_running()
         {
             defmt::info!("self-test passed (Wi-Fi + DHCP up), explicit_buy ...");
+            // bootrom の explicit_buy は最初に WATCHDOG.CTRL.ENABLE を落とす (成否によらず) ので、
+            // 以後の再ロードは不要。先にフラグを落としてタスクを終わらせる。
+            TBYB_FEEDING.store(false, Ordering::Relaxed);
             ui.model.boot.buy = match ab_boot::explicit_buy() {
                 Ok(()) => {
-                    defmt::info!("explicit_buy OK");
+                    defmt::info!("explicit_buy OK (watchdog enabled: {})", WATCHDOG.ctrl().read().enable());
                     BuyState::Bought
                 }
                 Err(rc) => {
@@ -942,10 +1035,10 @@ async fn main(spawner: Spawner) {
             ui.present().await;
         }
 
-        // --- OTA (buy 待ちの間は行わない) ---
+        // --- OTA (buy 待ち / 巻き戻し待ちの間は行わない) ---
         if ota_possible
             && network_up
-            && ui.model.boot.buy != BuyState::Pending
+            && !matches!(ui.model.boot.buy, BuyState::Pending | BuyState::TimedOut)
             && let Some(due) = ui.model.ota.next_check
             && Instant::now() >= due
             && let Ok(slots) = ui.model.boot.slots
