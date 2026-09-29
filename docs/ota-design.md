@@ -2,9 +2,9 @@
 
 Pico 2 W (RP2350) が GitHub Release から最新ファームウェアを HTTPS で取得し、
 RP2350 bootrom の A/B パーティションと Try Before You Buy (TBYB) を使って
-安全に入れ替えるための設計。第 1 段階 (本 PR) はパーティション構成・版数・
-起動スロット表示までを実装し、HTTPS ダウンロードとフラッシュ書き込みは
-第 2 段階で行う。節番号 `§x.y` は RP2350 データシート
+安全に入れ替えるための設計。第 1 段階はパーティション構成・版数・
+起動スロット表示まで、第 2 段階 (`wifi_ota` bin、使い方は [wifi-ota.md](wifi-ota.md)) で
+HTTPS ダウンロードとフラッシュ書き込みを実装した。節番号 `§x.y` は RP2350 データシート
 (<https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf>) を指す。
 調査メモの全文は PR の説明に添付した `ota-research.md` を参照。
 
@@ -30,8 +30,8 @@ RP2350 bootrom の A/B パーティションと Try Before You Buy (TBYB) を使
 |---|---|---|
 | フラッシュ | 4 MB (W25Q32)、セクタ 4 kB、ページ 256 B | Pico 2 W データシート |
 | SRAM | 512 kB + 4 kB × 2 | memory.x |
-| 最大イメージ (現状) | `wifi_status`: text 431,180 B + data 56 B ≈ **421 kB** (UF2 は 863 kB だが 2 倍に膨れるだけ) | `llvm-size` |
-| RAM 空き (現状) | `wifi_status` の bss 256,576 B → 約 **255 kB** 空き | `llvm-size` |
+| 最大イメージ | `wifi_ota` (第 2 段階): text 619,340 + rodata 279,040 B ≈ **877 kB** (`wifi_status` は 419 kB) | `llvm-size` |
+| RAM 空き | `wifi_ota`: 静的領域の終わり 0x200751B8 → スタック **44,616 B**。`wifi_status` は 112,860 B | `llvm-size` / `llvm-nm` |
 | bootrom API | embassy-rp 0.9 `rom_data` に reboot / get_sys_info / get_partition_table_info / explicit_buy / flash_* が全てある | `embassy-rp-0.9.0/src/rom_data/rp235x.rs` |
 | 配布 | GitHub Release (`v*` タグで CI が作成) のアセット | `.github/workflows/build.yml` |
 | ツール | picotool 2.3.1 (partition create / load -p / uf2 convert) | `picotool help` |
@@ -51,8 +51,7 @@ RP2350 bootrom の A/B パーティションと Try Before You Buy (TBYB) を使
 
 根拠
 
-- 1 スロット 1920 kB は現状最大の 421 kB の 4.5 倍。第 2 段階で TLS/HTTP を足しても
-  (reqwless + embedded-tls で +100〜150 kB 程度と見込む) 余裕がある。
+- 1 スロット 1920 kB は第 2 段階の `wifi_ota` (877 kB、TLS/HTTP/rsa 込み) の 2.2 倍。
 - データシート §5.10.4 の例 (2044 kB × 2) から、将来の設定保存領域として `data` を
   切り出した。owner リンク (§5.1.18.1) は付けず、A/B 共通の領域として使う。
 - `memory.x` の `FLASH LENGTH` を 1920K にした。イメージは常に 0x10000000 で
@@ -125,7 +124,7 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
 - 第 2 段階の OTA 書き込み (約 100 セクタ消去 + 約 1,700 ページ書き込み) も同じ条件で走査に影響しない。
   cyw43 側の割り込み遅延は別問題 (§5 補足)。
 
-## 5. 更新フロー (第 2 段階で実装)
+## 5. 更新フロー (第 2 段階 `wifi_ota` で実装済)
 
 ```
 [起動] → 自己診断 (LCD 走査開始、SD、Wi-Fi 接続) → TBYB なら explicit_buy
@@ -149,6 +148,17 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
 
 補足
 
+- 実装は `src/ota/` (manifest / http / slot) と `src/bin/wifi_ota.rs`。書き込みのアドレスは
+  `embassy_rp::flash::Flash::blocking_erase / blocking_write` の offset = bootrom
+  `flash_range_erase / flash_range_program` の addr = **ストレージアドレス** (§5.4.8.10/11
+  「offset from start of flash」、ATRANS は掛からない)。読み戻しは `0x1C000000 + オフセット`
+  (§2.2.2 Table 10 XIP_NOCACHE_NOALLOC_NOTRANSLATE)。`Flash::blocking_read` は 0x10000000 の
+  変換付き窓を読むので他方区画には使えない。
+- [3] の先頭セクタは受信前に消去して無効化し、[4] の検証が全て通ってから最後に書く。
+- 対象区画に manifest と同じ SHA-256 のイメージが既にあれば「前回 TBYB で buy されずに
+  戻ってきた」と判断してダウンロードせず、10 分後に FLASH_UPDATE 起動を再試行する。
+- 自己診断 [6] は「LCD 走査中 (起動 2 s 以上) + Wi-Fi join + DHCP で IP 取得」。ウォッチドッグは
+  16.7 s なので manifest 取得まで待つ余裕はない (join + DHCP で 5〜10 s 使う)。
 - フラッシュ操作中 (セクタ消去 数十〜数百 ms) は XIP が止まり、DMA からの XIP 読み出しは
   バスフォールトになる。LCD は §4.1 の条件 (DMA の読み出し元が全て SRAM) を満たしているので
   乱れない。cyw43 側は PIO SPI の DMA が停止中に完了しても割り込みが遅れるだけで、
@@ -177,10 +187,12 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
   `<name>.sha256` を作る。スロット依存はない。
 - CI (`build.yml`) は全 bin の ELF/UF2/.bin と `pico2w-ab.uf2` をアーティファクトに
   入れ、`v*` タグでは Release に UF2 / .bin / .sha256 を添付する。
-- 第 2 段階の Release アセット: `wifi_ota-<ver>.bin` と `manifest.json`
-  (`{"version":"0.2.0","bin":"wifi_ota-0.2.0.bin","size":…,"sha256":"…"}`)。
-  OTA 用 bin は `--features tbyb` でビルドする (通常の picotool 用は無し)。
-  タグと `Cargo.toml` の version の一致は CI で検査する (第 2 段階)。
+- 第 2 段階の Release アセット: `wifi_ota.bin` / `wifi_ota.uf2` (`--features tbyb`)、
+  `wifi_ota-plain.uf2` (TBYB 無し、Wi-Fi 未設定の機体への初回用)、
+  `manifest.json` (`scripts/make-manifest.sh`:
+  `{"version":"0.2.0","bin":"wifi_ota.bin","size":…,"sha256":"…"}`)。アセット名は版数を含めない
+  (実機は常に `releases/latest/download/<name>` を取る)。
+  タグと `Cargo.toml` の version の一致は CI で検査する (不一致ならビルド失敗)。
 - 版数を上げる手順: `Cargo.toml` の `version` を変更 → ビルド → `picotool info` で
   `version: 0.101` などを確認 → `git tag v0.1.1`。
 
@@ -196,27 +208,32 @@ LCD 走査 (`src/lcd/display.rs`) は PIO0 SM0/SM1 + DMA CH0〜CH3 の **CPU 不
   経路上の攻撃者が任意のイメージを配れる (=任意コード実行) ため、公開ネットワークで
   使うなら証明書検証が必要。CA ピン留めは GitHub 側の CA 変更で更新が止まるリスクが
   ある。manifest の SHA-256 は破損検出であり、同じ経路で取る限り改竄対策にはならない。
-- 方針: 第 2 段階は検証付き TLS を目標にし、難しければ「検証なし + 自宅 LAN 限定」
-  を明記して出す。第 3 段階で manifest/bin への署名 (Ed25519、公開鍵をファームに埋め込み)
-  を検討する。RP2350 のセキュアブート (OTP) は不可逆なので採用しない。
+- **第 2 段階の決定: `TlsVerify::None` (検証なし)、自宅 LAN 限定。** 理由は
+  [wifi-ota.md §6](wifi-ota.md#6-セキュリティ-重要): アセット配信ホスト `*.githubusercontent.com`
+  は Let's Encrypt の RSA 4096 証明書で、embedded-tls 0.18 は `rsa` feature (alloc 必須) 無しでは
+  ハンドシェイクすら成立しない。reqwless 0.14 の証明書検証 (rustpki) はホスト名を CN 完全一致で
+  しか見ないためワイルドカード証明書を受け付けず、webpki 経路は ring 依存で使えない。
+  第 3 段階で manifest への Ed25519 署名 (公開鍵をファームに埋め込み) を実装する。
+  RP2350 のセキュアブート (OTP) は不可逆なので採用しない。
 - 更新元の URL・リポジトリ名はファームウェアに固定 (SD カードからは読まない)。
 
 ## 10. 段階計画
 
 | 段階 | 内容 | 状態 |
 |---|---|---|
-| 1 (本 PR) | パーティションテーブル、版数付き IMAGE_DEF、`ab_boot` ラッパ、`ota_selftest` bin、スクリプト、CI、文書。A/B 選択・FLASH_UPDATE 起動・TBYB + explicit_buy は v0.1.0→v0.1.1 で実機確認済。表示層をフラッシュ操作と共存できる形に修正 (§4.1) | 実装済 (表示修正は実機未確認) |
-| 2 | `wifi_ota` bin: manifest 取得 → bin ダウンロード → 他方区画へ書き込み → 検証 → FLASH_UPDATE → 自己診断 → buy。TLS 検証方針の決定 | 未着手 |
-| 3 | 更新スケジューラ / LCD への進捗・版数表示 / 失敗回数の記録 (data 区画) / 署名 | 未着手 |
+| 1 | パーティションテーブル、版数付き IMAGE_DEF、`ab_boot` ラッパ、`ota_selftest` bin、スクリプト、CI、文書。A/B 選択・FLASH_UPDATE 起動・TBYB + explicit_buy は v0.1.0→v0.1.1 で実機確認済。表示層をフラッシュ操作と共存できる形に修正 (§4.1、v0.1.4/v0.1.5 で実機確認済) | 実装済・実機確認済 |
+| 2 | `wifi_ota` bin: manifest 取得 → bin ダウンロード → 他方区画へ書き込み → 検証 → FLASH_UPDATE → 自己診断 → buy。LCD への進捗・版数表示、60 s 周期 + バックオフ。TLS は検証なし (§9)。CI が Release に `wifi_ota.bin` + `manifest.json` を添付 | 実装済 (実機未確認、[wifi-ota.md §8](wifi-ota.md#8-未確認事項-実機)) |
+| 3 | manifest への Ed25519 署名 / 失敗回数の記録 (data 区画) / 巻き戻し検出の永続化 | 未着手 |
 
 ## 11. 未確認事項
 
-- 実機での bootrom 挙動全般 (版数選択、FLASH_UPDATE、TBYB のウォッチドッグ、
-  explicit_buy の戻り値)。`ota_selftest` で確認する (docs/ota-setup.md)。
-- `reboot(FLASH_UPDATE)` の p0 に渡すアドレスが `0x10000000 + オフセット` で正しいか
-  (picotool の挙動に合わせた。ストレージオフセットそのままの可能性もある)。
+- ~~実機での bootrom 挙動全般 (版数選択、FLASH_UPDATE、TBYB のウォッチドッグ、
+  explicit_buy の戻り値)~~ → `ota_selftest` v0.1.0〜v0.1.5 で確認済 (docs/ota-setup.md)。
+- `reboot(FLASH_UPDATE)` を **ファームウェアから** 呼んだときの p0 (`0x10000000 + オフセット`) が
+  正しいか (picotool `-x` と同じ形式にしている。ストレージオフセットそのままの可能性もある)。
 - `flash_runtime_to_storage_addr` の戻り値が 0x10000000 を含むか (両方に対応済)。
-- ~~explicit_buy 中に LCD の DMA/PIO が乱れないか~~ → 実機で乱れた (砂嵐)。原因は SM1 タイミングデータが
-  フラッシュにあったこと (§4.1)。修正後 (v0.1.3 TBYB) で乱れないことは未確認。
-- embedded-tls の証明書検証 (webpki) が GitHub の証明書チェーン (ECDSA/RSA) で使えるか。
-- cyw43 ドライバがフラッシュ消去中の割り込み遅延に耐えるか。
+- ~~explicit_buy 中に LCD の DMA/PIO が乱れないか~~ → 原因 (§4.1) を修正し v0.1.4/v0.1.5 で乱れないことを確認済。
+- ~~embedded-tls の証明書検証 (webpki) が GitHub の証明書チェーン (ECDSA/RSA) で使えるか~~ → 使えない (§9)。
+- cyw43 ドライバがフラッシュ消去中の割り込み遅延に耐えるか (第 2 段階の実機試験で確認)。
+- 第 2 段階の HTTPS 取得・書き込み・検証・FLASH_UPDATE・自己診断の一連の流れ全体
+  ([wifi-ota.md §8](wifi-ota.md#8-未確認事項-実機))。
