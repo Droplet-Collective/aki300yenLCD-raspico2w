@@ -1,0 +1,3 @@
+# 親ディレクトリの .cargo/config.toml (build.target = thumbv8m) を上書きしてホストでビルドする
+[build]
+target = "x86_64-unknown-linux-gnu"

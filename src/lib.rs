@@ -7,11 +7,13 @@
 
 pub mod ab_boot;
 pub mod boot_trace;
+pub mod font;
 pub mod heap;
 pub mod image_def;
 pub mod lcd;
 pub mod ota;
 pub mod pins;
 pub mod sdcard;
+pub mod ticker;
 pub mod usb_reset;
 pub mod wifi;

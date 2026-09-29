@@ -248,3 +248,33 @@ pub fn init_sd(
     };
     Ok(VolumeManager::new(device, FixedTime))
 }
+
+/// SD ルートの `name` (8.3 形式、例 `TICKER.TXT`) を `buf` の長さまで読む。戻り値は読んだバイト数。
+/// ファイルが無ければ `Err("<name> not found")` ではなく呼び出し側が区別できるよう [`ReadError::NotFound`]。
+pub fn read_root_file(volume_mgr: &SdVolumeManager, name: &str, buf: &mut [u8]) -> Result<usize, ReadError> {
+    let volume = volume_mgr
+        .open_volume(embedded_sdmmc::VolumeIdx(0))
+        .map_err(|e| ReadError::Other(volume_error(e)))?;
+    let root = volume.open_root_dir().map_err(|_| ReadError::Other("ROOT DIR ERROR"))?;
+    let file = root
+        .open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly)
+        .map_err(|_| ReadError::NotFound)?;
+    let mut len = 0;
+    while len < buf.len() {
+        let count = file.read(&mut buf[len..]).map_err(|_| ReadError::Other("read error"))?;
+        if count == 0 {
+            break;
+        }
+        len += count;
+    }
+    Ok(len)
+}
+
+/// [`read_root_file`] の失敗理由
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// ファイルが無い (任意ファイルなら既定値で続ける)
+    NotFound,
+    /// ボリューム / ディレクトリ / 読み取りの失敗
+    Other(&'static str),
+}

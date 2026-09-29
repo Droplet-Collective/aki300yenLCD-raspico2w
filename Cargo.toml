@@ -1,7 +1,7 @@
 [package]
 edition = "2024"
 name = "pico2w-300yen-lcd"
-version = "0.2.8"
+version = "0.3.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -145,3 +145,9 @@ path = "src/bin/wifi_ota.rs"
 [[bin]]
 name = "ota_selftest_min"
 path = "src/bin/ota_selftest_min.rs"
+
+# ネットワーク・ティッカー (v0.3.0〜): NTP 時計 + Open-Meteo 天気 + GitHub の message.txt を流す + OTA。
+# Release の OTA イメージ (manifest.json の bin) はこれ。Release 用は --features tbyb
+[[bin]]
+name = "ticker"
+path = "src/bin/ticker.rs"

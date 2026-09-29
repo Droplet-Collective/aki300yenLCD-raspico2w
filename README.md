@@ -17,6 +17,9 @@ PIO + DMA で駆動し、その表示を持ったファームウェアを **Wi-F
   標準機能 (A/B 版数比較・FLASH_UPDATE・TBYB) だけで構成しています。
 - **実機確認**: 2026-09-29 に実機 (1 台) で v0.2.6 への自動更新 (ダウンロード → 検証 →
   FLASH_UPDATE 起動 → TBYB 自己診断 → 確定) が通ることを確認しました。
+- **ネットワーク・ティッカー (v0.3.0〜)**: OTA の土台の上に、NTP 時計・Open-Meteo の天気・GitHub 上の
+  `message.txt` を流す表示を載せた `ticker` bin。v0.3.0 からは Release の OTA イメージがこれになり、
+  `wifi_ota` 0.2.x が動いている機体もそのまま `ticker` に切り替わります ([ticker.md](docs/ticker.md))。
 
 ## ハードウェア
 
@@ -59,9 +62,15 @@ src/
   image_def.rs      Cargo.toml の version から VERSION 項目付き IMAGE_DEF を生成 (TBYB フラグも)
   usb_reset.rs      picotool 用 USB reset interface
   sdcard.rs         microSD (GPIO SPI) と FAT ボリューム
+  ota/app.rs        OTA + TBYB + 接続管理の実行部 (ticker / wifi_ota 共用)
+  ticker/           ticker の部品 (暦、ticker.txt、Open-Meteo、SNTP、時計の数字)
+  font/misaki.rs    美咲フォント (8×8 日本語) の検索と描画
   bin/              下記の実行ファイル
 partition/          A/B パーティションテーブル (pico2w-ab.json → pico2w-ab.uf2)
 scripts/            make-ota-image.sh (ELF → .bin/.uf2/.sha256)、make-manifest.sh、make-partition-table.sh
+fonts/misaki/       美咲フォントのビットマップテーブルとライセンス
+ticker/message.txt  ticker が流す文字 (main を書き換えれば 5 分以内に反映)
+tools/              misaki2bin.py (BDF → テーブル)、ticker-tests (ホストでのユニットテスト)
 .github/workflows/  build.yml (全 bin をビルド、v* タグで Release)、release.yml (workflow_dispatch で Release)
 docs/               設計・手順・実機で得た知見 (下記リンク)
 ```
@@ -70,7 +79,8 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 
 | bin | 内容 |
 |---|---|
-| `wifi_ota` | **OTA 対応の本命**。`wifi_status` の表示 + GitHub Release からの自己更新。Release 用は `--features tbyb` |
+| `ticker` | **Release の OTA イメージ (v0.3.0〜)**。NTP 時計 + Open-Meteo 天気 + `ticker/message.txt` の流れる文字 (美咲フォント) + OTA。設定は SD の `TICKER.TXT` ([ticker.md](docs/ticker.md))。Release 用は `--features tbyb` |
+| `wifi_ota` | OTA の最小構成 (v0.2.x の OTA イメージ)。`wifi_status` の表示 + GitHub Release からの自己更新。OTA / TBYB の本体は `src/ota/app.rs` で `ticker` と共用 |
 | `wifi_status` | SD の `WIFI.TXT` で Wi-Fi に接続し、周辺 AP の RSSI を LCD に表示 ([wifi-status.md](docs/wifi-status.md)) |
 | `ota_selftest` | Wi-Fi 無しで A/B・TBYB を確認する診断 bin。起動区画・版数・TBYB 状態を表示して `explicit_buy` ([ota-setup.md](docs/ota-setup.md)) |
 | `ota_selftest_min` | 実機二分探索用の最小表示 bin |
@@ -106,13 +116,14 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 - `--features tbyb` を付けると IMAGE_DEF に TBYB フラグが立ちます。この版は FLASH_UPDATE 起動のときだけ選ばれ、
   bootrom が 16.7 s のウォッチドッグを仕掛けた状態で起動します。`explicit_buy` を呼ぶまで確定しません。
 
-### 更新フロー (`wifi_ota`)
+### 更新フロー (`ticker` / `wifi_ota` 共通、`src/ota/app.rs`)
 
 1. DHCP 完了の 5 秒後、以後 60 秒ごとに `https://github.com/<repo>/releases/latest/download/manifest.json` を取得
    (github.com の 302 → `*.githubusercontent.com` のリダイレクトは自前で追う。404 = Release 無しは正常)。
 2. `{"version","bin","size","sha256"}` を読み、自分の `CARGO_PKG_VERSION` より厳密に新しいときだけ続行。
 3. 書き込み先は自分が起動している区画の他方。まず先頭セクタ (IMAGE_DEF) を消して無効化。
-4. `wifi_ota.bin` を 4 kB ずつ受信しながらセクタ消去 → 256 B ページ書き込み。同時に SHA-256 を計算。
+4. manifest の `bin` (v0.3.0〜 `ticker.bin`、v0.2.x は `wifi_ota.bin`) を 4 kB ずつ受信しながらセクタ消去 →
+   256 B ページ書き込み。同時に SHA-256 を計算。名前は manifest に従うので、bin の種類の切り替えも OTA でできる。
 5. サイズと SHA-256 が manifest と一致したら先頭セクタを書き、**0x1C000000 (アドレス変換もキャッシュも通さない
    XIP 窓)** から全域を読み戻してもう一度 SHA-256 を照合。
 6. `reboot(FLASH_UPDATE, 対象区画)` → 新版が TBYB で起動。
@@ -129,15 +140,16 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 ```sh
 rustup target add thumbv8m.main-none-eabihf     # rust-toolchain.toml が stable + rust-src + llvm-tools を指定
 cargo build --release                           # 全 bin
-cargo build --release --bin wifi_ota --features tbyb   # OTA で配る (Release 用) イメージ
+cargo build --release --bin ticker --features tbyb     # OTA で配る (Release 用) イメージ (v0.3.0〜)
+(cd tools/ticker-tests && cargo test)                   # ticker の純粋なロジックをホストでテスト
 ```
 
 ELF から配布物を作るには picotool 2.x が必要です:
 
 ```sh
-PICOTOOL=/path/to/picotool scripts/make-ota-image.sh target/thumbv8m.main-none-eabihf/release/wifi_ota out
-#   → out/wifi_ota.bin (OTA 用生イメージ) / out/wifi_ota.uf2 / out/wifi_ota.sha256
-scripts/make-manifest.sh out/wifi_ota.bin 0.2.6 out/manifest.json
+PICOTOOL=/path/to/picotool scripts/make-ota-image.sh target/thumbv8m.main-none-eabihf/release/ticker out
+#   → out/ticker.bin (OTA 用生イメージ) / out/ticker.uf2 / out/ticker.sha256
+scripts/make-manifest.sh out/ticker.bin 0.3.0 out/manifest.json
 scripts/make-partition-table.sh                 # partition/pico2w-ab.uf2
 ```
 
@@ -153,11 +165,12 @@ CI アーティファクトの入手は [ci-build.md](docs/ci-build.md)。
    ([ota-setup.md §1](docs/ota-setup.md))。
 2. **Wi-Fi 設定**: microSD (FAT16/32) のルートに `WIFI.TXT` を置く (1 行目 SSID、2 行目 WPA2 パスフレーズ。
    [wifi-status.md](docs/wifi-status.md))。
-3. **最初のアプリ**: Release から `wifi_ota-plain.uf2` (TBYB 無し。Wi-Fi 未設定でも起動する) を D&D するか
-   `picotool load -f -v -x wifi_ota-plain.uf2`。Wi-Fi が確実に通る機体なら `wifi_ota.uf2` (TBYB 付き) でもよいが、
+3. **最初のアプリ**: Release から `ticker-plain.uf2` (TBYB 無し。Wi-Fi 未設定でも起動する) を D&D するか
+   `picotool load -f -v -x ticker-plain.uf2`。Wi-Fi が確実に通る機体なら `ticker.uf2` (TBYB 付き) でもよいが、
    Wi-Fi + DHCP が通らないと 16.7 s で旧版へ戻る (旧版が無ければ BOOTSEL に落ちる)。
-4. 以後は電源と Wi-Fi だけで更新されます。LCD の行 1 に `wifi_ota vX.Y.Z [via OTA] slot A/B TBYB:...`、
-   行 2 に `OTA: ...` の進捗が出ます ([wifi-ota.md §4](docs/wifi-ota.md))。
+   (`wifi_ota-plain.uf2` も同様に使える。任意で `TICKER.TXT` を SD に置く: [ticker.md §4](docs/ticker.md))
+4. 以後は電源と Wi-Fi だけで更新されます。LCD の下 2 行に `ticker vX.Y.Z [via OTA] slot A/B TBYB:...` と
+   `OTA: ...` の進捗が出ます ([wifi-ota.md §4](docs/wifi-ota.md)、[ticker.md §1](docs/ticker.md))。
 
 ## リリースと自動更新
 
@@ -170,8 +183,8 @@ CI アーティファクトの入手は [ci-build.md](docs/ci-build.md)。
      Release にアセットを添付します。
    - または `git tag vX.Y.Z && git push origin vX.Y.Z`。`build.yml` の `push: tags` が同じことをします。
 4. Release には全 bin の `.uf2` / `.bin` / `.sha256`、`pico2w-ab.uf2`、そして `--features tbyb` でビルドした
-   `wifi_ota.bin` / `wifi_ota.uf2` と `manifest.json` が付きます。実機は常に `releases/latest/download/<name>` を
-   見るので、アセット名に版数は入れません。
+   `ticker.bin` / `ticker.uf2` (と `wifi_ota.bin` / `wifi_ota.uf2`) と、`ticker.bin` を指す `manifest.json` が付きます。
+   実機は常に `releases/latest/download/<name>` を見るので、アセット名に版数は入れません。
 5. 稼働中の機体は 60 秒以内に manifest を見に行き、新しければ更新 → 再起動 → 自己診断 → 確定します。
 
 ## 実機で学んだこと
@@ -201,7 +214,7 @@ CI アーティファクトの入手は [ci-build.md](docs/ci-build.md)。
   証明書を扱えないため。経路上の攻撃者が任意のファームウェアを配れるので、**信頼できる LAN でだけ使うこと**。
   第 3 段階として manifest への Ed25519 署名 (公開鍵をファームウェアに埋め込み) を予定
   ([wifi-ota.md §6](docs/wifi-ota.md))。
-- OTA で更新できるのは `wifi_ota` だけ。他の bin は USB (picotool / D&D) で書く。
+- OTA で配れるのは manifest が指す 1 つの bin (v0.3.0〜 `ticker`)。他の bin は USB (picotool / D&D) で書く。
 - 実機確認は 1 台のみ。複数台・長期運用・フラッシュ書き込み中の cyw43 の挙動などは未確認
   ([wifi-ota.md §8](docs/wifi-ota.md))。
 - パーティションテーブル自体の更新、Wi-Fi ファームウェア (cyw43、約 231 kB) の分離配布は扱っていない。
