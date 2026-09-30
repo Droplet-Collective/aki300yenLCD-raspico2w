@@ -108,7 +108,8 @@ pub fn render_frame(sc: &Scenario, bg: &[u16], bg_level: u8, layout: Layout, ext
     }
     let mut px = vec![0u16; PIXELS];
     let mut canvas = Canvas::new(&mut px);
-    let view = sc.view(extra_secs, scroll_x);
+    let text = sc.scroll_text();
+    let view = sc.view(extra_secs, scroll_x, &text);
     screen::render(&mut canvas, bg, bg_level, &view, layout);
     px
 }
@@ -146,7 +147,8 @@ pub fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<(), String> 
 pub fn render_scenario(sc: &Scenario, base: &Path, out: &Path, name: &str, gif: bool) -> Result<(), String> {
     let bg = background_for(sc, base)?;
     let layout = sc.layout();
-    let frame = render_frame(sc, &bg, sc.bg_level, layout, 0, sc.scroll_x);
+    let start_x = sc.start_scroll_x(&sc.scroll_text());
+    let frame = render_frame(sc, &bg, sc.bg_level, layout, 0, start_x);
     for scale in [1, 3] {
         let (w, h, rgb) = to_rgb(&frame, scale);
         let file = if scale == 1 { format!("{name}.png") } else { format!("{name}@{scale}x.png") };
@@ -164,7 +166,7 @@ fn write_animation(sc: &Scenario, base: &Path, mut bg: Frame, path: &Path) -> Re
     let layout = sc.layout();
     let frame_ms = a.frame_ms.max(20) / 10 * 10;
     let frames = a.duration_ms / frame_ms;
-    let text_w = crate::font::shinonome::text_width(&sc.message) as i32;
+    let text = sc.scroll_text();
     let (_, scroll_w) = layout.scroll_area(sc.status.expanded);
     let mut next = match &sc.next_background {
         Some(p) => Some(BmpLoader::open(&resolve(base, p))?),
@@ -174,19 +176,15 @@ fn write_animation(sc: &Scenario, base: &Path, mut bg: Frame, path: &Path) -> Re
     let load_end = fade_out_end + a.load_ms;
     let mut rows_total = 0u32;
     let mut frames_rgb: Vec<Frame> = Vec::new();
-    // LCD のフレーム番号で流れる文字を進める (ファームウェアと同じ: 帯の右端から左へ、出切ったら右端へ)
-    let mut scroll_x = sc.scroll_x;
+    // LCD のフレーム番号で流れる文字を進める (ファームウェアと同じ `scroll::advance`: 設定の部分があれば
+    // 切れ目なく繰り返し、無ければ帯の右端から左へ、出切ったら右端へ)
+    let mut scroll_x = sc.start_scroll_x(&text);
     let mut lcd_frame_prev = 0u64;
     for i in 0..frames {
         let t = i * frame_ms;
         let lcd_frame = t as u64 * a.lcd_hz as u64 / 1000;
         for _ in lcd_frame_prev..lcd_frame {
-            if text_w > 0 {
-                scroll_x -= a.scroll_px.max(1);
-                if scroll_x + text_w < 0 {
-                    scroll_x = scroll_w;
-                }
-            }
+            scroll_x = crate::scenario::advance(&text, scroll_x, a.scroll_px.max(1), scroll_w);
         }
         lcd_frame_prev = lcd_frame;
         let level = match &mut next {
@@ -313,7 +311,7 @@ pub fn render_sheet(sc: &Scenario, base: &Path, bgs: &[PathBuf], out: &Path, nam
         for (bi, (label, raw)) in backgrounds.iter().enumerate() {
             let mut bg = raw.clone();
             screen::prepare_background(&mut bg, *layout);
-            let frame = render_frame(sc, &bg, sc.bg_level, *layout, 0, sc.scroll_x);
+            let frame = render_frame(sc, &bg, sc.bg_level, *layout, 0, sc.start_scroll_x(&sc.scroll_text()));
             let (_, _, rgb) = to_rgb(&frame, scale as u32);
             let ox = gap + bi * (cw + gap);
             let oy = gap + li * (ch + label_h + gap) + label_h;

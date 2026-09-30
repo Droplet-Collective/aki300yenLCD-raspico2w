@@ -184,6 +184,10 @@ fn every_layout_renders_all_states() {
         for (expanded, with_banner) in [(false, false), (true, false), (false, true), (true, true)] {
             sc.status.expanded = expanded;
             sc.banner = with_banner.then(|| banner.clone());
+            // 流れる文字の設定の部分 (0.5.1〜): 無し / URL とコード (目立たせる) / Wi-Fi 接続待ち
+            sc.settings = with_banner.then(|| banner.clone());
+            sc.highlight = with_banner;
+            sc.settings_waiting = expanded && !with_banner;
             sc.clock = None;
             sc.weather = None;
             let _ = crate::output::render_frame(&sc, &bg, 32, layout, 0, 0);
@@ -208,4 +212,39 @@ fn settings_banner_fits() {
     let line = banner_line(&b);
     assert!(line.len() <= 66, "{line}");
     assert_eq!(line.as_str(), "settings: http://255.255.255.255/  code 999999");
+}
+
+/// 流れる文字 (0.5.1〜): 設定の部分があるときは 1 周 (`width`) ずらしても画面が 1 画素も変わらない
+/// (= 折り返しのつなぎ目で飛ばない)。3 つの画面構成とも、文字が帯より短い / 長い / 空の場合で確かめる
+#[test]
+fn looped_scroll_is_seamless_at_the_join() {
+    use crate::scenario::{BannerJson, Scenario, advance};
+    use crate::ui::screen::Layout;
+    let bg = vec![0x39e7u16; PIXELS];
+    let long = "長い文字が続きます。".repeat(8);
+    for message in ["", "短い文字", long.as_str()] {
+        let mut sc = Scenario::default();
+        sc.message = message.into();
+        sc.settings = Some(BannerJson {
+            url: "http://192.168.200.130/".into(),
+            code: "482913".into(),
+        });
+        let text = sc.scroll_text();
+        assert!(text.looped());
+        let w = text.width();
+        for layout in [Layout::Glass, Layout::Dock, Layout::Classic] {
+            let (_, area_w) = layout.scroll_area(false);
+            for x in [0, -1, -37, -(w / 2), -(w - 1)] {
+                let a = crate::output::render_frame(&sc, &bg, 32, layout, 0, x);
+                let b = crate::output::render_frame(&sc, &bg, 32, layout, 0, x - w);
+                assert!(a == b, "{} x={x} w={w} len={}", layout.name(), message.len());
+            }
+            // 進める規則も 1 周で戻る (位置は常に (-w, area_w] に収まる)
+            let mut x = 0;
+            for _ in 0..(3 * w) {
+                x = advance(&text, x, 1, area_w);
+                assert!(x > -w && x <= area_w);
+            }
+        }
+    }
 }

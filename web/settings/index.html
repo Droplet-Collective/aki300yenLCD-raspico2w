@@ -255,7 +255,7 @@ ul.results button span { color: var(--muted); font: 12px var(--mono); white-spac
       </section>
 
       <section class="panel" id="panel-message">
-        <h2>流れる文字 <span class="key">message / message_url</span></h2>
+        <h2>流れる文字 <span class="key">message / message_url / show_settings</span></h2>
         <div class="stack">
           <div class="seg" role="radiogroup" aria-label="流れる文字の出どころ">
             <label><input type="radio" name="msgmode" value="url" id="m-url">URL から取得 (5 分ごと)</label>
@@ -268,6 +268,11 @@ ul.results button span { color: var(--muted); font: 12px var(--mono); white-spac
             <textarea id="f-message" maxlength="600"></textarea>
             <span class="count" id="c-message">0 / 512 バイト</span>
           </label>
+          <label class="toggle" style="white-space:normal"><input type="checkbox" id="f-show_settings"> 流れる文字に設定 URL とコードを入れる</label>
+          <p class="hint" id="note-show-settings" style="margin:0">文字の後ろに <code>◆ 設定 http://…/  コード 123456 ◆</code> を毎周流します。
+            <b>入れている間は、LCD を見られる人なら誰でも、同じ Wi-Fi からこのページで設定を変えられます</b>
+            (コードがずっと見えているため。0.5.0 でも、起動後 1 分の案内が出ている間は同じでした)。
+            来客や人通りから LCD が見える場所では外してください。外しても「LCD にコードを表示」で 1 分だけ出せます。</p>
         </div>
       </section>
 
@@ -537,7 +542,7 @@ $('code-cancel').addEventListener('click', () => {
 async function showCodeOnLcd() {
   try {
     await post('/api/show-code', '', { needCode: false });
-    toast('LCD の下の帯に 1 分間コードを出しました', 'ok');
+    toast('LCD の流れる文字を設定 URL とコードの所へ進めました (1 分間は必ず流します)', 'ok');
   } catch (e) { toast(e.message, 'error'); }
 }
 $('code-show').addEventListener('click', showCodeOnLcd);
@@ -578,7 +583,7 @@ let files = [];      // SD の BMP [{name,size}]
 let photoState = []; // 並び [{name,size,use}]
 let photosLoaded = false;
 
-const FIELDS = ['place', 'lat', 'lon', 'tz', 'layout', 'slide', 'status', 'scroll', 'message', 'message_url', 'images'];
+const FIELDS = ['place', 'lat', 'lon', 'tz', 'layout', 'slide', 'status', 'scroll', 'message', 'message_url', 'images', 'show_settings'];
 
 function current() {
   const radio = (n) => (document.querySelector(`input[name=${n}]:checked`) || {}).value;
@@ -595,6 +600,7 @@ function current() {
     message: local ? $('f-message').value.replace(/[\r\n\t]+/g, ' ').trim() : '',
     message_url: $('f-message_url').value.trim(),
     images: imagesValue(),
+    show_settings: $('f-show_settings').checked ? '1' : '0',
   };
 }
 
@@ -612,6 +618,7 @@ function base() {
     message: b.local_message ? b.message : '',
     message_url: b.message_url,
     images: photosLoaded ? imagesValueOf(initialPhotoState()) : b.images,
+    show_settings: b.show_settings === false ? '0' : '1',
   };
 }
 
@@ -668,6 +675,7 @@ function fillForm(s) {
   $('f-message_url').value = s.message_url;
   $('f-message').value = s.local_message ? s.message : '';
   (s.local_message ? $('m-local') : $('m-url')).checked = true;
+  $('f-show_settings').checked = s.show_settings !== false;
   photoState = initialPhotoState();
   renderPhotos();
   refreshUi();
@@ -695,7 +703,7 @@ function refreshUi() {
 }
 
 function labelOf(k) {
-  return { place: '地名', lat: '緯度', lon: '経度', tz: '時差', layout: '画面構成', slide: '切り替え間隔', status: '状態表示', scroll: '速さ', message: '文字', message_url: 'URL', images: '写真の並び' }[k] || k;
+  return { place: '地名', lat: '緯度', lon: '経度', tz: '時差', layout: '画面構成', slide: '切り替え間隔', status: '状態表示', scroll: '速さ', message: '文字', message_url: 'URL', images: '写真の並び', show_settings: '設定 URL の表示' }[k] || k;
 }
 
 function validate(c) {
@@ -1064,7 +1072,8 @@ function paintLcd() {
   if (!c) return;
   $('lcd-place').textContent = c.place || '—';
   $('note-tz').textContent = ' UTC' + c.tz + ' ';
-  const text = $('m-local').checked ? (c.message || '(文字なし)') : (lastStatus && lastStatus.message_state ? `URL の文字 (${lastStatus.message_state})` : 'URL の文字');
+  let text = $('m-local').checked ? (c.message || '(文字なし)') : (lastStatus && lastStatus.message_state ? `URL の文字 (${lastStatus.message_state})` : 'URL の文字');
+  if (c.show_settings === '1') text += `\u3000◆\u3000設定 http://${(lastStatus && lastStatus.ip) || location.hostname}/  コード ••••••\u3000◆`;
   $('lcd-band').textContent = text;
 }
 

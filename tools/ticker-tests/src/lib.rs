@@ -21,6 +21,14 @@ pub mod sntp;
 pub mod weather;
 #[path = "../../../src/font/shinonome.rs"]
 pub mod shinonome;
+/// 流れる文字の組み立て (0.5.1〜)。`ui::scroll` は `crate::font::shinonome` を使うので、同じ道筋を用意する
+pub mod font {
+    pub use super::shinonome;
+}
+#[path = "../../../src/ui/scroll.rs"]
+pub mod scroll;
+#[cfg(test)]
+mod scroll_tests;
 
 /// 設定ページ (0.5.0〜) の純粋な部品。`upload` は `crate::ticker::config` を使うので、同じ道筋を用意する
 pub mod ticker {

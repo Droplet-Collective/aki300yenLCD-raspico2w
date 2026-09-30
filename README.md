@@ -23,7 +23,8 @@ PIO + DMA で駆動し、その表示を持ったファームウェアを **Wi-F
   v0.4.0 からは SD の写真 (BMP) をスライドショーで背景にし、その上に半透明の板で情報を重ねます。
   画面は PC のシミュレータ `tools/ui-sim` で書き込む前に確かめられます ([ui-sim.md](docs/ui-sim.md))。
   v0.5.0 からは同じ LAN のブラウザで地域 / 表示 / 流れる文字 / 写真を変えられる **設定ページ** があります
-  ([settings-server.md](docs/settings-server.md))。起動後 1 分、LCD に URL とアクセスコードが出ます。
+  ([settings-server.md](docs/settings-server.md))。v0.5.1 からは URL とアクセスコードが流れる文字の中に毎周流れます
+  (`ticker.txt` の `show_settings=0` か設定ページで止められます)。
 
 ## ハードウェア
 
@@ -244,4 +245,5 @@ OTA で配るファーム (`ticker` など) や `src/ota`・起動の方針・�
   ([wifi-ota.md §8](docs/wifi-ota.md))。
 - 設定ページ (0.5.0〜) は LAN の中の平文の HTTP。アクセスコードと Host / Origin の確認でよそのサイトからの操作は防ぐが、
   同じ LAN で通信を見られる人からは守れない ([settings-server.md §4](docs/settings-server.md))。
+  0.5.1〜 の既定 (`show_settings=1`) ではコードが LCD に常に流れるので、LCD を見られる人は誰でも設定を変えられる。
 - パーティションテーブル自体の更新、Wi-Fi ファームウェア (cyw43、約 231 kB) の分離配布は扱っていない。

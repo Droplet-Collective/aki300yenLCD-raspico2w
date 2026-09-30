@@ -95,7 +95,7 @@ buy 待ちの版は次が **全部** 揃ってから `BUY_SETTLE_MS` (25 s) 健�
 
 - **`scripts/stack-report.py` を必ず回し、margin ≥ 10 KB を保つ** (CI は margin < 0 でしか落ちないので 10 KB は手で守る)。
   `python3 scripts/stack-report.py target/thumbv8m.main-none-eabihf/release/ticker --path 6`
-  (0.4.2: free 38,144 B / 最深 24,444 B / +13.7 kB。0.5.0: free 36,380 B / 最深 23,588 B / +12.8 kB。
+  (0.4.2: free 38,144 B / 最深 24,444 B / +13.7 kB。0.5.0: free 36,380 B / 最深 23,588 B / +12.8 kB。0.5.1: free 35,572 B / 最深 24,780 B / +10.8 kB — 10 kB まで残り 0.8 kB、次に RAM / スタックを増やす変更は先に削る所を探す。
   RAM を増やす変更は必ず前後を比較して PR に書く)。
   新しいタスクを足したら `ROOTS` に追加する。rustup の llvm-tools を使う (GNU objdump は ARM ELF を読めない)。
 - スタックは SRAM8/9 まで (`memory.x` の `_stack_start` = 0x2008_2000)。下端は `supervisor::set_stack_limit` が MSPLIM に設定、

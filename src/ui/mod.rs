@@ -12,6 +12,7 @@
 //! - [`bmp`] — SD の BMP を行ごとに読み、画面いっぱいに拡大縮小して背景にする
 //! - [`background`] — 写真が無いときのグラデーション、フェード
 //! - [`screen`] — 画面構成 ([`screen::View`] を [`screen::Layout`] で描く)
+//! - [`scroll`] — 流れる文字の組み立て (文字 + 設定ページの URL とコード、0.5.1〜)
 //! - [`slide`] — スライドショーの切り替え (背景のフェード) の明るさ
 //! - [`recovery`] — 回復モードの画面 (黒地に `FONT_6X10` だけ、0.4.2〜)
 
@@ -24,6 +25,7 @@ pub mod color;
 pub mod icons;
 pub mod recovery;
 pub mod screen;
+pub mod scroll;
 pub mod slide;
 
 /// 画面の幅 (px)

@@ -1,4 +1,4 @@
-# 設定ページ (`ticker` v0.5.0〜)
+# 設定ページ (`ticker` v0.5.0〜、現行 v0.5.1)
 
 同じ LAN (同じ Wi-Fi) のスマートフォンや PC のブラウザから、ticker の設定を変えるページ。端末 (Pico 2 W) の中の
 小さな HTTP サーバ (`src/web/`) が配る。変えられるのは `ticker.txt` の設定 (地域 / 表示 / 流れる文字 / 写真の並び)
@@ -6,20 +6,24 @@
 
 ## 1. 開き方
 
-1. 端末を起動する。最初の OTA 確認 (起動から 10〜20 s) が通ると、LCD の下の帯に 1 分間
-   `設定 http://192.168.x.y/  コード 123456` が出る (状態 3 行を出している間は行 1 に `settings: http://... code ...`)。
+1. 端末を起動する。最初の OTA 確認 (起動から 10〜20 s) が通ると、LCD の流れる文字の後ろに毎周
+   `◆ 設定 http://192.168.x.y/ コード 123456 ◆` が流れる (0.5.1〜。0.5.0 は下の帯に 1 分だけ出していた)。
+   状態 3 行を出している間 (起動 60 s など) は行 1 にも 1 分 `settings: http://... code ...`。
 2. 同じ Wi-Fi につないだブラウザでその URL を開く (`http://` で。`https://` ではない)。
 3. 設定を変えて「保存」を押す。初めて保存するときに LCD の 6 桁のコードを聞かれる。コードは起動するたびに変わる。
-   案内が消えた後は、ページの「LCD にコードを表示」で 1 分間もう一度出せる。
+   `show_settings=0` (流れる文字に入れない) にしているときは、ページの「LCD にコードを表示」で 1 分だけ流れる文字に入れられる
+   (設定の部分へ進めて 12 s 目立たせる)。
 
 IP アドレスは状態 3 行の行 1 (`SSID 192.168.x.y | NTP ...`) にも出る (`status=full` なら常に)。ルーターの DHCP の
 一覧でも探せる (ホスト名は付けていないので MAC アドレスで)。`ticker.local` (mDNS) は使えない (§7)。
 
 LCD の見本 (ui-sim、`tools/ui-sim/scenarios/settings*.json`):
 
-- ふだんの画面: 帯の流れる文字の代わりに `設定 http://… コード …` (`settings.json`)
+- ふだんの画面: 流れる文字の中の設定の部分 (`settings.json`)、つなぎ目を流れる GIF (`settings-scroll.json`)、
+  「LCD にコードを表示」の直後 (`settings-highlight.json`)
 - 状態 3 行の表示中 (起動 60 s、TBYB の buy 待ちなど): 行 1 が `settings: http://… code …` (`settings-status.json`)
 - `layout=dock`: 下の台の 2 行目 (`settings-dock.json`)
+- 流れる文字の組み立ての規則 (区切り、IP が無いとき、`show_settings=0`、長い文字の切り方) は [ticker.md §1.3](ticker.md)
 
 ## 2. できること
 
@@ -28,6 +32,7 @@ LCD の見本 (ui-sim、`tools/ui-sim/scenarios/settings*.json`):
 | 地域: 都市の検索 (ブラウザが Open-Meteo の地名検索 API を直接呼ぶ。端末は通信しない)、地名、緯度、経度、UTC からの時差 | `place` `lat` `lon` `tz` | すぐ。緯度 / 経度が変わったら天気をすぐ取り直す |
 | 表示: 画面構成 (Glass / Dock / Classic)、写真の切り替え間隔、状態 3 行の出し方、流れる文字の速さ | `layout` `slide` `status` `scroll` | すぐ。画面構成を変えたら写真を読み直す (写真の暗がりを構成ごとに焼き込むため) |
 | 流れる文字: 「URL から取得」(既定、5 分ごと) か「この端末で決める」 | `message_url` / `message` | すぐ。`message=` があれば取得しない |
+| 流れる文字に設定 URL とコードを入れる (0.5.1〜、既定 入れる) | `show_settings` (`1` / `0`) | すぐ (次のフレームで組み直す) |
 | 写真: SD の BMP の一覧 (サムネイル)、並べ替え、使う / 使わない、削除、追加 | `images` | すぐ (スライドショーが一覧を作り直す) |
 | 端末の状態 (読むだけ): 版、稼働時間、Wi-Fi (SSID / IP)、OTA の行、最後の確認、NTP / 天気 / 文字、スタックの最大使用量、前回のリセット理由、TBYB | — | 5 s ごとに更新 |
 | ボタン: 今すぐ更新を確認 / 再起動 / LCD にコードを表示 | — | — |
@@ -52,16 +57,16 @@ LCD の見本 (ui-sim、`tools/ui-sim/scenarios/settings*.json`):
 |---|---|---|
 | `GET /` | 不要 | 設定ページ (gzip、`Content-Encoding: gzip`、CSP 付き) |
 | `GET /api/status` | 不要 | 端末の状態 (`version` `uptime_s` `ssid` `ip` `rssi` (常に null) `wifi` `ntp` `weather` `message_state` `ota` `ota_tone` `ident` `tbyb` `stack_used` `stack_total` `last_reset` `layout` `weather_now` `last_ota_check_s` `ota_checks` `pending`) |
-| `GET /api/settings` | 不要 | 今の設定 (`place` `lat` `lon` `tz_offset_secs` `layout` `slide` `status` `scroll` `message_url` `local_message` `message` `images` `sd`) |
+| `GET /api/settings` | 不要 | 今の設定 (`place` `lat` `lon` `tz_offset_secs` `layout` `slide` `status` `scroll` `show_settings` (0.5.1〜) `message_url` `local_message` `message` `images` `sd`) |
 | `GET /api/images` | 不要 | SD の BMP `{"files":[{"name","size"}],"order":[images= の名前],"max":16,"upload_size":115254}` |
 | `GET /img/NAME.BMP` | 不要 | SD の BMP をそのまま (`image/bmp`)。サムネイルはブラウザが縮める |
-| `POST /api/settings` | 要 | `application/x-www-form-urlencoded`。変えるキーだけ (`place` `lat` `lon` `tz` `layout` `slide` `status` `scroll` `message` `message_url` `images`)。`images=` / `message=` を空で送ると行を消す。値の規則は `ticker.txt` と同じ (`config::valid_value`)。4 kB まで |
+| `POST /api/settings` | 要 | `application/x-www-form-urlencoded`。変えるキーだけ (`place` `lat` `lon` `tz` `layout` `slide` `status` `scroll` `message` `message_url` `images` `show_settings`)。`images=` / `message=` を空で送ると行を消す。値の規則は `ticker.txt` と同じ (`config::valid_value`)。4 kB まで |
 | `POST /api/images/delete` | 要 | `name=NAME.BMP`。`images=` にあれば外す |
 | `POST /api/upload?name=元の名前` | 要 | 本文は 400×96 の 24 bit BMP ちょうど 115,254 バイト (`application/octet-stream`)。応答 `{"ok":true,"name":"SD の名前"}` |
 | `POST /api/reboot` | 要 | 再起動 (buy 待ちなら 409) |
 | `POST /api/ota-check` | 要 | すぐに OTA を確認する (新しい版があれば入れて再起動) |
 | `POST /api/auth` | 要 | コードを確かめるだけ |
-| `POST /api/show-code` | 不要 | LCD に案内 (URL とコード) を 1 分出す。10 s に 1 回まで |
+| `POST /api/show-code` | 不要 | 流れる文字を設定の部分 (URL とコード) へ進めて 12 s 目立たせ、1 分は `show_settings=0` でも入れる (状態 3 行の行 1 にも 1 分)。10 s に 1 回まで |
 | `OPTIONS *` | — | 405 (CORS の許可は返さない) |
 
 curl の例: `curl -H 'X-Ticker-Code: 123456' -d 'layout=dock&slide=60' http://192.168.200.130/api/settings`
@@ -72,7 +77,8 @@ LAN の中だけで使う前提で、TLS は無い (平文の HTTP)。そのう�
 操作する (CSRF / DNS rebinding) こと** を防ぐ:
 
 1. **アクセスコード**: 状態を変える要求 (POST) は `X-Ticker-Code` ヘッダに 6 桁のコードが要る。コードは起動ごとに乱数
-   (RP2350 の ROSC) から作り、LCD にだけ出す (起動後 1 分と、ページが頼んだとき)。
+   (RP2350 の ROSC) から作り、LCD にだけ出す (0.5.1〜 既定では流れる文字の中に常に。`show_settings=0` なら
+   ページが頼んだときの 1 分と、状態 3 行の行 1 に起動後 1 分)。
 2. **独自ヘッダ = CORS の事前確認**: `X-Ticker-Code` は「単純でない」ヘッダなので、よそのサイトのページが送るには
    ブラウザが先に `OPTIONS` で許可を聞く。サーバは許可を返さない (405) ので、ブラウザは本当の要求を送らない。
 3. **`Host` の確認** (GET も): `Host` はこの端末の IP アドレス (`a.b.c.d` / `a.b.c.d:80`) だけを受ける。DNS rebinding
@@ -88,6 +94,10 @@ LAN の中だけで使う前提で、TLS は無い (平文の HTTP)。そのう�
 
 - **同じ LAN の中の盗聴 / なりすまし**: 平文なので、同じ Wi-Fi で通信を見られる人はコードも設定も読める。コードを
   知った人 / LCD を見られる人は設定を変えられる。LAN の中の人を信用できない場所では使わない (または SD の抜き差しで設定する)。
+- **LCD を見られる人 (0.5.1〜 の既定)**: `show_settings=1` (既定) ではコードが流れる文字にずっと出ているので、**LCD を
+  見られる人なら誰でも、同じ Wi-Fi から設定を変えられる** (写真の削除 / 追加、再起動も)。0.5.0 でも起動後 1 分の案内の間は
+  同じだった (出ている時間が長くなっただけで、守りの仕組みは変わらない)。来客や人通りから LCD が見える場所では、設定ページの
+  「流れる文字に設定 URL とコードを入れる」を外す (`show_settings=0`)。ページにも同じ注意を書いた。
 - **読み取り**: GET (状態 / 設定 / 写真) はコード無しで読める (同じ LAN の中の人だけ。よそのサイトからは `Host` の確認で読めない)。
   Wi-Fi のパスワードはどこにも出ない。
 - **締め出しを使った妨害**: 間違ったコードを送り続ければ、正しい利用者も締め出される (数分〜15 分)。再起動で解ける。

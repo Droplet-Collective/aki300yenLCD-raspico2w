@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use crate::ui::screen::{Banner, Clock, StatusView, Tone, View, WeatherView};
+use crate::ui::scroll::{self, ScrollText, Settings};
 
 #[derive(Deserialize, Clone)]
 #[serde(default)]
@@ -27,8 +28,16 @@ pub struct Scenario {
     pub animation: AnimationJson,
     /// 回復モードの画面 (0.4.2〜)。指定すると時計 / 天気 / 写真の代わりにこれを描く (GIF は作らない)
     pub recovery: Option<RecoveryJson>,
-    /// 設定ページの案内 (0.5.0〜): {"url": "http://192.168.x.y/", "code": "123456"}
+    /// 状態 3 行の行 1 に出す設定ページの案内 (0.5.0〜): {"url": "http://192.168.x.y/", "code": "123456"}
     pub banner: Option<BannerJson>,
+    /// 流れる文字に入れる設定の部分 (0.5.1〜、`show_settings=1` で待ち受け中): {"url": ..., "code": ...}
+    pub settings: Option<BannerJson>,
+    /// 設定の部分を `設定: Wi-Fi 接続待ち` にする (IP が無い)。`settings` より優先
+    pub settings_waiting: bool,
+    /// 設定の部分を目立たせる (「LCD にコードを表示」の直後)
+    pub highlight: bool,
+    /// 指定すると静止画 / GIF の最初の位置を「設定の部分が範囲の左端 + この px」にする (`scroll_x` の代わり)
+    pub scroll_to_settings: Option<i32>,
 }
 
 /// 設定ページの案内 (`ui::screen::Banner`)
@@ -135,6 +144,10 @@ impl Default for Scenario {
             animation: AnimationJson::default(),
             recovery: None,
             banner: None,
+            settings: None,
+            settings_waiting: false,
+            highlight: false,
+            scroll_to_settings: None,
         }
     }
 }
@@ -217,7 +230,30 @@ impl Scenario {
         Layout::parse(&self.layout).unwrap_or(Layout::Glass)
     }
 
-    pub fn view(&self, extra_secs: u32, scroll_x: i32) -> View<'_> {
+    /// 流れる文字を組み立てる (ファームウェアの render_task と同じ `ScrollText::compose`)
+    pub fn scroll_text(&self) -> ScrollText {
+        let mut text = ScrollText::new();
+        let settings = if self.settings_waiting {
+            Settings::Waiting
+        } else {
+            match &self.settings {
+                Some(b) => Settings::Ready { url: &b.url, code: &b.code },
+                None => Settings::Hidden,
+            }
+        };
+        text.compose(&self.message, settings);
+        text
+    }
+
+    /// 最初のスクロール位置 (`scroll_to_settings` があれば設定の部分から)
+    pub fn start_scroll_x(&self, text: &ScrollText) -> i32 {
+        match (self.scroll_to_settings, text.settings_scroll_x()) {
+            (Some(offset), Some(x)) => x + offset,
+            _ => self.scroll_x,
+        }
+    }
+
+    pub fn view<'a>(&'a self, extra_secs: u32, scroll_x: i32, text: &'a ScrollText) -> View<'a> {
         let s = &self.status;
         View {
             clock: self.clock.map(|c| c.to_clock(extra_secs)),
@@ -230,7 +266,7 @@ impl Scenario {
                 min: w.min,
                 rain_pct: w.rain_pct,
             }),
-            message: &self.message,
+            scroll: text.line(self.highlight),
             scroll_x,
             status: StatusView {
                 expanded: s.expanded,
@@ -254,3 +290,8 @@ impl Scenario {
 }
 
 use crate::ui::screen::Layout;
+
+/// GIF の 1 フレーム分だけ流れる文字を進める (ファームウェアと同じ `scroll::advance`)
+pub fn advance(text: &ScrollText, scroll_x: i32, step: i32, area_w: i32) -> i32 {
+    scroll::advance(scroll_x, step, text.width(), area_w, text.looped())
+}

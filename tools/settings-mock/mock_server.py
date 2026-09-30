@@ -38,6 +38,7 @@ STATE = {
         "slide": 30,
         "status": "auto",
         "scroll": 1,
+        "show_settings": True,
         "message_url": "https://raw.githubusercontent.com/Droplet-Collective/aki300yenLCD-raspico2w/main/ticker/message.txt",
         "local_message": False,
         "message": "",
@@ -222,7 +223,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def save(self, form):
         s = STATE["settings"]
-        allowed = {"place", "lat", "lon", "tz", "layout", "slide", "status", "scroll", "message", "message_url", "images"}
+        allowed = {"place", "lat", "lon", "tz", "layout", "slide", "status", "scroll", "message", "message_url", "images", "show_settings"}
         for key, values in form.items():
             if key not in allowed:
                 return self.fail(400, "知らない設定の名前です")
@@ -253,6 +254,9 @@ class Handler(BaseHTTPRequestHandler):
                     n = int(v)
                     assert 1 <= n <= 8
                     s["scroll"] = n
+                elif key == "show_settings":
+                    assert v in ("0", "1")
+                    s["show_settings"] = v == "1"
                 elif key == "message":
                     assert len(v.encode()) <= 512
                     s["message"] = v

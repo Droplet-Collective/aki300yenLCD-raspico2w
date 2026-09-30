@@ -4,7 +4,9 @@
   "clock": { "year": 2026, "month": 9, "day": 30, "hour": 21, "minute": 53, "second": 44 },
   "place": "札幌",
   "weather": { "temperature": 14.2, "code": 3, "max": 17.0, "min": 10.4, "rain_pct": 20 },
-  "status": { "expanded": false, "version": "v0.5.0" },
-  "banner": { "url": "http://192.168.200.130/", "code": "482913" },
+  "message": "こんにちは、おちょこさん。今日もいい一日を。",
+  "status": { "expanded": false, "version": "v0.5.1" },
+  "settings": { "url": "http://192.168.200.130/", "code": "482913" },
+  "scroll_to_settings": 0,
   "animation": { "duration_ms": 1000 }
 }

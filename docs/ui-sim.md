@@ -63,6 +63,7 @@ cargo test --release
 | `ota.json` | OTA のダウンロード中 (状態 3 行 + 進捗バー)、雪、氷点下 |
 | `error.json` | 天気の取得失敗 (`WX` が赤)、雷雨 |
 | `lastreset.json` | 0.4.1〜: 異常終了からの再起動直後 (状態行 1 に赤の `last reset: STACK OVERFLOW ...`、状態行 2 にスタックの最大使用量 `stk`、最初の OTA 確認中) |
+| `settings.json` / `settings-dock.json` / `settings-scroll.json` / `settings-highlight.json` | 0.5.1〜: 流れる文字の中の設定 URL とコード (Glass / Dock、つなぎ目を流れる GIF、「LCD にコードを表示」の直後)。`settings-status.json` は状態 3 行の行 1 |
 
 ```jsonc
 {
@@ -75,6 +76,11 @@ cargo test --release
   "weather": { "temperature": 19.1, "code": 2, "max": 21.9, "min": 18.6, "rain_pct": 40 },  // null = 天気取得中
   "message": "流れる文字",
   "scroll_x": 0,                             // PNG での流れる文字の位置 (帯の左端からの px)
+  "settings": { "url": "http://192.168.200.130/", "code": "482913" },  // 0.5.1〜 流れる文字に入れる設定の部分 (null で無し)
+  "settings_waiting": false,                 // true で `設定: Wi-Fi 接続待ち`
+  "highlight": false,                        // 設定の部分を目立たせる (「LCD にコードを表示」の直後)
+  "scroll_to_settings": -35,                 // 指定すると最初の位置 = 設定の部分が左端 + この px (scroll_x の代わり)
+  "banner": { "url": "...", "code": "..." }, // 状態 3 行の行 1 の `settings: ... code ...` (expanded のときだけ見える)
   "status": {
     "expanded": false,                       // true で状態 3 行 (docs/ticker.md「状態表示」の規則は実機側)
     "line1": "...", "line1_tone": "ok",      // tone: muted / normal / ok / busy / error
