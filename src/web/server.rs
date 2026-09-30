@@ -259,10 +259,12 @@ impl Server {
             }
         };
         let req = Req::from_head(&head, len);
+        // 本文の後ろまで読んでしまった (パイプライン化された次の要求): 次の要求の頭が分からないので、応答したら閉じる
+        let overread = len > req.head_len + req.body_len as usize;
         let result = self.route(w, app, &req, started).await;
         match result {
             Ok(next) => {
-                if req.close {
+                if req.close || overread {
                     Next::Close
                 } else {
                     next
