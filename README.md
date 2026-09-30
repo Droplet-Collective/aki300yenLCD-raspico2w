@@ -71,7 +71,8 @@ src/
   font/shinonome.rs 東雲フォント (14 ドット日本語) の検索と描画
   bin/              下記の実行ファイル
 partition/          A/B パーティションテーブル (pico2w-ab.json → pico2w-ab.uf2)
-scripts/            make-ota-image.sh (ELF → .bin/.uf2/.sha256)、make-manifest.sh、make-partition-table.sh
+scripts/            make-ota-image.sh (ELF → .bin/.uf2/.sha256)、make-manifest.sh、make-partition-table.sh、
+                    stack-report.py (スタック見積もり)、check-skill.py (CI: SKILL.md / CLAUDE.md の検査)
 fonts/shinonome/    東雲フォント (14 ドット) のビットマップテーブルとライセンス (Public Domain)
 fonts/dejavu/       時計 / 気温の AA 数字の元 (DejaVu Sans) のライセンス
 ticker/message.txt  ticker が流す文字 (main を書き換えれば 5 分以内に反映)
@@ -133,8 +134,11 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 5. サイズと SHA-256 が manifest と一致したら先頭セクタを書き、**0x1C000000 (アドレス変換もキャッシュも通さない
    XIP 窓)** から全域を読み戻してもう一度 SHA-256 を照合。
 6. `reboot(FLASH_UPDATE, 対象区画)` → 新版が TBYB で起動。
-7. 新版はウォッチドッグを 2 s ごとに延長しながら LCD 走査 + Wi-Fi join + DHCP を待ち、通れば `explicit_buy`。
-   起動から 120 s 以内に通らなければ延長をやめ、ウォッチドッグで旧版に戻る。
+7. 新版 (buy 待ち) は次が全部揃ってから 25 s 健全に動いたときだけ `explicit_buy` する (0.4.2〜 `boot_policy::BuyGate`):
+   Wi-Fi join + DHCP、OTA の manifest 確認が TLS + HTTP を最後まで通った (manifest を解釈できた / 確定した HTTP ステータス)、
+   `ticker` の機能を一巡 (NTP / 天気 / 文字 / SD の設定 / 最初の写真。`wifi_ota` は一巡なし)、main / 取得 / 描画の生存確認。
+   起動から 180 s 以内に揃わなければウォッチドッグの再ロードをやめ、旧版に戻る。buy 待ちの OTA 確認は manifest を読むだけ。
+   詳細 (ウォッチドッグ、回復モード、他方区画へ戻す) は [ticker.md §8](docs/ticker.md)。
 8. 巻き戻ったとき: 新版は進行段階と稼働時間を `WATCHDOG.SCRATCH5〜7` に書き続けているので、旧版が起動時に読んで
    `WATCHDOG.REASON` や BOOT_INFO の診断ワードと共に LCD に出す。旧版は対象区画に manifest と同じイメージが
    あることから巻き戻りを検出し、10 分後に FLASH_UPDATE 起動を再試行する。
@@ -211,7 +215,7 @@ OTA で配るファーム (`ticker` など) や `src/ota`・起動の方針・�
   8 kB にした。アセット配信ホストは RSA 4096 の証明書で、embedded-tls の `rsa` feature (alloc) 無しでは TLS 1.3 の
   ハンドシェイクが成立しない。
 - **TBYB のウォッチドッグは 16.7 s (24 bit × 1 µs)**: Wi-Fi join + DHCP はこれに収まらないことがあるので、buy 待ちの
-  間は 2 s ごとに `WATCHDOG.LOAD` を再ロードして延長し、120 s を自己診断の締め切りにした。
+  間は 2 s ごとに `WATCHDOG.LOAD` を再ロードして延長し、120 s を自己診断の締め切りにした (0.4.2 から 180 s、buy 条件も強化。上の更新フロー 7)。
 - **温かい再起動で CYW43439 が状態を引き継ぐ**: FLASH_UPDATE 再起動後、join は通るのに DHCP が一度も通らなかった。
   起動時に WL_REG_ON を 500 ms 落としてコールドスタートさせ、再起動前にも `leave()` + 電源断をする。
 - **DHCP タイムアウトでは再 join する**: 20 s で IP が取れなければ AP から離脱してやり直す。
