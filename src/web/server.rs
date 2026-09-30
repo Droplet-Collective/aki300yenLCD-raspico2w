@@ -566,10 +566,12 @@ impl Server {
         })
         .map_err(|_| Fail(503, "SD にファイルを作れません"))?;
         let mut blocks = BlockWriter { fill: upload::HEADER, written: 0 };
-        let pre = req.pre_body(w.head);
-        let extra = &pre[pre.len().min(upload::HEADER)..];
-        let mut result = blocks.push(&file, w.block, extra);
         let total = upload::UPLOAD_SIZE as usize;
+        // ヘッダと一緒に届いた本文の残り。pre_body は Content-Length で切ってあるが、書く量はここでも BMP の長さで抑える
+        // (Devin Review の指摘。ファイルが 115,254 B を超えないことを 2 か所で守る)
+        let pre = req.pre_body(w.head);
+        let extra = &pre[upload::extra_range(pre.len(), total)];
+        let mut result = blocks.push(&file, w.block, extra);
         while result.is_ok() && blocks.written + blocks.fill < total {
             let room = (512 - blocks.fill).min(total - blocks.written - blocks.fill);
             let fill = blocks.fill;
@@ -957,8 +959,7 @@ impl Req {
 
     /// ヘッダと一緒に届いた本文の先頭
     fn pre_body<'b>(&self, head: &'b [u8]) -> &'b [u8] {
-        let end = self.len.min(self.head_len + self.body_len as usize);
-        &head[self.head_len.min(end)..end]
+        &head[http::body_prefix(self.len, self.head_len, self.body_len)]
     }
 }
 
