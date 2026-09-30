@@ -93,6 +93,8 @@ pub enum Stage {
     FallbackReboot = 22,
     /// SD の初期化 / wifi.txt / ticker.txt の読み込み中 (0.4.2〜)
     SdInit = 23,
+    /// 設定ページのサーバが待ち受けを始めた (最初の OTA 確認が通った後。0.5.0〜)
+    WebListening = 24,
     /// panic ハンドラに入った (SCRATCH7 = 行番号、SCRATCH0 = `&Location` のアドレス (0.4.1〜))
     Panic = 0xE0,
     /// HardFault に入った (SCRATCH7 = PC、SCRATCH0 = LR (0.4.1〜))
@@ -105,6 +107,8 @@ pub enum Stage {
     WdtRender = 0xE5,
     /// 登録していない割り込みが来た (SCRATCH7 = IRQ 番号。0.4.1〜)
     UnhandledIrq = 0xE6,
+    /// ウォッチドッグの監視で設定ページのサーバ (1 つの要求の処理) の停止を検出した (SCRATCH7 = ms。0.5.0〜)
+    WdtWeb = 0xE7,
 }
 
 impl Stage {
@@ -134,12 +138,14 @@ impl Stage {
             21 => Self::OtaProved,
             22 => Self::FallbackReboot,
             23 => Self::SdInit,
+            24 => Self::WebListening,
             0xE0 => Self::Panic,
             0xE1 => Self::HardFault,
             0xE2 => Self::StackOverflow,
             0xE3 => Self::WdtMain,
             0xE4 => Self::WdtJobs,
             0xE5 => Self::WdtRender,
+            0xE7 => Self::WdtWeb,
             0xE6 => Self::UnhandledIrq,
             _ => return None,
         })
@@ -171,12 +177,14 @@ impl Stage {
             Self::OtaProved => "ota-ok",
             Self::FallbackReboot => "fallback",
             Self::SdInit => "sd-init",
+            Self::WebListening => "web",
             Self::Panic => "PANIC",
             Self::HardFault => "HARDFAULT",
             Self::StackOverflow => "STACK-OVERFLOW",
             Self::WdtMain => "WDT-MAIN",
             Self::WdtJobs => "WDT-JOBS",
             Self::WdtRender => "WDT-RENDER",
+            Self::WdtWeb => "WDT-WEB",
             Self::UnhandledIrq => "UNHANDLED-IRQ",
         }
     }

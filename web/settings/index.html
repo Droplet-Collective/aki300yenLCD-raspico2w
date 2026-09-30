@@ -1,0 +1,1160 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:,">
+<title>Ticker 設定</title>
+<style>
+/* 設定ページ (firmware の src/web/server.rs が gzip で送る)。LCD のガラスの画面と同じ色 (src/ui/color.rs の palette)。
+   レイアウト: 上に LCD の見本 (400×96)、下にガラス板のカードを 1〜2 列。保存は画面下の帯。 */
+:root {
+  --ground: #070a12;
+  --glass: rgba(8, 12, 22, .62);
+  --glass-strong: rgba(8, 12, 22, .86);
+  --edge: rgba(255, 255, 255, .11);
+  --edge-strong: rgba(255, 255, 255, .22);
+  --text: #ecf0f8;
+  --soft: #c4cede;
+  --muted: #828c9e;
+  --faint: #58606f;
+  --accent: #ffb048;
+  --aqua: #60e0e8;
+  --green: #60e880;
+  --yellow: #ffd840;
+  --red: #ff5858;
+  --font: system-ui, -apple-system, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Noto Sans Mono", monospace;
+  --r: 14px;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { background: var(--ground); }
+body {
+  margin: 0; min-height: 100vh; color: var(--text); font: 15px/1.6 var(--font);
+  background:
+    radial-gradient(1200px 520px at 12% -10%, rgba(255, 176, 72, .16), transparent 60%),
+    radial-gradient(900px 600px at 100% 0%, rgba(96, 224, 232, .12), transparent 55%),
+    linear-gradient(180deg, #0c1224 0%, var(--ground) 70%);
+  background-attachment: fixed;
+  padding-inline: 16px; padding-block: calc(16px + env(safe-area-inset-top, 0px)) calc(96px + env(safe-area-inset-bottom, 0px));
+}
+.wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 16px; }
+header.top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+header.top h1 { font-size: 20px; margin: 0; font-weight: 700; letter-spacing: .02em; }
+header.top h1 small { color: var(--muted); font-weight: 500; font-size: 14px; margin-left: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--edge); background: var(--glass); font-size: 12.5px; color: var(--soft); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.ok { background: var(--green); box-shadow: 0 0 8px rgba(96, 232, 128, .6); }
+.dot.busy { background: var(--yellow); }
+.dot.error { background: var(--red); }
+.spacer { flex: 1; }
+
+/* LCD の見本 */
+.lcd { position: relative; width: 100%; max-width: 800px; aspect-ratio: 400 / 96; border-radius: 10px; overflow: hidden; background: #111a2e; border: 1px solid var(--edge-strong); box-shadow: 0 10px 40px rgba(0, 0, 0, .5), inset 0 0 0 4px #05070c; container-type: inline-size; }
+.lcd canvas.bg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.lcd .scrim { position: absolute; inset: 0; background: linear-gradient(120deg, rgba(0, 0, 0, .45), transparent 58%); }
+.lcd .clock { position: absolute; left: 2%; top: 3%; font-weight: 600; font-size: 8.4cqw; line-height: 1; letter-spacing: -.01em; text-shadow: 0 .25cqw .5cqw rgba(0, 0, 0, .6); font-variant-numeric: tabular-nums; }
+.lcd .clock span { font-size: 4.4cqw; color: var(--soft); }
+.lcd .date { position: absolute; left: 2.5%; top: 41%; font-size: 3.5cqw; text-shadow: 0 .2cqw .4cqw rgba(0, 0, 0, .7); }
+.lcd .card { position: absolute; left: 58.5%; top: 4%; width: 40.5%; height: 56%; border-radius: 1cqw; background: rgba(8, 12, 22, .55); border: 1px solid rgba(255, 255, 255, .14); backdrop-filter: blur(3px); padding: 1cqw 1.5cqw; font-size: 3.3cqw; }
+.lcd .card .place { position: absolute; right: 1.5cqw; top: 1cqw; color: var(--soft); }
+.lcd .card .temp { color: var(--accent); font-size: 4.6cqw; font-weight: 600; }
+.lcd .band { position: absolute; left: 1%; right: 1%; top: 77%; height: 20%; border-radius: 1cqw; background: rgba(8, 12, 22, .55); border: 1px solid rgba(255, 255, 255, .14); font-size: 3.4cqw; display: flex; align-items: center; padding: 0 1.5cqw; gap: 2cqw; white-space: nowrap; overflow: hidden; }
+.lcd .band b { color: var(--accent); font-weight: 600; }
+.lcd .card { line-height: 1.3; }
+.lcd.dock .card { left: .75%; right: .75%; top: 54%; width: auto; height: 43%; display: flex; align-items: flex-start; gap: 2.5cqw; padding-top: 1.2cqw; }
+.lcd.dock .card br { display: none; }
+.lcd.dock .card .place { position: static; order: 3; color: var(--muted); }
+.lcd.dock .date { left: 50%; top: 17%; }
+.lcd.dock .band { top: auto; bottom: 4%; height: 20%; left: 1.5%; right: 1.5%; background: none; border: none; backdrop-filter: none; }
+.lcd.classic .scrim { background: rgba(0, 0, 0, .55); }
+.lcd.classic .card, .lcd.classic .band { background: none; border: none; backdrop-filter: none; }
+.lcd.classic .card { left: 48.5%; top: 17%; width: 50%; display: flex; gap: 2cqw; align-items: baseline; }
+.lcd.classic .card br { display: none; }
+.lcd.classic .card .place { position: static; order: -1; color: var(--accent); }
+.lcd.classic .card .temp { font-size: 3.4cqw; font-weight: 400; }
+.lcd.classic .date { left: 49%; top: 3%; color: #a0e0ff; text-shadow: none; }
+.lcd.classic .band { top: 54%; height: 16%; color: #ffffc0; }
+.lcd-row { display: grid; grid-template-columns: minmax(0, 800px) minmax(0, 1fr); gap: 16px; align-items: end; }
+.lcd-note { color: var(--muted); font-size: 13px; }
+.lcd-note strong { color: var(--soft); font-weight: 600; }
+
+/* カード */
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.col { display: grid; gap: 16px; min-width: 0; }
+section.panel { background: var(--glass); border: 1px solid var(--edge); border-radius: var(--r); padding: 18px; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); min-width: 0; }
+section.panel > h2 { margin: 0 0 12px; font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; text-wrap: balance; }
+section.panel > h2 .key { font: 12px var(--mono); color: var(--muted); font-weight: 400; }
+.hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+.hint code, code { font-family: var(--mono); font-size: .92em; color: var(--soft); }
+
+/* 状態 */
+dl.status { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 14px; margin: 0; font-size: 14px; }
+dl.status dt { color: var(--muted); }
+dl.status dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+dl.status dd.mono { font-family: var(--mono); font-size: 12.5px; color: var(--soft); }
+.tone-ok { color: var(--green); } .tone-busy { color: var(--yellow); } .tone-error { color: var(--red); } .tone-muted { color: var(--muted); }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+
+/* 入力 */
+label.field { display: grid; gap: 5px; font-size: 13px; color: var(--soft); min-width: 0; }
+.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+.stack { display: grid; gap: 14px; }
+input[type=text], input[type=number], input[type=url], select, textarea {
+  width: 100%; min-width: 0; font: 15px var(--font); color: var(--text); background: rgba(0, 0, 0, .32); border: 1px solid var(--edge-strong); border-radius: 9px; padding: 9px 11px; outline: none;
+}
+input[type=number] { font-variant-numeric: tabular-nums; }
+textarea { resize: vertical; min-height: 84px; line-height: 1.5; }
+input:focus-visible, select:focus-visible, textarea:focus-visible { border-color: var(--aqua); box-shadow: 0 0 0 3px rgba(96, 224, 232, .2); }
+input.changed, select.changed, textarea.changed { border-color: var(--accent); }
+.count { font: 12px var(--mono); color: var(--muted); text-align: right; }
+.count.over { color: var(--red); }
+button { font: 600 14px var(--font); color: var(--text); background: rgba(255, 255, 255, .08); border: 1px solid var(--edge-strong); border-radius: 10px; padding: 9px 14px; cursor: pointer; }
+button:hover { background: rgba(255, 255, 255, .14); }
+button:focus-visible { outline: 2px solid var(--aqua); outline-offset: 2px; }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); color: #1a1206; border-color: transparent; }
+button.primary:hover { background: #ffc06c; }
+button.danger { color: var(--red); border-color: rgba(255, 88, 88, .45); }
+button.small { padding: 5px 9px; font-size: 12.5px; border-radius: 8px; }
+button.icon { width: 32px; height: 32px; padding: 0; display: inline-grid; place-items: center; font-size: 15px; }
+
+/* 選択肢 (画面構成 / 状態表示) */
+.choices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.choice { position: relative; display: grid; gap: 6px; padding: 10px; border-radius: 11px; border: 1px solid var(--edge); background: rgba(0, 0, 0, .22); cursor: pointer; font-size: 13px; color: var(--soft); min-width: 0; }
+.choice input { position: absolute; opacity: 0; pointer-events: none; }
+.choice:has(input:checked) { border-color: var(--accent); background: rgba(255, 176, 72, .1); color: var(--text); }
+.choice:has(input:focus-visible) { outline: 2px solid var(--aqua); outline-offset: 2px; }
+.choice .name { font-weight: 700; }
+.choice .desc { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.mini { width: 100%; aspect-ratio: 400 / 96; border-radius: 4px; background: linear-gradient(135deg, #3b4a6b, #1d2438); position: relative; overflow: hidden; }
+.mini i { position: absolute; border-radius: 2px; background: rgba(8, 12, 22, .6); border: 1px solid rgba(255, 255, 255, .25); }
+.mini b { position: absolute; background: rgba(255, 255, 255, .85); border-radius: 1px; }
+.seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--edge-strong); border-radius: 10px; overflow: hidden; }
+.seg label { padding: 7px 12px; font-size: 13px; cursor: pointer; color: var(--soft); border-right: 1px solid var(--edge); }
+.seg label:last-child { border-right: 0; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: rgba(255, 176, 72, .16); color: var(--text); }
+.seg label:has(input:focus-visible) { outline: 2px solid var(--aqua); outline-offset: -2px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.range-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+.range-row output { font: 13px var(--mono); color: var(--soft); min-width: 5.5em; text-align: right; }
+
+/* 都市の検索 */
+.search { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+ul.results { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; }
+ul.results button { width: 100%; text-align: left; font-weight: 500; display: flex; justify-content: space-between; gap: 10px; background: rgba(0, 0, 0, .2); }
+ul.results button span { color: var(--muted); font: 12px var(--mono); white-space: nowrap; }
+
+/* 写真 */
+.photos { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.photo { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 8px; border-radius: 11px; border: 1px solid var(--edge); background: rgba(0, 0, 0, .2); }
+.photo.off { opacity: .55; }
+.photo.dragging { outline: 2px dashed var(--accent); }
+.photo canvas { width: 150px; height: 36px; border-radius: 4px; background: #1d2438; display: block; }
+.photo .meta { min-width: 0; display: grid; gap: 2px; }
+.photo .meta .n { font: 600 14px var(--mono); overflow-wrap: anywhere; }
+.photo .meta .s { font-size: 12px; color: var(--muted); }
+.photo .ctl { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--soft); cursor: pointer; white-space: nowrap; }
+.toggle input { accent-color: var(--accent); width: 16px; height: 16px; }
+.empty { color: var(--muted); font-size: 14px; padding: 14px; border: 1px dashed var(--edge-strong); border-radius: 11px; text-align: center; }
+
+/* 保存の帯 */
+.savebar { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); background: var(--glass-strong); border-top: 1px solid var(--edge-strong); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); z-index: 10; }
+.savebar .in { max-width: 1080px; margin: 0 auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.savebar .msg { flex: 1; min-width: 12em; font-size: 14px; color: var(--soft); }
+.savebar .msg b { color: var(--accent); }
+
+/* ダイアログ */
+.modal { position: fixed; inset: 0; background: rgba(2, 4, 10, .72); display: grid; place-items: center; padding: 16px; z-index: 20; }
+#dlg-code, #dlg-confirm { z-index: 25; }
+.dialog { width: min(560px, 100%); max-height: calc(100vh - 32px); overflow: auto; background: #0d1322; border: 1px solid var(--edge-strong); border-radius: 16px; padding: 20px; display: grid; gap: 14px; box-shadow: 0 20px 60px rgba(0, 0, 0, .6); }
+.dialog.wide { width: min(880px, 100%); }
+.dialog h3 { margin: 0; font-size: 17px; }
+.codebox { font: 600 28px var(--mono); letter-spacing: .35em; text-align: center; padding: 10px; }
+.crop-view { position: relative; width: 100%; aspect-ratio: 400 / 96; border-radius: 8px; overflow: hidden; background: #000; touch-action: none; cursor: grab; border: 1px solid var(--edge-strong); }
+.crop-view:active { cursor: grabbing; }
+.crop-view canvas { width: 100%; height: 100%; display: block; }
+.crop-view .guides { position: absolute; inset: 0; pointer-events: none; }
+.crop-view .guides i { position: absolute; border: 1px dashed rgba(255, 255, 255, .55); border-radius: 3px; background: rgba(8, 12, 22, .25); }
+.crop-out { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+.crop-out canvas { width: 200px; height: 48px; border-radius: 4px; image-rendering: pixelated; border: 1px solid var(--edge); }
+
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(84px + env(safe-area-inset-bottom, 0px)); background: #0d1322; border: 1px solid var(--edge-strong); border-radius: 12px; padding: 10px 16px; font-size: 14px; z-index: 30; max-width: calc(100% - 32px); box-shadow: 0 10px 30px rgba(0, 0, 0, .5); }
+.toast.error { border-color: var(--red); }
+.toast.ok { border-color: var(--green); }
+
+@media (max-width: 860px) {
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .lcd-row { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 520px) {
+  .choices { grid-template-columns: minmax(0, 1fr); }
+  .choice { grid-template-columns: 110px minmax(0, 1fr); align-items: center; }
+  .choice .mini { grid-row: span 2; }
+  .photo { grid-template-columns: 110px minmax(0, 1fr); }
+  .photo canvas { width: 110px; height: 26px; }
+  .photo .ctl { grid-column: 1 / -1; justify-content: space-between; }
+  section.panel { padding: 14px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .toast { animation: rise .2s ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translate(-50%, 8px); } }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Network Ticker<small>設定</small></h1>
+    <span class="chip" id="chip-version">v…</span>
+    <span class="spacer"></span>
+    <span class="chip"><span class="dot" id="dot-conn"></span><span id="conn-text">接続中…</span></span>
+  </header>
+
+  <div class="lcd-row">
+    <div class="lcd glass" id="lcd" aria-label="LCD の見本 (400×96)">
+      <canvas class="bg" id="lcd-bg" width="400" height="96"></canvas>
+      <div class="scrim"></div>
+      <div class="clock" id="lcd-clock">--:--<span>:--</span></div>
+      <div class="date" id="lcd-date">時刻同期中…</div>
+      <div class="card"><span class="place" id="lcd-place">東京</span><span class="temp" id="lcd-temp">--.-°</span><br><span id="lcd-wx">天気取得中…</span></div>
+      <div class="band"><span id="lcd-band">流れる文字</span></div>
+    </div>
+    <p class="lcd-note">上は見本です (写真は SD の 1 枚目、時計はこの端末の時刻を<strong id="note-tz">UTC+9</strong>で表示)。<br>保存すると LCD にすぐ反映されます。再起動は要りません。</p>
+  </div>
+
+  <div class="grid">
+    <div class="col">
+      <section class="panel" id="panel-region">
+        <h2>地域 <span class="key">place / lat / lon / tz</span></h2>
+        <div class="stack">
+          <div>
+            <div class="search">
+              <input type="text" id="city-q" placeholder="都市の名前で探す (例: 札幌, Paris)" autocomplete="off">
+              <button type="button" id="city-go">検索</button>
+            </div>
+            <ul class="results" id="city-results"></ul>
+            <p class="hint">検索はこのブラウザから Open-Meteo の地名検索を使います (端末は通信しません)。</p>
+          </div>
+          <label class="field">地名 (LCD の天気の右上)
+            <input type="text" id="f-place" maxlength="32" autocomplete="off">
+            <span class="count" id="c-place">0 / 32 バイト</span>
+          </label>
+          <div class="row">
+            <label class="field">緯度<input type="number" id="f-lat" step="0.0001" min="-90" max="90"></label>
+            <label class="field">経度<input type="number" id="f-lon" step="0.0001" min="-180" max="180"></label>
+            <label class="field">UTC からの時差<select id="f-tz"></select></label>
+          </div>
+          <p class="hint">夏時間は自動で切り替わりません。季節で時差が変わる地域は保存し直してください。</p>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-message">
+        <h2>流れる文字 <span class="key">message / message_url</span></h2>
+        <div class="stack">
+          <div class="seg" role="radiogroup" aria-label="流れる文字の出どころ">
+            <label><input type="radio" name="msgmode" value="url" id="m-url">URL から取得 (5 分ごと)</label>
+            <label><input type="radio" name="msgmode" value="local" id="m-local">この端末で決める</label>
+          </div>
+          <label class="field" id="wrap-url">取得する URL (UTF-8 の文字ファイル、512 バイトまで)
+            <input type="url" id="f-message_url" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field" id="wrap-local">表示する文字 (改行は空白になります)
+            <textarea id="f-message" maxlength="600"></textarea>
+            <span class="count" id="c-message">0 / 512 バイト</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-status">
+        <h2>端末の状態</h2>
+        <dl class="status" id="status-list">
+          <dt>版</dt><dd id="s-version">—</dd>
+          <dt>稼働時間</dt><dd id="s-uptime">—</dd>
+          <dt>Wi-Fi</dt><dd id="s-wifi">—</dd>
+          <dt>電波 (RSSI)</dt><dd id="s-rssi">—</dd>
+          <dt>OTA</dt><dd id="s-ota" class="mono">—</dd>
+          <dt>最後の確認</dt><dd id="s-otacheck">—</dd>
+          <dt>取得</dt><dd id="s-jobs" class="mono">—</dd>
+          <dt>スタック</dt><dd id="s-stack">—</dd>
+          <dt>前回のリセット</dt><dd id="s-reset" class="mono">—</dd>
+          <dt>更新の確定</dt><dd id="s-tbyb" class="mono">—</dd>
+        </dl>
+        <div class="actions">
+          <button type="button" id="btn-ota">今すぐ更新を確認</button>
+          <button type="button" id="btn-reboot" class="danger">再起動</button>
+          <button type="button" id="btn-code">LCD にコードを表示</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="panel" id="panel-display">
+        <h2>表示 <span class="key">layout / slide / status / scroll</span></h2>
+        <div class="stack">
+          <div class="choices" role="radiogroup" aria-label="画面構成">
+            <label class="choice"><input type="radio" name="layout" value="glass" id="l-glass">
+              <span class="mini"><b style="left:4%;top:12%;width:30%;height:28%"></b><i style="left:58%;top:5%;width:40%;height:55%"></i><i style="left:1%;top:77%;width:98%;height:20%"></i></span>
+              <span class="name">Glass</span><span class="desc">大きな時計、右上に天気、下に流れる文字</span></label>
+            <label class="choice"><input type="radio" name="layout" value="dock" id="l-dock">
+              <span class="mini"><b style="left:4%;top:12%;width:30%;height:28%"></b><i style="left:1%;top:54%;width:98%;height:43%"></i></span>
+              <span class="name">Dock</span><span class="desc">下の台に天気と流れる文字をまとめる</span></label>
+            <label class="choice"><input type="radio" name="layout" value="classic" id="l-classic">
+              <span class="mini" style="filter:brightness(.55)"><b style="left:3%;top:8%;width:36%;height:30%"></b><b style="left:50%;top:10%;width:30%;height:10%"></b><b style="left:1%;top:57%;width:98%;height:10%"></b></span>
+              <span class="name">Classic</span><span class="desc">0.3 の配置、写真は暗く敷く</span></label>
+          </div>
+          <label class="field">写真の切り替え間隔
+            <select id="f-slide">
+              <option value="0">切り替えない</option>
+              <option value="10">10 秒</option>
+              <option value="30">30 秒</option>
+              <option value="60">1 分</option>
+              <option value="300">5 分</option>
+              <option value="600">10 分</option>
+              <option value="1800">30 分</option>
+              <option value="3600">1 時間</option>
+            </select>
+          </label>
+          <div class="field" style="display:grid;gap:6px;font-size:13px;color:var(--soft)">状態 3 行 (Wi-Fi / 版数 / OTA) の表示
+            <div class="seg" role="radiogroup" aria-label="状態表示">
+              <label><input type="radio" name="status" value="auto" id="st-auto">必要なときだけ</label>
+              <label><input type="radio" name="status" value="full" id="st-full">常に</label>
+              <label><input type="radio" name="status" value="compact" id="st-compact">出さない</label>
+            </div>
+          </div>
+          <label class="field">流れる文字の速さ (1 フレーム ≈ 1/60 秒あたり)
+            <span class="range-row"><input type="range" id="f-scroll" min="1" max="8" step="1"><output id="o-scroll">1 px</output></span>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-photos">
+        <h2>写真 <span class="key">images=</span><span class="spacer"></span><span class="chip" id="photo-count">0 / 16</span></h2>
+        <ul class="photos" id="photos"></ul>
+        <div class="actions">
+          <button type="button" class="primary" id="btn-add">写真を追加…</button>
+          <input type="file" id="file" accept="image/*" hidden>
+        </div>
+        <p class="hint">並べた順に切り替わります (ドラッグか ↑↓ で並べ替え)。「使う」を外した写真は SD に残したまま出しません。追加する写真は 400×96 に切り抜いて 24 bit の BMP (115,254 バイト) にして送ります。</p>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="savebar">
+  <div class="in">
+    <span class="msg" id="save-msg">変更はありません</span>
+    <button type="button" id="btn-revert" disabled>元に戻す</button>
+    <button type="button" class="primary" id="btn-save" disabled>保存</button>
+  </div>
+</div>
+
+<div class="modal" id="dlg-code" hidden>
+  <form class="dialog" id="code-form" autocomplete="off">
+    <h3>アクセスコード</h3>
+    <p class="hint" style="margin:0">設定を変えるには、LCD に出ている 6 桁のコードが要ります。コードは端末を起動するたびに変わります。</p>
+    <input type="text" id="code-input" class="codebox" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="••••••" aria-label="6 桁のコード">
+    <p class="hint tone-error" id="code-err" hidden></p>
+    <div class="actions" style="margin:0">
+      <button type="button" id="code-show">LCD に表示する</button>
+      <span class="spacer"></span>
+      <button type="button" id="code-cancel">やめる</button>
+      <button type="submit" class="primary">続ける</button>
+    </div>
+  </form>
+</div>
+
+<div class="modal" id="dlg-confirm" hidden>
+  <div class="dialog">
+    <h3 id="confirm-title">確認</h3>
+    <p class="hint" style="margin:0" id="confirm-text"></p>
+    <div class="actions" style="margin:0;justify-content:flex-end">
+      <button type="button" id="confirm-no">やめる</button>
+      <button type="button" class="primary" id="confirm-yes">実行</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="dlg-crop" hidden>
+  <div class="dialog wide">
+    <h3>写真を切り抜く (400×96)</h3>
+    <div class="crop-view" id="crop-view">
+      <canvas id="crop-canvas" width="800" height="192"></canvas>
+      <div class="guides" id="crop-guides" hidden>
+        <i style="left:2%;top:4%;width:36%;height:36%"></i>
+        <i style="left:58.5%;top:4%;width:40.5%;height:56%"></i>
+        <i style="left:1%;top:77%;width:98%;height:20%"></i>
+      </div>
+    </div>
+    <label class="field">拡大<span class="range-row"><input type="range" id="crop-zoom" min="1" max="4" step="0.01" value="1"><output id="crop-zoom-o">1.00×</output></span></label>
+    <div class="crop-out">
+      <canvas id="crop-out" width="400" height="96"></canvas>
+      <span>ドラッグで位置、拡大はスライダー / ホイール / 2 本指。<br><label class="toggle"><input type="checkbox" id="crop-guide-on"> 時計・天気・帯の位置を重ねる</label></span>
+    </div>
+    <label class="field">SD に置く名前 (8.3 形式、同じ名前があれば端末が付け直します)
+      <input type="text" id="crop-name" maxlength="12" spellcheck="false" style="font-family:var(--mono)">
+    </label>
+    <div class="actions" style="margin:0;justify-content:flex-end">
+      <span class="hint" id="crop-progress" style="margin:0 auto 0 0"></span>
+      <button type="button" id="crop-cancel">やめる</button>
+      <button type="button" class="primary" id="crop-ok">この範囲で追加</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const bytes = (s) => enc.encode(s).length;
+const MAX_FILES = 16, UPLOAD_SIZE = 115254;
+
+// ---------- 通信: 端末は 1 本ずつしか受けないので、要求は必ず順番に送る ----------
+let chain = Promise.resolve();
+let code = '';
+try { code = sessionStorage.getItem('ticker-code') || ''; } catch (e) { /* 使えなくてもよい */ }
+
+function queued(fn) {
+  const run = chain.then(fn, fn);
+  chain = run.catch(() => {});
+  return run;
+}
+
+async function raw(path, opts = {}, timeoutMs = 12000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    return await fetch(path, { ...opts, signal: ctl.signal, cache: 'no-store' });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+class ApiError extends Error {
+  constructor(status, message, extra) { super(message); this.status = status; this.extra = extra || {}; }
+}
+
+async function readError(res) {
+  let body = {};
+  try { body = await res.json(); } catch (e) { /* 空 */ }
+  return new ApiError(res.status, body.error || ('HTTP ' + res.status), body);
+}
+
+function getJSON(path) {
+  return queued(async () => {
+    const res = await raw(path);
+    if (!res.ok) throw await readError(res);
+    return res.json();
+  });
+}
+
+function getBlob(path) {
+  return queued(async () => {
+    const res = await raw(path, {}, 30000);
+    if (!res.ok) throw await readError(res);
+    return res.blob();
+  });
+}
+
+/** 状態を変える要求。コードが無い / 違うときは聞いてから 1 回だけ送り直す */
+async function post(path, body, { type = 'application/x-www-form-urlencoded', timeoutMs = 15000, needCode = true } = {}) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (needCode && !code) await askCode();
+    const res = await queued(() => raw(path, {
+      method: 'POST',
+      headers: { 'Content-Type': type, 'X-Ticker-Code': code },
+      body,
+    }, timeoutMs));
+    if (res.ok) return res.json();
+    const err = await readError(res);
+    if (err.status === 401 && needCode && attempt === 0) {
+      code = '';
+      await askCode(err.message);
+      continue;
+    }
+    if (err.status === 429 && err.extra.retry_after) err.message += ` (あと ${err.extra.retry_after} 秒)`;
+    throw err;
+  }
+}
+
+function form(obj) {
+  return new URLSearchParams(obj).toString();
+}
+
+// ---------- ちょっとした部品 ----------
+let toastTimer = 0;
+function toast(text, kind = '') {
+  const t = $('toast');
+  t.textContent = text;
+  t.className = 'toast ' + kind;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, kind === 'error' ? 6000 : 3200);
+}
+
+function confirmBox(title, text, yes = '実行') {
+  return new Promise((resolve) => {
+    $('confirm-title').textContent = title;
+    $('confirm-text').textContent = text;
+    $('confirm-yes').textContent = yes;
+    $('dlg-confirm').hidden = false;
+    const done = (v) => { $('dlg-confirm').hidden = true; $('confirm-yes').onclick = $('confirm-no').onclick = null; resolve(v); };
+    $('confirm-yes').onclick = () => done(true);
+    $('confirm-no').onclick = () => done(false);
+    $('confirm-yes').focus();
+  });
+}
+
+let codeWaiters = [];
+function askCode(message) {
+  $('code-err').hidden = !message;
+  $('code-err').textContent = message || '';
+  $('code-input').value = '';
+  $('dlg-code').hidden = false;
+  setTimeout(() => $('code-input').focus(), 30);
+  return new Promise((resolve, reject) => codeWaiters.push({ resolve, reject }));
+}
+$('code-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const v = $('code-input').value.trim();
+  if (!/^\d{6}$/.test(v)) { $('code-err').hidden = false; $('code-err').textContent = '6 桁の数字を入れてください'; return; }
+  code = v;
+  try { sessionStorage.setItem('ticker-code', v); } catch (err) { /* なくてもよい */ }
+  $('dlg-code').hidden = true;
+  codeWaiters.splice(0).forEach((w) => w.resolve());
+});
+$('code-cancel').addEventListener('click', () => {
+  $('dlg-code').hidden = true;
+  codeWaiters.splice(0).forEach((w) => w.reject(new ApiError(0, 'キャンセルしました')));
+});
+async function showCodeOnLcd() {
+  try {
+    await post('/api/show-code', '', { needCode: false });
+    toast('LCD の下の帯に 1 分間コードを出しました', 'ok');
+  } catch (e) { toast(e.message, 'error'); }
+}
+$('code-show').addEventListener('click', showCodeOnLcd);
+$('btn-code').addEventListener('click', showCodeOnLcd);
+
+// ---------- 時差 ----------
+function tzLabel(secs) {
+  const sign = secs < 0 ? '-' : '+';
+  const a = Math.abs(secs);
+  const h = Math.floor(a / 3600), m = Math.round((a % 3600) / 60);
+  return m ? `${sign}${h}:${String(m).padStart(2, '0')}` : `${sign}${h}`;
+}
+(function fillTz() {
+  const sel = $('f-tz');
+  const offs = [];
+  for (let q = -12 * 4; q <= 14 * 4; q++) offs.push(q * 900);
+  for (const s of offs.filter((s) => s % 1800 === 0 || [20700, 31500, 45900, 49500, 34200].includes(s))) {
+    const o = document.createElement('option');
+    o.value = String(s);
+    o.textContent = 'UTC' + tzLabel(s) + (s === 32400 ? ' (日本)' : '');
+    sel.appendChild(o);
+  }
+})();
+
+function tzOffsetOf(zone) {
+  try {
+    const part = new Intl.DateTimeFormat('en-US', { timeZone: zone, timeZoneName: 'longOffset' })
+      .formatToParts(new Date()).find((p) => p.type === 'timeZoneName').value;
+    const m = /GMT([+-])(\d{1,2})(?::?(\d{2}))?/.exec(part);
+    if (!m) return 0;
+    return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 3600 + Number(m[3] || 0) * 60);
+  } catch (e) { return null; }
+}
+
+// ---------- 設定 ----------
+let loaded = null;   // 端末から読んだ設定
+let files = [];      // SD の BMP [{name,size}]
+let photoState = []; // 並び [{name,size,use}]
+let photosLoaded = false;
+
+const FIELDS = ['place', 'lat', 'lon', 'tz', 'layout', 'slide', 'status', 'scroll', 'message', 'message_url', 'images'];
+
+function current() {
+  const radio = (n) => (document.querySelector(`input[name=${n}]:checked`) || {}).value;
+  const local = radio('msgmode') === 'local';
+  return {
+    place: $('f-place').value.trim(),
+    lat: Number($('f-lat').value).toFixed(4),
+    lon: Number($('f-lon').value).toFixed(4),
+    tz: tzLabel(Number($('f-tz').value)),
+    layout: radio('layout'),
+    slide: $('f-slide').value,
+    status: radio('status'),
+    scroll: $('f-scroll').value,
+    message: local ? $('f-message').value.replace(/[\r\n\t]+/g, ' ').trim() : '',
+    message_url: $('f-message_url').value.trim(),
+    images: imagesValue(),
+  };
+}
+
+function base() {
+  const b = loaded;
+  return {
+    place: b.place,
+    lat: Number(b.lat).toFixed(4),
+    lon: Number(b.lon).toFixed(4),
+    tz: tzLabel(b.tz_offset_secs),
+    layout: b.layout,
+    slide: String(b.slide),
+    status: b.status,
+    scroll: String(b.scroll),
+    message: b.local_message ? b.message : '',
+    message_url: b.message_url,
+    images: photosLoaded ? imagesValueOf(initialPhotoState()) : b.images,
+  };
+}
+
+function diff() {
+  if (!loaded) return {};
+  const a = base(), c = current(), out = {};
+  for (const k of FIELDS) if (a[k] !== c[k]) out[k] = c[k];
+  // 文字の出どころを URL に戻すときは message= を消す (空で送る)
+  return out;
+}
+
+function sortedNames() { return files.map((f) => f.name).sort(); }
+
+function initialPhotoState() {
+  const order = loaded && loaded.images ? loaded.images.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean) : [];
+  const byName = new Map(files.map((f) => [f.name.toUpperCase(), f]));
+  const out = [];
+  if (order.length) {
+    for (const n of order) if (byName.has(n)) { out.push({ ...byName.get(n), use: true }); byName.delete(n); }
+    for (const f of [...byName.values()].sort((x, y) => x.name.localeCompare(y.name))) out.push({ ...f, use: false });
+  } else {
+    for (const f of [...files].sort((x, y) => x.name.localeCompare(y.name))) out.push({ ...f, use: true });
+  }
+  return out;
+}
+
+/** images= の値: 全部を名前順に使うなら空 (行を消す = ルートの全部) */
+function imagesValueOf(state) {
+  const used = state.filter((p) => p.use).map((p) => p.name);
+  if (used.length === state.length && used.join() === sortedNames().join()) return '';
+  return used.join(',');
+}
+function imagesValue() { return photosLoaded ? imagesValueOf(photoState) : (loaded ? loaded.images : ''); }
+
+function fillForm(s) {
+  $('f-place').value = s.place;
+  $('f-lat').value = Number(s.lat).toFixed(4);
+  $('f-lon').value = Number(s.lon).toFixed(4);
+  $('f-tz').value = String(s.tz_offset_secs);
+  if (!$('f-tz').value) {
+    const o = document.createElement('option');
+    o.value = String(s.tz_offset_secs); o.textContent = 'UTC' + tzLabel(s.tz_offset_secs);
+    $('f-tz').appendChild(o); $('f-tz').value = o.value;
+  }
+  ($('l-' + s.layout) || $('l-glass')).checked = true;
+  $('f-slide').value = String(s.slide);
+  if (!$('f-slide').value) {
+    const o = document.createElement('option');
+    o.value = String(s.slide); o.textContent = `${s.slide} 秒`;
+    $('f-slide').appendChild(o); $('f-slide').value = o.value;
+  }
+  ($('st-' + s.status) || $('st-auto')).checked = true;
+  $('f-scroll').value = String(s.scroll);
+  $('f-message_url').value = s.message_url;
+  $('f-message').value = s.local_message ? s.message : '';
+  (s.local_message ? $('m-local') : $('m-url')).checked = true;
+  photoState = initialPhotoState();
+  renderPhotos();
+  refreshUi();
+}
+
+function refreshUi() {
+  const local = $('m-local').checked;
+  $('wrap-url').hidden = local;
+  $('wrap-local').hidden = !local;
+  $('o-scroll').value = $('f-scroll').value + ' px';
+  const pb = bytes($('f-place').value.trim());
+  $('c-place').textContent = `${pb} / 32 バイト`;
+  $('c-place').classList.toggle('over', pb > 32);
+  const mb = bytes($('f-message').value.trim());
+  $('c-message').textContent = `${mb} / 512 バイト`;
+  $('c-message').classList.toggle('over', mb > 512);
+  const d = diff();
+  const n = Object.keys(d).length;
+  const map = { place: 'f-place', lat: 'f-lat', lon: 'f-lon', tz: 'f-tz', slide: 'f-slide', message: 'f-message', message_url: 'f-message_url' };
+  for (const [k, id] of Object.entries(map)) $(id).classList.toggle('changed', k in d);
+  $('save-msg').innerHTML = n ? `<b>未保存の変更 ${n} 件</b> (${Object.keys(d).map(labelOf).join('、')})` : '変更はありません';
+  $('btn-save').disabled = !n;
+  $('btn-revert').disabled = !n;
+  paintLcd();
+}
+
+function labelOf(k) {
+  return { place: '地名', lat: '緯度', lon: '経度', tz: '時差', layout: '画面構成', slide: '切り替え間隔', status: '状態表示', scroll: '速さ', message: '文字', message_url: 'URL', images: '写真の並び' }[k] || k;
+}
+
+function validate(c) {
+  if (!c.place) return '地名を入れてください';
+  if (bytes(c.place) > 32) return '地名が長すぎます (UTF-8 で 32 バイトまで、漢字なら 10 文字ほど)';
+  if (c.place.includes('#')) return '地名に # は使えません';
+  const lat = Number(c.lat), lon = Number(c.lon);
+  if (!(lat >= -90 && lat <= 90)) return '緯度は -90〜90 です';
+  if (!(lon >= -180 && lon <= 180)) return '経度は -180〜180 です';
+  if ($('m-local').checked && !c.message) return '表示する文字を入れてください (URL から取得するなら切り替えてください)';
+  if (bytes(c.message) > 512) return '流れる文字が長すぎます (512 バイトまで)';
+  if (!$('m-local').checked && !/^https?:\/\//.test(c.message_url)) return 'URL は http:// か https:// で始めてください';
+  if (c.message_url.includes('#')) return 'URL に # は使えません';
+  return '';
+}
+
+$('btn-save').addEventListener('click', async () => {
+  const d = diff();
+  const problem = validate(current());
+  if (problem) { toast(problem, 'error'); return; }
+  $('btn-save').disabled = true;
+  try {
+    await post('/api/settings', form(d));
+    toast('保存しました。LCD に反映しました', 'ok');
+    await loadSettings();
+  } catch (e) {
+    toast('保存できませんでした: ' + e.message, 'error');
+  } finally {
+    refreshUi();
+  }
+});
+$('btn-revert').addEventListener('click', () => { if (loaded) fillForm(loaded); });
+
+for (const el of document.querySelectorAll('input, select, textarea')) {
+  if (el.closest('.dialog') || el.id === 'city-q' || el.id === 'file') continue;
+  el.addEventListener('input', refreshUi);
+  el.addEventListener('change', refreshUi);
+}
+
+// ---------- 都市の検索 (ブラウザから Open-Meteo の地名検索へ) ----------
+async function searchCity() {
+  const q = $('city-q').value.trim();
+  const ul = $('city-results');
+  ul.innerHTML = '';
+  if (!q) return;
+  const li = document.createElement('li');
+  li.className = 'hint';
+  li.textContent = '検索中…';
+  ul.appendChild(li);
+  try {
+    const url = 'https://geocoding-api.open-meteo.com/v1/search?count=6&format=json&language=ja&name=' + encodeURIComponent(q);
+    const res = await raw(url, {}, 10000);
+    const data = await res.json();
+    ul.innerHTML = '';
+    for (const r of data.results || []) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      const where = [r.admin1, r.country].filter(Boolean).join(', ');
+      const tz = tzOffsetOf(r.timezone);
+      b.innerHTML = '<strong></strong><span></span>';
+      b.firstChild.textContent = r.name + (where ? ` (${where})` : '');
+      b.lastChild.textContent = `${r.latitude.toFixed(2)}, ${r.longitude.toFixed(2)}${tz === null ? '' : '  UTC' + tzLabel(tz)}`;
+      b.addEventListener('click', () => {
+        let name = r.name;
+        while (bytes(name) > 32) name = [...name].slice(0, -1).join('');
+        $('f-place').value = name;
+        $('f-lat').value = r.latitude.toFixed(4);
+        $('f-lon').value = r.longitude.toFixed(4);
+        if (tz !== null) {
+          if (![...$('f-tz').options].some((o) => o.value === String(tz))) {
+            const o = document.createElement('option'); o.value = String(tz); o.textContent = 'UTC' + tzLabel(tz); $('f-tz').appendChild(o);
+          }
+          $('f-tz').value = String(tz);
+        }
+        ul.innerHTML = '';
+        refreshUi();
+      });
+      const item = document.createElement('li');
+      item.appendChild(b);
+      ul.appendChild(item);
+    }
+    if (!ul.children.length) ul.innerHTML = '<li class="hint">見つかりませんでした</li>';
+  } catch (e) {
+    ul.innerHTML = '<li class="hint tone-error">検索できませんでした (インターネットにつながっていないかもしれません)。緯度と経度を直接入れてください。</li>';
+  }
+}
+$('city-go').addEventListener('click', searchCity);
+$('city-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); searchCity(); } });
+
+// ---------- 写真 ----------
+const thumbs = new Map(); // 名前 → ImageBitmap
+
+function renderPhotos() {
+  const ul = $('photos');
+  ul.innerHTML = '';
+  $('photo-count').textContent = `${files.length} / ${MAX_FILES}`;
+  $('btn-add').disabled = !loaded || !loaded.sd || files.length >= MAX_FILES;
+  if (!loaded) return;
+  if (!loaded.sd) { ul.innerHTML = '<li class="empty">SD カードがありません</li>'; return; }
+  if (!photoState.length) { ul.innerHTML = '<li class="empty">写真がありません。「写真を追加」から足せます (無いあいだは LCD はグラデーションの背景)</li>'; return; }
+  photoState.forEach((p, i) => {
+    const li = document.createElement('li');
+    li.className = 'photo' + (p.use ? '' : ' off');
+    li.draggable = true;
+    li.dataset.index = i;
+    const cv = document.createElement('canvas');
+    cv.width = 300; cv.height = 72;
+    drawThumb(cv, p.name);
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.innerHTML = '<span class="n"></span><span class="s"></span>';
+    meta.firstChild.textContent = p.name;
+    meta.lastChild.textContent = `${(p.size / 1024).toFixed(1)} KB` + (p.size === UPLOAD_SIZE ? ' · 400×96' : '');
+    const ctl = document.createElement('div');
+    ctl.className = 'ctl';
+    const use = document.createElement('label');
+    use.className = 'toggle';
+    use.innerHTML = '<input type="checkbox"> 使う';
+    use.firstChild.checked = p.use;
+    use.firstChild.id = 'use-' + p.name;
+    use.firstChild.addEventListener('change', (e) => { p.use = e.target.checked; renderPhotos(); refreshUi(); });
+    const up = button('↑', '上へ', () => move(i, -1), i === 0);
+    const down = button('↓', '下へ', () => move(i, 1), i === photoState.length - 1);
+    const del = button('削除', `${p.name} を SD から消す`, () => removePhoto(p.name));
+    del.className = 'small danger';
+    ctl.append(use, up, down, del);
+    li.append(cv, meta, ctl);
+    li.addEventListener('dragstart', (e) => { li.classList.add('dragging'); e.dataTransfer.setData('text/plain', String(i)); });
+    li.addEventListener('dragend', () => li.classList.remove('dragging'));
+    li.addEventListener('dragover', (e) => e.preventDefault());
+    li.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const from = Number(e.dataTransfer.getData('text/plain'));
+      if (Number.isInteger(from) && from !== i) { const [m] = photoState.splice(from, 1); photoState.splice(i, 0, m); renderPhotos(); refreshUi(); }
+    });
+    ul.appendChild(li);
+  });
+}
+
+function button(text, label, onClick, disabled) {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'small icon'; b.textContent = text; b.title = label; b.setAttribute('aria-label', label);
+  b.disabled = !!disabled; b.addEventListener('click', onClick);
+  return b;
+}
+
+function move(i, d) {
+  const j = i + d;
+  if (j < 0 || j >= photoState.length) return;
+  [photoState[i], photoState[j]] = [photoState[j], photoState[i]];
+  renderPhotos(); refreshUi();
+}
+
+function drawThumb(cv, name) {
+  const ctx = cv.getContext('2d');
+  const bmp = thumbs.get(name);
+  if (!bmp) {
+    ctx.fillStyle = '#1d2438'; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = '#58606f'; ctx.font = '22px system-ui'; ctx.textAlign = 'center'; ctx.fillText('読み込み中…', cv.width / 2, cv.height / 2 + 8);
+    return;
+  }
+  // LCD と同じ「隙間なく覆って中央を切る」縮小 (スライドショーの scale-to-fill)
+  const s = Math.max(cv.width / bmp.width, cv.height / bmp.height);
+  const w = bmp.width * s, h = bmp.height * s;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, (cv.width - w) / 2, (cv.height - h) / 2, w, h);
+}
+
+async function loadThumbs() {
+  for (const f of files) {
+    if (thumbs.has(f.name)) continue;
+    try {
+      const blob = await getBlob('/img/' + encodeURIComponent(f.name));
+      thumbs.set(f.name, await createImageBitmap(blob));
+    } catch (e) {
+      thumbs.set(f.name, null);
+    }
+    renderPhotos();
+    paintLcd();
+  }
+}
+
+async function removePhoto(name) {
+  const ok = await confirmBox('写真を消す', `${name} を SD カードから消します。元には戻せません。`, '消す');
+  if (!ok) return;
+  try {
+    await post('/api/images/delete', form({ name }));
+    thumbs.delete(name);
+    toast(`${name} を消しました`, 'ok');
+    await loadSettings();
+  } catch (e) { toast('消せませんでした: ' + e.message, 'error'); }
+}
+
+async function loadImages() {
+  if (!loaded || !loaded.sd) { files = []; photosLoaded = false; renderPhotos(); return; }
+  try {
+    const data = await getJSON('/api/images');
+    files = data.files;
+    photosLoaded = true;
+  } catch (e) {
+    toast('写真の一覧を読めませんでした: ' + e.message, 'error');
+  }
+}
+
+// ---------- 写真の追加: 切り抜き → 400×96 の 24 bit BMP ----------
+const crop = { img: null, zoom: 1, x: 0, y: 0, name: '' };
+
+$('btn-add').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    const img = await createImageBitmap(file);
+    openCrop(img, file.name);
+  } catch (err) {
+    toast('この画像は開けませんでした (JPEG / PNG / WebP などを選んでください)', 'error');
+  }
+});
+
+function shortName(original) {
+  const stem = original.replace(/\.[^.]*$/, '').toUpperCase().replace(/[^A-Z0-9_-]/g, '').replace(/^[-_]+/, '').slice(0, 8).replace(/[-_]+$/, '');
+  return (stem || 'IMG' + String(Date.now() % 100000).padStart(5, '0')) + '.BMP';
+}
+
+function openCrop(img, name) {
+  crop.img = img;
+  crop.zoom = 1;
+  crop.x = 0; crop.y = 0;
+  crop.name = name;
+  $('crop-zoom').value = '1';
+  $('crop-name').value = shortName(name);
+  $('crop-progress').textContent = '';
+  $('crop-ok').disabled = false;
+  $('dlg-crop').hidden = false;
+  drawCrop();
+}
+
+/** 出力 (400×96) の座標で、画像をどこに描くか */
+function placement() {
+  const img = crop.img;
+  const cover = Math.max(400 / img.width, 96 / img.height);
+  const s = cover * crop.zoom;
+  const w = img.width * s, h = img.height * s;
+  // 動かせる範囲に収める (枠の外が見えないように)
+  const maxX = (w - 400) / 2, maxY = (h - 96) / 2;
+  crop.x = Math.max(-maxX, Math.min(maxX, crop.x));
+  crop.y = Math.max(-maxY, Math.min(maxY, crop.y));
+  return { s, w, h, dx: (400 - w) / 2 + crop.x, dy: (96 - h) / 2 + crop.y };
+}
+
+function drawCrop() {
+  const p = placement();
+  const big = $('crop-canvas').getContext('2d');
+  big.imageSmoothingQuality = 'high';
+  big.clearRect(0, 0, 800, 192);
+  big.drawImage(crop.img, p.dx * 2, p.dy * 2, p.w * 2, p.h * 2);
+  const out = $('crop-out').getContext('2d');
+  out.imageSmoothingQuality = 'high';
+  out.clearRect(0, 0, 400, 96);
+  out.drawImage(crop.img, p.dx, p.dy, p.w, p.h);
+  $('crop-zoom-o').value = crop.zoom.toFixed(2) + '×';
+}
+
+(function cropGestures() {
+  const view = $('crop-view');
+  const pts = new Map();
+  let last = null;
+  const scale = () => 400 / view.clientWidth;
+  view.addEventListener('pointerdown', (e) => { view.setPointerCapture(e.pointerId); pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); last = null; });
+  view.addEventListener('pointermove', (e) => {
+    if (!pts.has(e.pointerId)) return;
+    const prev = pts.get(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 1) {
+      crop.x += (e.clientX - prev.x) * scale();
+      crop.y += (e.clientY - prev.y) * scale();
+    } else if (pts.size === 2) {
+      const [a, b] = [...pts.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (last) setZoom(crop.zoom * d / last);
+      last = d;
+    }
+    drawCrop();
+  });
+  const up = (e) => { pts.delete(e.pointerId); last = null; };
+  view.addEventListener('pointerup', up);
+  view.addEventListener('pointercancel', up);
+  view.addEventListener('wheel', (e) => { e.preventDefault(); setZoom(crop.zoom * Math.exp(-e.deltaY / 400)); drawCrop(); }, { passive: false });
+})();
+
+function setZoom(z) {
+  crop.zoom = Math.max(1, Math.min(4, z));
+  $('crop-zoom').value = String(crop.zoom);
+}
+$('crop-zoom').addEventListener('input', (e) => { setZoom(Number(e.target.value)); drawCrop(); });
+$('crop-guide-on').addEventListener('change', (e) => { $('crop-guides').hidden = !e.target.checked; });
+$('crop-cancel').addEventListener('click', () => { $('dlg-crop').hidden = true; });
+
+/** 400×96 の画素 → 24 bit BMP (下の行から、BGR、1 行 1,200 バイトでパディング無し) = 115,254 バイト */
+function encodeBmp(ctx) {
+  const { data } = ctx.getImageData(0, 0, 400, 96);
+  const buf = new ArrayBuffer(UPLOAD_SIZE);
+  const v = new DataView(buf);
+  v.setUint8(0, 0x42); v.setUint8(1, 0x4d);
+  v.setUint32(2, UPLOAD_SIZE, true);
+  v.setUint32(10, 54, true);
+  v.setUint32(14, 40, true);
+  v.setInt32(18, 400, true);
+  v.setInt32(22, 96, true);
+  v.setUint16(26, 1, true);
+  v.setUint16(28, 24, true);
+  v.setUint32(34, 400 * 96 * 3, true);
+  v.setUint32(38, 2835, true);
+  v.setUint32(42, 2835, true);
+  const px = new Uint8Array(buf, 54);
+  let o = 0;
+  for (let y = 95; y >= 0; y--) {
+    for (let x = 0; x < 400; x++) {
+      const i = (y * 400 + x) * 4;
+      px[o++] = data[i + 2]; px[o++] = data[i + 1]; px[o++] = data[i];
+    }
+  }
+  return new Blob([buf], { type: 'application/octet-stream' });
+}
+
+$('crop-ok').addEventListener('click', async () => {
+  const name = $('crop-name').value.trim().toUpperCase();
+  if (!/^[A-Z0-9_\-~]{1,8}\.BMP$/.test(name) || name.startsWith('_')) {
+    toast('名前は英数字 8 文字まで + .BMP にしてください (例: SUNSET.BMP)', 'error');
+    return;
+  }
+  const blob = encodeBmp($('crop-out').getContext('2d'));
+  $('crop-ok').disabled = true;
+  $('crop-progress').textContent = '送信中… (SD に書くので 5〜20 秒ほど)';
+  try {
+    const res = await post('/api/upload?name=' + encodeURIComponent(name), blob, { type: 'application/octet-stream', timeoutMs: 75000 });
+    $('dlg-crop').hidden = true;
+    toast(`${res.name} を追加しました`, 'ok');
+    thumbs.set(res.name, await createImageBitmap(blob));
+    await loadSettings();
+  } catch (e) {
+    $('crop-progress').textContent = '';
+    toast('追加できませんでした: ' + e.message, 'error');
+  } finally {
+    $('crop-ok').disabled = false;
+  }
+});
+
+// ---------- LCD の見本 ----------
+function paintLcd() {
+  const c = loaded ? current() : null;
+  const lcd = $('lcd');
+  if (c) lcd.className = 'lcd ' + c.layout;
+  const ctx = $('lcd-bg').getContext('2d');
+  const first = photoState.find((p) => p.use && thumbs.get(p.name));
+  if (first) {
+    const bmp = thumbs.get(first.name);
+    const s = Math.max(400 / bmp.width, 96 / bmp.height);
+    ctx.drawImage(bmp, (400 - bmp.width * s) / 2, (96 - bmp.height * s) / 2, bmp.width * s, bmp.height * s);
+  } else {
+    const g = ctx.createLinearGradient(0, 0, 400, 96);
+    g.addColorStop(0, '#1e3a5f'); g.addColorStop(.55, '#3a2f5c'); g.addColorStop(1, '#6b3b4a');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 400, 96);
+  }
+  if (!c) return;
+  $('lcd-place').textContent = c.place || '—';
+  $('note-tz').textContent = ' UTC' + c.tz + ' ';
+  const text = $('m-local').checked ? (c.message || '(文字なし)') : (lastStatus && lastStatus.message_state ? `URL の文字 (${lastStatus.message_state})` : 'URL の文字');
+  $('lcd-band').textContent = text;
+}
+
+function tick() {
+  if (!loaded) return;
+  const off = Number($('f-tz').value || loaded.tz_offset_secs) * 1000;
+  const d = new Date(Date.now() + off);
+  const hh = String(d.getUTCHours()).padStart(2, '0'), mm = String(d.getUTCMinutes()).padStart(2, '0'), ss = String(d.getUTCSeconds()).padStart(2, '0');
+  $('lcd-clock').innerHTML = `${hh}:${mm}<span>:${ss}</span>`;
+  $('lcd-date').textContent = `${d.getUTCMonth() + 1}月${d.getUTCDate()}日(${'日月火水木金土'[d.getUTCDay()]})`;
+}
+setInterval(tick, 1000);
+
+// ---------- 状態 ----------
+let lastStatus = null;
+function fmtUptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return (d ? `${d} 日 ` : '') + `${h} 時間 ${m} 分`;
+}
+function kib(b) { return (b / 1024).toFixed(1) + ' KB'; }
+function tone(el, t) { el.className = (el.classList.contains('mono') ? 'mono ' : '') + 'tone-' + t; }
+
+async function loadStatus() {
+  try {
+    const s = await getJSON('/api/status');
+    lastStatus = s;
+    $('dot-conn').className = 'dot ok';
+    $('conn-text').textContent = s.ip || '接続中';
+    $('chip-version').textContent = 'v' + s.version;
+    $('s-version').textContent = `${s.ident}`;
+    $('s-uptime').textContent = fmtUptime(s.uptime_s);
+    $('s-wifi').textContent = s.ip ? `${s.ssid}  ${s.ip}` : s.wifi;
+    $('s-rssi').textContent = s.rssi === null ? '取得できません (Wi-Fi チップのドライバが対応していない)' : `${s.rssi} dBm`;
+    tone($('s-rssi'), s.rssi === null ? 'muted' : 'ok');
+    $('s-ota').textContent = s.ota;
+    tone($('s-ota'), s.ota_tone === 'normal' ? 'muted' : s.ota_tone);
+    $('s-otacheck').textContent = s.last_ota_check_s === null ? 'まだ' : `${s.last_ota_check_s} 秒前 (起動してから ${s.ota_checks} 回)`;
+    $('s-jobs').textContent = `NTP ${s.ntp} | 天気 ${s.weather} | 文字 ${s.message_state}`;
+    $('s-stack').textContent = `最大 ${kib(s.stack_used)} / ${kib(s.stack_total)} (余り ${kib(s.stack_total - s.stack_used)})`;
+    $('s-reset').textContent = s.last_reset || '—';
+    tone($('s-reset'), /panic|HardFault|STACK|wdt|FALLBACK/.test(s.last_reset) ? 'error' : 'muted');
+    $('s-tbyb').textContent = s.tbyb || '—';
+    tone($('s-tbyb'), s.pending ? 'busy' : 'ok');
+    if (s.weather_now) {
+      $('lcd-temp').textContent = s.weather_now.temperature.toFixed(1) + '°';
+      $('lcd-wx').textContent = s.weather_now.condition;
+    }
+    $('btn-reboot').disabled = s.pending;
+    $('btn-reboot').title = s.pending ? '更新の確定 (TBYB) を待つ間は再起動できません' : '';
+    paintLcd();
+  } catch (e) {
+    $('dot-conn').className = 'dot error';
+    $('conn-text').textContent = '応答なし (更新中かもしれません)';
+  }
+}
+
+$('btn-ota').addEventListener('click', async () => {
+  try { await post('/api/ota-check', ''); toast('更新を確認します。新しい版があれば入れて再起動します', 'ok'); }
+  catch (e) { toast(e.message, 'error'); }
+});
+$('btn-reboot').addEventListener('click', async () => {
+  const ok = await confirmBox('再起動', '端末を再起動します。30 秒ほどで戻ります。アクセスコードは新しくなります。', '再起動する');
+  if (!ok) return;
+  try {
+    await post('/api/reboot', '');
+    code = '';
+    try { sessionStorage.removeItem('ticker-code'); } catch (e) { /* なくてもよい */ }
+    toast('再起動しています…', 'ok');
+  } catch (e) { toast(e.message, 'error'); }
+});
+
+// ---------- 読み込み ----------
+async function loadSettings() {
+  loaded = await getJSON('/api/settings');
+  await loadImages();
+  fillForm(loaded);
+  loadThumbs();
+}
+
+(async function start() {
+  refreshUi();
+  try {
+    await loadStatus();
+    await loadSettings();
+  } catch (e) {
+    toast('端末から設定を読めませんでした: ' + e.message, 'error');
+  }
+  tick();
+  setInterval(() => { if (!document.hidden) loadStatus(); }, 5000);
+})();
+</script>
+</body>
+</html>

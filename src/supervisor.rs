@@ -57,8 +57,8 @@ const PHASE_SUPERVISED: u8 = 2;
 
 static PHASE: AtomicU8 = AtomicU8::new(PHASE_OFF);
 static STREAK_CLEARED: AtomicBool = AtomicBool::new(false);
-static LAST_BEAT: [AtomicU32; WHO_COUNT] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
-static LIMIT_MS: [AtomicU32; WHO_COUNT] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+static LAST_BEAT: [AtomicU32; WHO_COUNT] = [const { AtomicU32::new(0) }; WHO_COUNT];
+static LIMIT_MS: [AtomicU32; WHO_COUNT] = [const { AtomicU32::new(0) }; WHO_COUNT];
 /// buy 待ちの締め切り (起動からの ms、0 = 無し)
 static BUY_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
 static DEADLINE_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -73,12 +73,23 @@ fn now_ms() -> u32 {
 
 /// 生存を知らせる (各タスクのループで呼ぶ。軽い: 時刻を 1 語書くだけ)
 pub fn beat(who: Who) {
-    LAST_BEAT[who as usize].store(now_ms(), Ordering::Relaxed);
+    // `health::PARKED` (u32::MAX) は「監視しない」の印なので、時刻がちょうどその値になる 1 ms は避ける
+    LAST_BEAT[who as usize].store(now_ms().min(health::PARKED - 1), Ordering::Relaxed);
+}
+
+/// `who` の監視を止める (設定ページのサーバが要求を処理し終えて待ち受けに戻ったとき。0.5.0〜)。
+/// 次の [`beat`] で監視が再び始まる
+pub fn park(who: Who) {
+    LAST_BEAT[who as usize].store(health::PARKED, Ordering::Relaxed);
 }
 
 /// `who` が `within_ms` 以内に生存を知らせたか (TBYB の自己診断で「描画が回っている」の確認に使う)
 pub fn alive(who: Who, within_ms: u32) -> bool {
-    let age = now_ms().wrapping_sub(LAST_BEAT[who as usize].load(Ordering::Relaxed));
+    let last = LAST_BEAT[who as usize].load(Ordering::Relaxed);
+    if last == health::PARKED {
+        return true;
+    }
+    let age = now_ms().wrapping_sub(last);
     age <= within_ms
 }
 
@@ -134,18 +145,20 @@ pub fn start(limits: Limits) {
     let now = now_ms();
     for who in Who::ALL {
         LIMIT_MS[who as usize].store(limits.ms[who as usize], Ordering::Relaxed);
-        LAST_BEAT[who as usize].store(now, Ordering::Relaxed);
+        let start = if who.starts_parked() { health::PARKED } else { now };
+        LAST_BEAT[who as usize].store(start, Ordering::Relaxed);
     }
     enable();
     PHASE.store(PHASE_SUPERVISED, Ordering::SeqCst);
     // 次の起動が「記録の無いウォッチドッグ・リセット」(割り込みごと止まった) を見分けるための印 (0.4.1 の表示用)
     boot_trace::set_extra(health::SUPERVISED_MARK);
     defmt::info!(
-        "supervisor: watchdog {} ms, limits main {} ms jobs {} ms render {} ms",
+        "supervisor: watchdog {} ms, limits main {} ms jobs {} ms render {} ms web {} ms",
         WATCHDOG_TIMEOUT_US / 1000,
         limits.ms[0],
         limits.ms[1],
-        limits.ms[2]
+        limits.ms[2],
+        limits.ms[3]
     );
 }
 
@@ -210,6 +223,7 @@ pub fn on_frame(frame: u32) {
                 Who::Main => Stage::WdtMain,
                 Who::Jobs => Stage::WdtJobs,
                 Who::Render => Stage::WdtRender,
+                Who::Web => Stage::WdtWeb,
             };
             boot_trace::fault_with(stage, ms, 0);
             defmt::error!("supervisor: {} stalled for {} ms, resetting", who.label(), ms);

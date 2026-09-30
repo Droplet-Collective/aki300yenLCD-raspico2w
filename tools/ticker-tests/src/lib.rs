@@ -22,6 +22,30 @@ pub mod weather;
 #[path = "../../../src/font/shinonome.rs"]
 pub mod shinonome;
 
+/// 設定ページ (0.5.0〜) の純粋な部品。`upload` は `crate::ticker::config` を使うので、同じ道筋を用意する
+pub mod ticker {
+    pub use super::config;
+}
+#[path = "../../../src/web/auth.rs"]
+pub mod web_auth;
+#[path = "../../../src/web/form.rs"]
+pub mod web_form;
+#[path = "../../../src/web/http.rs"]
+pub mod web_http;
+#[path = "../../../src/web/json.rs"]
+pub mod web_json;
+#[path = "../../../src/web/upload.rs"]
+pub mod web_upload;
+pub mod web {
+    pub use super::web_auth as auth;
+    pub use super::web_form as form;
+    pub use super::web_http as http;
+    pub use super::web_json as json;
+    pub use super::web_upload as upload;
+}
+#[cfg(test)]
+mod web_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,21 +328,21 @@ mod tests {
         use health::{Limits, Who, stalled};
         let l = Limits::TICKER;
         // 全員さっき知らせた
-        assert_eq!(stalled(10_000, &[9_900, 9_000, 9_990], &l), None);
+        assert_eq!(stalled(10_000, &[9_900, 9_000, 9_990, health::PARKED], &l), None);
         // 描画が 5 s を超えて止まった
-        assert_eq!(stalled(20_000, &[19_900, 19_000, 14_000], &l), Some((Who::Render, 6_000)));
+        assert_eq!(stalled(20_000, &[19_900, 19_000, 14_000, health::PARKED], &l), Some((Who::Render, 6_000)));
         // main が 90 s を超えて止まった (取得 / 描画は生きている)
-        assert_eq!(stalled(200_000, &[100_000, 199_000, 199_990], &l), Some((Who::Main, 100_000)));
+        assert_eq!(stalled(200_000, &[100_000, 199_000, 199_990, health::PARKED], &l), Some((Who::Main, 100_000)));
         // 取得タスク
-        assert_eq!(stalled(200_000, &[199_000, 100_000, 199_990], &l), Some((Who::Jobs, 100_000)));
+        assert_eq!(stalled(200_000, &[199_000, 100_000, 199_990, health::PARKED], &l), Some((Who::Jobs, 100_000)));
         // ちょうど上限は許す
-        assert_eq!(stalled(95_000, &[5_000, 5_000, 90_000], &l), None);
+        assert_eq!(stalled(95_000, &[5_000, 5_000, 90_000, health::PARKED], &l), None);
         // 監視開始直後に書かれた「未来の」値 (割り込みとの競合) は 0 扱い
-        assert_eq!(stalled(1_000, &[1_004, 1_000, 1_002], &l), None);
+        assert_eq!(stalled(1_000, &[1_004, 1_000, 1_002, health::PARKED], &l), None);
         // 49.7 日で u32 の ms が一周しても判定できる
         let now = 5u32;
-        assert_eq!(stalled(now, &[u32::MAX - 100, u32::MAX - 100, u32::MAX - 10], &l), None);
-        assert_eq!(stalled(now, &[u32::MAX - 100, u32::MAX - 100, u32::MAX - 6_000], &l), Some((Who::Render, 6_006)));
+        assert_eq!(stalled(now, &[u32::MAX - 100, u32::MAX - 100, u32::MAX - 10, health::PARKED], &l), None);
+        assert_eq!(stalled(now, &[u32::MAX - 100, u32::MAX - 100, u32::MAX - 6_000, health::PARKED], &l), Some((Who::Render, 6_006)));
     }
 
     /// 監視 (supervisor::on_frame と同じ判定) を 0.5 s ごとに回す簡単なシミュレーション。
@@ -329,7 +353,7 @@ mod tests {
         use health::{Limits, Who, stalled};
         fn run(stop: Option<(Who, u32)>, until_ms: u32) -> Option<(u32, Who)> {
             let limits = Limits::TICKER;
-            let mut last = [0u32; 3];
+            let mut last = [0u32, 0, 0, health::PARKED];
             let mut t = 0u32;
             while t <= until_ms {
                 let stopped = |who: Who| stop.is_some_and(|(w, at)| w == who && t >= at);
@@ -557,7 +581,8 @@ mod tests {
         // 条件の順に待つ
         assert_eq!(g.tick(&BuyInputs { network_up: false, ..all }), BuyStep::Waiting { missing: "wifi" });
         assert_eq!(g.tick(&BuyInputs { ota_proved: false, ..all }), BuyStep::Waiting { missing: "ota" });
-        let partial = Round { sd_config: true, ntp: true, ..Round::default() };
+        let partial = Round { sd_config: true, web: true, ntp: true, ..Round::default() };
+        assert_eq!(g.tick(&BuyInputs { round: Round { web: false, ..Round::DONE }, ..all }), BuyStep::Waiting { missing: "web" });
         assert_eq!(g.tick(&BuyInputs { round: partial, ..all }), BuyStep::Waiting { missing: "weather" });
         assert_eq!(g.tick(&BuyInputs { healthy: false, ..all }), BuyStep::Waiting { missing: "health" });
         // 揃ってから 25 s

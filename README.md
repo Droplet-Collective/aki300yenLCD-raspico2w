@@ -22,6 +22,8 @@ PIO + DMA で駆動し、その表示を持ったファームウェアを **Wi-F
   `wifi_ota` 0.2.x が動いている機体もそのまま `ticker` に切り替わります ([ticker.md](docs/ticker.md))。
   v0.4.0 からは SD の写真 (BMP) をスライドショーで背景にし、その上に半透明の板で情報を重ねます。
   画面は PC のシミュレータ `tools/ui-sim` で書き込む前に確かめられます ([ui-sim.md](docs/ui-sim.md))。
+  v0.5.0 からは同じ LAN のブラウザで地域 / 表示 / 流れる文字 / 写真を変えられる **設定ページ** があります
+  ([settings-server.md](docs/settings-server.md))。起動後 1 分、LCD に URL とアクセスコードが出ます。
 
 ## ハードウェア
 
@@ -66,10 +68,12 @@ src/
   sdcard.rs         microSD (GPIO SPI) と FAT ボリューム
   ota/app.rs        OTA + TBYB + 接続管理の実行部 (ticker / wifi_ota 共用)
   ticker/           ticker の部品 (暦、ticker.txt、Open-Meteo、SNTP、写真のスライドショー)
+  web/              設定ページの HTTP サーバ (0.5.0〜): server.rs と、要求の解釈 / アクセスコード / BMP の検査など純粋な部品
   ui/               画面の描画 (no_std の純粋なコード、tools/ui-sim と共用): 画面構成、ガラス板、AA 数字、
                     天気アイコン、BMP の読み込み (拡大縮小 + 切り出し)
   font/shinonome.rs 東雲フォント (14 ドット日本語) の検索と描画
   bin/              下記の実行ファイル
+web/settings/       設定ページ (index.html 1 枚。build.rs が gzip にしてファームに埋め込む)
 partition/          A/B パーティションテーブル (pico2w-ab.json → pico2w-ab.uf2)
 scripts/            make-ota-image.sh (ELF → .bin/.uf2/.sha256)、make-manifest.sh、make-partition-table.sh、
                     stack-report.py (スタック見積もり)、check-skill.py (CI: SKILL.md / CLAUDE.md の検査)
@@ -77,7 +81,8 @@ fonts/shinonome/    東雲フォント (14 ドット) のビットマップテ�
 fonts/dejavu/       時計 / 気温の AA 数字の元 (DejaVu Sans) のライセンス
 ticker/message.txt  ticker が流す文字 (main を書き換えれば 5 分以内に反映)
 tools/              bdf2bin.py (BDF → フォントテーブル)、ticker-tests (ホストでのユニットテスト)、
-                    ui-sim (画面シミュレータ: PNG / GIF、見本の背景 BMP。docs/ui-sim.md)
+                    ui-sim (画面シミュレータ: PNG / GIF、見本の背景 BMP。docs/ui-sim.md)、
+                    settings-mock (設定ページの偽の端末と画面写真。docs/settings-server.md)
 .github/workflows/  build.yml (全 bin をビルド、v* タグで Release)、release.yml (workflow_dispatch で Release)
 docs/               設計・手順・実機で得た知見 (下記リンク)
 ```
@@ -86,7 +91,7 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 
 | bin | 内容 |
 |---|---|
-| `ticker` | **Release の OTA イメージ (v0.3.0〜)**。NTP 時計 + Open-Meteo 天気 + `ticker/message.txt` の流れる文字 (東雲フォント 14 ドット) + OTA。v0.4.0〜 SD の BMP のスライドショーを背景に、ガラス風の板で重ね描き。設定は SD の `TICKER.TXT` ([ticker.md](docs/ticker.md))。Release 用は `--features tbyb` |
+| `ticker` | **Release の OTA イメージ (v0.3.0〜)**。NTP 時計 + Open-Meteo 天気 + `ticker/message.txt` の流れる文字 (東雲フォント 14 ドット) + OTA。v0.4.0〜 SD の BMP のスライドショーを背景に、ガラス風の板で重ね描き。設定は SD の `TICKER.TXT` ([ticker.md](docs/ticker.md))、v0.5.0〜 ブラウザの設定ページからも ([settings-server.md](docs/settings-server.md))。Release 用は `--features tbyb` |
 | `wifi_ota` | OTA の最小構成 (v0.2.x の OTA イメージ)。`wifi_status` の表示 + GitHub Release からの自己更新。OTA / TBYB の本体は `src/ota/app.rs` で `ticker` と共用 |
 | `wifi_status` | SD の `WIFI.TXT` で Wi-Fi に接続し、周辺 AP の RSSI を LCD に表示 ([wifi-status.md](docs/wifi-status.md)) |
 | `ota_selftest` | Wi-Fi 無しで A/B・TBYB を確認する診断 bin。起動区画・版数・TBYB 状態を表示して `explicit_buy` ([ota-setup.md](docs/ota-setup.md)) |
@@ -136,7 +141,8 @@ docs/               設計・手順・実機で得た知見 (下記リンク)
 6. `reboot(FLASH_UPDATE, 対象区画)` → 新版が TBYB で起動。
 7. 新版 (buy 待ち) は次が全部揃ってから 25 s 健全に動いたときだけ `explicit_buy` する (0.4.2〜 `boot_policy::BuyGate`):
    Wi-Fi join + DHCP、OTA の manifest 確認が TLS + HTTP を最後まで通った (manifest を解釈できた / 確定した HTTP ステータス)、
-   `ticker` の機能を一巡 (NTP / 天気 / 文字 / SD の設定 / 最初の写真。`wifi_ota` は一巡なし)、main / 取得 / 描画の生存確認。
+   `ticker` の機能を一巡 (NTP / 天気 / 文字 / SD の設定 / 最初の写真 / 0.5.0〜 設定ページの待ち受け。`wifi_ota` は一巡なし)、
+   main / 取得 / 描画 (/ 設定ページの要求の処理中) の生存確認。
    起動から 180 s 以内に揃わなければウォッチドッグの再ロードをやめ、旧版に戻る。buy 待ちの OTA 確認は manifest を読むだけ。
    詳細 (ウォッチドッグ、回復モード、他方区画へ戻す) は [ticker.md §8](docs/ticker.md)。
 8. 巻き戻ったとき: 新版は進行段階と稼働時間を `WATCHDOG.SCRATCH5〜7` に書き続けているので、旧版が起動時に読んで
@@ -236,4 +242,6 @@ OTA で配るファーム (`ticker` など) や `src/ota`・起動の方針・�
 - OTA で配れるのは manifest が指す 1 つの bin (v0.3.0〜 `ticker`)。他の bin は USB (picotool / D&D) で書く。
 - 実機確認は 1 台のみ。複数台・長期運用・フラッシュ書き込み中の cyw43 の挙動などは未確認
   ([wifi-ota.md §8](docs/wifi-ota.md))。
+- 設定ページ (0.5.0〜) は LAN の中の平文の HTTP。アクセスコードと Host / Origin の確認でよそのサイトからの操作は防ぐが、
+  同じ LAN で通信を見られる人からは守れない ([settings-server.md §4](docs/settings-server.md))。
 - パーティションテーブル自体の更新、Wi-Fi ファームウェア (cyw43、約 231 kB) の分離配布は扱っていない。

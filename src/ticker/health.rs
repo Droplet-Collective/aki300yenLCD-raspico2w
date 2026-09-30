@@ -25,19 +25,31 @@ pub enum Who {
     Jobs = 1,
     /// 描画タスク。毎フレーム (≈ 60 Hz)
     Render = 2,
+    /// 設定ページの HTTP サーバ (0.5.0〜、取得タスクの中で 1 要求ずつ動く)。要求を処理している間だけ
+    /// 監視し (読み書き / SD の 1 回ごとに知らせる)、待ち受け中は [`PARKED`] (監視しない)
+    Web = 3,
 }
 
-pub const WHO_COUNT: usize = 3;
+pub const WHO_COUNT: usize = 4;
+
+/// 生存確認の最終時刻がこの値なら監視しない (設定ページのサーバが要求を処理していないとき)
+pub const PARKED: u32 = u32::MAX;
 
 impl Who {
-    pub const ALL: [Who; WHO_COUNT] = [Who::Main, Who::Jobs, Who::Render];
+    pub const ALL: [Who; WHO_COUNT] = [Who::Main, Who::Jobs, Who::Render, Who::Web];
 
     pub fn label(self) -> &'static str {
         match self {
             Who::Main => "main",
             Who::Jobs => "jobs",
             Who::Render => "render",
+            Who::Web => "web",
         }
+    }
+
+    /// 監視の開始時に止めておく (処理を始めたときだけ知らせ始める) か
+    pub fn starts_parked(self) -> bool {
+        matches!(self, Who::Web)
     }
 }
 
@@ -49,15 +61,19 @@ pub struct Limits {
 
 impl Limits {
     /// ticker の既定値。描画は 5 s (フラッシュ消去で割り込みが止まるのは 1 回 0.4 s 以内、TLS の鍵交換も
-    /// 1 s 以内)、main / 取得は 90 s (どの待ちも 30 s 以内で打ち切られる)。
+    /// 1 s 以内)、main / 取得は 90 s (どの待ちも 30 s 以内で打ち切られる)。設定ページのサーバは 20 s
+    /// (1 回の読み書きは 5 s、SD の 1 回の操作は 2 s で打ち切り、進むたびに知らせる。0.5.0〜)。
     pub const TICKER: Limits = Limits {
-        ms: [90_000, 90_000, 5_000],
+        ms: [90_000, 90_000, 5_000, 20_000],
     };
 }
 
 /// 生存確認の結果: 止まっているタスクと、最後に知らせてからの時間 (ms)。全員生きていれば None
 pub fn stalled(now_ms: u32, last_ms: &[u32; WHO_COUNT], limits: &Limits) -> Option<(Who, u32)> {
     for who in Who::ALL {
+        if last_ms[who as usize] == PARKED {
+            continue;
+        }
         let age = now_ms.wrapping_sub(last_ms[who as usize]);
         // 未来の値 (起動直後に書き換わった直後など) は 0 とみなす
         let age = if age > u32::MAX / 2 { 0 } else { age };
@@ -82,12 +98,15 @@ pub const STAGE_WDT_JOBS: u8 = 0xE4;
 pub const STAGE_WDT_RENDER: u8 = 0xE5;
 /// 登録していない割り込み (DefaultHandler)。0.4.1〜
 pub const STAGE_UNHANDLED_IRQ: u8 = 0xE6;
+/// ウォッチドッグ: 設定ページのサーバが 1 つの要求で止まった。0.5.0〜
+pub const STAGE_WDT_WEB: u8 = 0xE7;
 
 pub fn wdt_stage(who: Who) -> u8 {
     match who {
         Who::Main => STAGE_WDT_MAIN,
         Who::Jobs => STAGE_WDT_JOBS,
         Who::Render => STAGE_WDT_RENDER,
+        Who::Web => STAGE_WDT_WEB,
     }
 }
 
@@ -123,6 +142,7 @@ pub fn decode(stage: u8, info: u32, extra: u32, file: Option<&str>) -> Option<La
         STAGE_WDT_MAIN => LastReset::Stalled { who: Who::Main, ms: info },
         STAGE_WDT_JOBS => LastReset::Stalled { who: Who::Jobs, ms: info },
         STAGE_WDT_RENDER => LastReset::Stalled { who: Who::Render, ms: info },
+        STAGE_WDT_WEB => LastReset::Stalled { who: Who::Web, ms: info },
         STAGE_UNHANDLED_IRQ => LastReset::UnhandledIrq { irqn: info as i32 },
         _ => return None,
     })

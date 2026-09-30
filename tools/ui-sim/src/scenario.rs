@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::ui::screen::{Clock, StatusView, Tone, View, WeatherView};
+use crate::ui::screen::{Banner, Clock, StatusView, Tone, View, WeatherView};
 
 #[derive(Deserialize, Clone)]
 #[serde(default)]
@@ -27,6 +27,16 @@ pub struct Scenario {
     pub animation: AnimationJson,
     /// 回復モードの画面 (0.4.2〜)。指定すると時計 / 天気 / 写真の代わりにこれを描く (GIF は作らない)
     pub recovery: Option<RecoveryJson>,
+    /// 設定ページの案内 (0.5.0〜): {"url": "http://192.168.x.y/", "code": "123456"}
+    pub banner: Option<BannerJson>,
+}
+
+/// 設定ページの案内 (`ui::screen::Banner`)
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct BannerJson {
+    pub url: String,
+    pub code: String,
 }
 
 /// 回復モードの画面 (`ui::recovery::RecoveryView`)
@@ -124,6 +134,7 @@ impl Default for Scenario {
             status: StatusJson::default(),
             animation: AnimationJson::default(),
             recovery: None,
+            banner: None,
         }
     }
 }
@@ -237,6 +248,7 @@ impl Scenario {
                 msg: tone(&s.msg),
                 version: &s.version,
             },
+            banner: self.banner.as_ref().map(|b| Banner { url: &b.url, code: &b.code }),
         }
     }
 }

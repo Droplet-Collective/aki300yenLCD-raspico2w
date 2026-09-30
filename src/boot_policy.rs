@@ -299,6 +299,8 @@ pub struct Round {
     pub message: bool,
     /// 最初の写真の読み込み (写真が無い / SD が無いときは試すものが無いので済み)
     pub slideshow: bool,
+    /// 設定ページの HTTP サーバが待ち受けを始めた (0.5.0〜。最初の OTA 確認が通った後に始まる)
+    pub web: bool,
 }
 
 impl Round {
@@ -309,6 +311,7 @@ impl Round {
         weather: true,
         message: true,
         slideshow: true,
+        web: true,
     };
 
     pub fn done(&self) -> bool {
@@ -319,6 +322,7 @@ impl Round {
     pub fn first_missing(&self) -> Option<&'static str> {
         [
             (self.sd_config, "sd"),
+            (self.web, "web"),
             (self.ntp, "ntp"),
             (self.weather, "weather"),
             (self.message, "message"),

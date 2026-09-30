@@ -75,6 +75,14 @@ pub struct StatusView<'a> {
     pub version: &'a str,
 }
 
+/// 設定ページの案内 (0.5.0〜): サーバが待ち受けを始めてから 1 分と、設定ページが「LCD にコードを表示」を
+/// 押したときに出す。`url` は `http://192.168.x.y/`、`code` は 6 桁のアクセスコード
+#[derive(Clone, Copy, Debug)]
+pub struct Banner<'a> {
+    pub url: &'a str,
+    pub code: &'a str,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct View<'a> {
     /// NTP 同期前は None
@@ -87,6 +95,8 @@ pub struct View<'a> {
     /// 流れる文字の左端 (帯の左端からの px。帯の幅 → 負の文字幅へ動かす)
     pub scroll_x: i32,
     pub status: StatusView<'a>,
+    /// 設定ページの案内 (出す間だけ Some)。状態 3 行の表示中は行 1 に、ふだんは流れる文字の場所に出す
+    pub banner: Option<Banner<'a>>,
 }
 
 /// 画面の構成
@@ -274,9 +284,34 @@ fn draw_status_chip(c: &mut Canvas, s: &StatusView, right: i32, y: i32) -> i32 {
     x0
 }
 
-/// 3 行の状態表示 (板の中、上端 `y`、行の間隔 9 px、`FONT_6X10`)
-fn draw_status_lines(c: &mut Canvas, s: &StatusView, x: i32, y: i32, width: i32) {
-    c.small(s.line1, x, y, tone_color(s.line1_tone));
+/// 状態 3 行の行 1 に出す案内 (ASCII、`FONT_6X10` の 66 桁以内)
+pub fn banner_line(b: &Banner) -> String<80> {
+    let mut line: String<80> = String::new();
+    let _ = write!(line, "settings: {}  code {}", b.url, b.code);
+    line
+}
+
+/// ふだんの画面の案内 (東雲 14 px、1 行): 設定 http://192.168.x.y/ ... コード 123456。範囲 (x, y, w)
+fn draw_banner(c: &mut Canvas, b: &Banner, x: i32, y: i32, w: i32) {
+    let pen = c.jp("設定", x, y, palette::ACCENT) + 7;
+    c.jp(b.url, pen, y, palette::OFF_WHITE);
+    let code_w = shinonome::text_width(b.code) as i32;
+    let label_w = shinonome::text_width("コード") as i32;
+    let right = x + w;
+    c.jp(b.code, right - code_w, y, palette::CYAN);
+    c.jp("コード", right - code_w - 5 - label_w, y, palette::MUTED);
+}
+
+/// 3 行の状態表示 (板の中、上端 `y`、行の間隔 9 px、`FONT_6X10`)。案内があれば行 1 の代わりに出す
+fn draw_status_lines(c: &mut Canvas, s: &StatusView, banner: Option<Banner>, x: i32, y: i32, width: i32) {
+    match banner {
+        Some(b) => {
+            c.small(&banner_line(&b), x, y, palette::CYAN);
+        }
+        None => {
+            c.small(s.line1, x, y, tone_color(s.line1_tone));
+        }
+    }
     let head_end = c.small(s.ident_head, x, y + 9, palette::MAGENTA);
     c.small(s.ident_rest, head_end, y + 9, tone_color(s.ident_tone));
     if let Some((done, total)) = s.progress {
@@ -370,7 +405,11 @@ fn render_glass(c: &mut Canvas, view: &View) {
     if view.status.expanded {
         let y = GLASS_CARD_Y + GLASS_CARD_H + 3;
         c.panel(2, y, WIDTH as i32 - 4, HEIGHT as i32 - y - 1, &STATUS_PANEL);
-        draw_status_lines(c, &view.status, 6, y + 3, WIDTH as i32 - 12);
+        draw_status_lines(c, &view.status, view.banner, 6, y + 3, WIDTH as i32 - 12);
+    } else if let Some(b) = view.banner {
+        // 案内の間は流れる文字と小さな状態の代わりに帯全体を使う
+        c.panel(GLASS_BAND_X, GLASS_BAND_Y, GLASS_BAND_W, GLASS_BAND_H, &GLASS_PANEL);
+        draw_banner(c, &b, GLASS_BAND_X + 6, GLASS_BAND_Y + 3, GLASS_BAND_W - 12);
     } else {
         c.panel(GLASS_BAND_X, GLASS_BAND_Y, GLASS_BAND_W, GLASS_BAND_H, &GLASS_PANEL);
         if !view.message.is_empty() {
@@ -406,7 +445,7 @@ fn render_dock(c: &mut Canvas, view: &View) {
     let h = HEIGHT as i32 - DOCK_Y - 3;
     if view.status.expanded {
         c.panel(DOCK_X, DOCK_Y + 4, WIDTH as i32 - 2 * DOCK_X, h - 4, &STATUS_PANEL);
-        draw_status_lines(c, &view.status, DOCK_X + 4, DOCK_Y + 7, WIDTH as i32 - 2 * DOCK_X - 8);
+        draw_status_lines(c, &view.status, view.banner, DOCK_X + 4, DOCK_Y + 7, WIDTH as i32 - 2 * DOCK_X - 8);
         return;
     }
     c.panel(DOCK_X, DOCK_Y, WIDTH as i32 - 2 * DOCK_X, h, &GLASS_PANEL);
@@ -433,7 +472,9 @@ fn render_dock(c: &mut Canvas, view: &View) {
         }
     }
     c.blend_rect(DOCK_X + 6, DOCK_Y + 20, WIDTH as i32 - 2 * DOCK_X - 12, 1, palette::WHITE, 5);
-    if !view.message.is_empty() {
+    if let Some(b) = view.banner {
+        draw_banner(c, &b, DOCK_X + 6, DOCK_Y + 23, WIDTH as i32 - 2 * DOCK_X - 12);
+    } else if !view.message.is_empty() {
         let (sx, sw) = Layout::Dock.scroll_area(false);
         draw_scroll(c, view, sx, DOCK_Y + 23, sw, palette::OFF_WHITE);
     }
@@ -509,8 +550,10 @@ fn render_classic(c: &mut Canvas, view: &View) {
     let dim = rgb(64, 64, 64);
     c.fill_rect(1, 50, WIDTH as i32 - 2, 1, dim);
     c.fill_rect(1, 67, WIDTH as i32 - 2, 1, dim);
-    if !view.message.is_empty() {
+    if let Some(b) = view.banner {
+        draw_banner(c, &b, 4, 52, WIDTH as i32 - 8);
+    } else if !view.message.is_empty() {
         draw_scroll(c, view, 1, 52, WIDTH as i32 - 2, rgb(255, 255, 192));
     }
-    draw_status_lines(c, &view.status, 2, 68, WIDTH as i32 - 4);
+    draw_status_lines(c, &view.status, view.banner, 2, 68, WIDTH as i32 - 4);
 }
