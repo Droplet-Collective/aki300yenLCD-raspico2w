@@ -1,7 +1,9 @@
 # Cut a release from the Actions tab (or `gh workflow run release.yml -f version=X.Y.Z`)
 # without pushing a tag by hand:
 #   1. check: Cargo.toml version == inputs.version and tag v<version> does not exist yet
-#   2. build: the reusable build job from build.yml (same steps as the v* tag path)
+#   2. build: the reusable build job from build.yml (same steps as the v* tag path). That job also runs
+#      the host tests (tools/ticker-tests: boot policy + boot-sequence simulation) and the stack check
+#      on the same ref, so a release is only cut when both pass.
 #   3. release: create the annotated tag v<version> on the built commit with GITHUB_TOKEN
 #      and attach the UF2 / OTA .bin / .sha256 / manifest.json to a GitHub Release.
 # A tag pushed with GITHUB_TOKEN does not trigger build.yml (GitHub rule), so this

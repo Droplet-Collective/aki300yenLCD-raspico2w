@@ -575,6 +575,25 @@ mod tests {
         assert_eq!(g.tick(&BuyInputs { now_ms: 180_000, ..all }), BuyStep::TimedOut);
     }
 
+    /// buy 条件 (b): 証拠になるのは manifest を解釈できた / 確定した HTTP ステータスだけ (Devin Review の指摘で厳しくした)
+    #[test]
+    fn policy_check_classification() {
+        use boot_policy::*;
+        // 成功 (manifest を解釈、または 404 = Release 無し)
+        assert_eq!(classify_check(true, None), CheckOutcome::Proved);
+        assert_eq!(classify_check(false, None), CheckOutcome::Proved);
+        // manifest の前: 確定した HTTP ステータス (5xx など) だけが証拠
+        assert_eq!(classify_check(false, Some(CheckFailure::FinalStatus)), CheckOutcome::Proved);
+        // ヘッダの溢れ / 構文エラー / リダイレクトの不備 / 切れた・壊れた manifest は証拠にならない
+        assert_eq!(classify_check(false, Some(CheckFailure::BadResponse)), CheckOutcome::Unproved);
+        assert_eq!(classify_check(false, Some(CheckFailure::Transport)), CheckOutcome::Unproved);
+        assert_eq!(classify_check(false, Some(CheckFailure::Local)), CheckOutcome::Unproved);
+        // manifest を解釈した後の失敗 (ダウンロード / 検証) は経路が通った後
+        for f in [CheckFailure::FinalStatus, CheckFailure::BadResponse, CheckFailure::Transport, CheckFailure::Local] {
+            assert_eq!(classify_check(true, Some(f)), CheckOutcome::Proved, "{f:?}");
+        }
+    }
+
     #[test]
     fn policy_record_roundtrip() {
         use boot_policy::*;

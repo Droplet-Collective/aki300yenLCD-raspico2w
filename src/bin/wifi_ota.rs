@@ -550,8 +550,9 @@ async fn main(spawner: Spawner) {
                 check_only: !ui.model.boot.ota_allowed(),
                 blocked: 0,
             };
-            let result = app::run_ota_check(&net, bufs, &mut flash, sectors, slots, mode, &mut ui).await;
-            let proved = app::check_outcome(&result) == CheckOutcome::Proved;
+            let mut parsed = false;
+            let result = app::run_ota_check(&net, bufs, &mut flash, sectors, slots, mode, &mut ui, &mut parsed).await;
+            let proved = app::check_outcome(&result, parsed) == CheckOutcome::Proved;
             ota_proved |= proved;
             ui.model.ota.apply(result);
             if !proved && ui.model.boot.buy == app::BuyState::Pending {

@@ -1002,8 +1002,9 @@ async fn jobs_task(work: NetWork) {
                         check_only: !download_ok,
                         blocked: j.blocked,
                     };
-                    let result = noinline(app::run_ota_check(&j.net, j.bufs, &mut j.flash, j.sectors, slots, mode, &mut ui)).await;
-                    let proved = app::check_outcome(&result) == CheckOutcome::Proved;
+                    let mut parsed = false;
+                    let result = noinline(app::run_ota_check(&j.net, j.bufs, &mut j.flash, j.sectors, slots, mode, &mut ui, &mut parsed)).await;
+                    let proved = app::check_outcome(&result, parsed) == CheckOutcome::Proved;
                     ui.ota.apply(result);
                     if proved {
                         note_ota_proved(!download_ok);
@@ -1196,8 +1197,9 @@ async fn jobs_task(work: NetWork) {
                 slots: boot.slots,
             };
             let mode = CheckMode { check_only: false, blocked };
-            let result = noinline(app::run_ota_check(&net, bufs, &mut flash, sectors, slots, mode, &mut ui)).await;
-            let proved = app::check_outcome(&result) == CheckOutcome::Proved;
+            let mut parsed = false;
+            let result = noinline(app::run_ota_check(&net, bufs, &mut flash, sectors, slots, mode, &mut ui, &mut parsed)).await;
+            let proved = app::check_outcome(&result, parsed) == CheckOutcome::Proved;
             ui.ota.apply(result);
             // 回復モードは失敗しても 60 s ごとに試す (通常モードのバックオフ 10 分までは待たない)
             let soon = Instant::now() + recovery_interval;
