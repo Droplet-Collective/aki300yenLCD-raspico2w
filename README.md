@@ -166,6 +166,9 @@ scripts/make-partition-table.sh                 # partition/pico2w-ab.uf2
 必要です ([ota-setup.md §2.1](docs/ota-setup.md))。書き込み環境 (Windows) は [setup-guide.md](docs/setup-guide.md)、
 CI アーティファクトの入手は [ci-build.md](docs/ci-build.md)。
 
+OTA で配るファーム (`ticker` など) や `src/ota`・起動の方針・ウォッチドッグ・LCD・メモリ配置・リリース手順を変えるときは、
+[`.claude/skills/ota-firmware/SKILL.md`](.claude/skills/ota-firmware/SKILL.md) のチェックリスト (OTA 到達保証を壊さないための確認) に従ってください。
+
 ## 初回セットアップ
 
 1. **パーティションテーブル (1 回だけ)**: BOOTSEL で接続し `picotool load -v partition/pico2w-ab.uf2`
