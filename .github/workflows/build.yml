@@ -72,6 +72,16 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      # The OTA firmware checklist (.claude/skills/ota-firmware/SKILL.md, pointed to by CLAUDE.md) keeps the
+      # OTA-reachability guarantee in every future change; fail early if it is removed or loses its frontmatter.
+      - name: Check that the OTA firmware skill is present
+        run: |
+          set -euo pipefail
+          f=.claude/skills/ota-firmware/SKILL.md
+          test -f "$f" || { echo "::error::$f is missing"; exit 1; }
+          head -n 1 "$f" | grep -qx -- '---' || { echo "::error::$f has no YAML frontmatter"; exit 1; }
+          sed -n '2,/^---$/p' "$f" | grep -q '^name: ota-firmware$' || { echo "::error::$f frontmatter has no 'name: ota-firmware'"; exit 1; }
+
       # rust-toolchain.toml already pins stable + target + components;
       # the action only pre-installs them so the first cargo call is quiet.
       - uses: dtolnay/rust-toolchain@stable
