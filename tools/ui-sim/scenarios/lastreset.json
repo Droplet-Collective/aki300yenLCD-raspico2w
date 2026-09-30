@@ -1,0 +1,19 @@
+{
+  "layout": "glass",
+  "background": "../samples/SUNSET.BMP",
+  "clock": null,
+  "weather": null,
+  "message": "",
+  "status": {
+    "expanded": true,
+    "line1": "last reset: STACK OVERFLOW pc=1003a2c4 @2s",
+    "line1_tone": "error",
+    "ident_head": "ticker v0.4.1",
+    "ident_rest": " slot A TBYB:bought OK stk 22.9/39.5K",
+    "ident_tone": "ok",
+    "ota": "OTA: checking manifest.json (#1)...",
+    "ota_tone": "normal",
+    "wifi": "ok", "ntp": "muted", "wx": "muted", "msg": "muted"
+  },
+  "animation": { "duration_ms": 1000 }
+}

@@ -191,6 +191,51 @@ impl TickerConfig {
     }
 }
 
+/// SD から `TICKER.TXT` を読んだ結果 (ファームウェアの `sdcard` の結果をこれに写して [`load`] に渡す)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigSource<'a> {
+    /// SD カードが無い / 初期化できない (メッセージは `sdcard::init_sd` の失敗理由)
+    NoCard(&'a str),
+    /// ファイルが無い (既定の使い方。東京の既定値で動く)
+    NotFound,
+    /// ボリューム / ディレクトリ / 読み取りの失敗
+    ReadFailed(&'a str),
+    /// 読めた内容 (空でもよい)
+    Read(&'a [u8]),
+}
+
+/// `ticker.txt` の設定と、状態行 1 に出す注意 (問題が無ければ空)。どの場合も既定値 (東京) で起動を続ける。
+/// 0.4.1: ticker.txt が無いと止まるのでは、という報告を受けて、4 つの場合をホストのテストで確かめている
+/// (`tools/ticker-tests`。0.4.0 の停止の原因は TLS のスタック溢れで、ticker.txt とは無関係)。
+pub fn load(source: ConfigSource<'_>) -> (TickerConfig, String<80>) {
+    use core::fmt::Write as _;
+    let mut note: String<80> = String::new();
+    let config = match source {
+        ConfigSource::NoCard(message) => {
+            let _ = write!(note, "SD: {} (ticker.txt skipped, using Tokyo)", message);
+            TickerConfig::default()
+        }
+        ConfigSource::NotFound => {
+            let _ = note.push_str("ticker.txt not found, using Tokyo (35.6812,139.7671 UTC+9)");
+            TickerConfig::default()
+        }
+        ConfigSource::ReadFailed(message) => {
+            let _ = write!(note, "ticker.txt: {}, using Tokyo defaults", message);
+            TickerConfig::default()
+        }
+        ConfigSource::Read(bytes) => {
+            let (parsed, any) = TickerConfig::parse(bytes);
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                let _ = note.push_str("ticker.txt is empty, using Tokyo defaults");
+            } else if !any {
+                let _ = note.push_str("ticker.txt: no valid keys, using Tokyo defaults");
+            }
+            parsed
+        }
+    };
+    (config, note)
+}
+
 /// `images=` の値から 8.3 形式として正しい名前だけを順に返す (前後の空白は除く。大文字小文字はそのまま)
 pub fn image_names(list: &str) -> impl Iterator<Item = &str> {
     list.split(',').map(str::trim).filter(|n| is_short_name(n)).take(MAX_IMAGES)

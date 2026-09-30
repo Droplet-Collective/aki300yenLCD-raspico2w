@@ -44,7 +44,7 @@ pub struct Fetched {
 
 /// `url` を GET し、3xx なら `Location` へ追従、200 なら本文を `chunk` 単位で `sink` へ流す。
 /// 4xx / 5xx は本文を読まずに `Fetched { status, .. }` で返す (404 = Release 無しは呼び出し側で判断)。
-/// `url` はリダイレクトで書き換わる。`rx_buf` は応答ヘッダ用 (github.com の 302 は 5〜6 kB 出す。
+/// `url` はリダイレクトで書き換わる (Location は一旦 `chunk` に写すので `chunk` は `URL_MAX` 以上にする)。`rx_buf` は応答ヘッダ用 (github.com の 302 は 5〜6 kB 出す。
 /// 収まらないと [`OtaError::HttpHeaderTooLong`])。
 pub async fn fetch<T: TcpConnect, D: Dns, S: BodySink>(
     client: &mut HttpClient<'_, T, D>,
@@ -66,26 +66,32 @@ pub async fn fetch<T: TcpConnect, D: Dns, S: BodySink>(
         defmt::info!("HTTP {} content-length {:?}", status, response.content_length);
 
         if (300..400).contains(&status) {
-            let mut next: String<URL_MAX> = String::new();
-            let mut found = false;
+            // Location は `chunk` に一旦写す (`url` は `handle` が借りている)。0.4.0 までは
+            // `String<URL_MAX>` (2 kB) のローカル変数で、TLS 経路のスタックフレームを 2 kB 押し上げていた。
+            let mut next_len: Option<usize> = None;
             for (name, value) in response.headers() {
                 if name.eq_ignore_ascii_case("location") {
-                    let text = core::str::from_utf8(value).map_err(|_| OtaError::HttpRedirect)?;
-                    next.push_str(text.trim()).map_err(|_| OtaError::LocationTooLong)?;
-                    found = true;
+                    let text = core::str::from_utf8(value).map_err(|_| OtaError::HttpRedirect)?.trim();
+                    if text.len() > URL_MAX || text.len() > chunk.len() {
+                        return Err(OtaError::LocationTooLong);
+                    }
+                    chunk[..text.len()].copy_from_slice(text.as_bytes());
+                    next_len = Some(text.len());
                     break;
                 }
             }
             drop(response);
             drop(handle);
-            if !found || !(next.starts_with("https://") || next.starts_with("http://")) {
-                return Err(OtaError::HttpRedirect);
-            }
+            let next = next_len
+                .and_then(|n| core::str::from_utf8(&chunk[..n]).ok())
+                .filter(|n| n.starts_with("https://") || n.starts_with("http://"))
+                .ok_or(OtaError::HttpRedirect)?;
             if redirects >= MAX_REDIRECTS {
                 return Err(OtaError::TooManyRedirects);
             }
             redirects += 1;
-            *url = next;
+            url.clear();
+            url.push_str(next).map_err(|_| OtaError::LocationTooLong)?;
             continue;
         }
 

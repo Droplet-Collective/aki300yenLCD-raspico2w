@@ -62,6 +62,7 @@ cargo test --release
 | `boot.json` | 起動直後: 時刻・天気が未取得、写真なし (既定のグラデーション)、状態 3 行 |
 | `ota.json` | OTA のダウンロード中 (状態 3 行 + 進捗バー)、雪、氷点下 |
 | `error.json` | 天気の取得失敗 (`WX` が赤)、雷雨 |
+| `lastreset.json` | 0.4.1〜: 異常終了からの再起動直後 (状態行 1 に赤の `last reset: STACK OVERFLOW ...`、状態行 2 にスタックの最大使用量 `stk`、最初の OTA 確認中) |
 
 ```jsonc
 {

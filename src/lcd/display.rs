@@ -388,8 +388,10 @@ impl Handler<DMA_IRQ_1> for FrameIrqHandler {
         let ints = pac::DMA.ints(1).read();
         pac::DMA.ints(1).write_value(ints);
         if ints & FRAME_START_CHANNEL_BIT != 0 {
-            FRAME_COUNT.fetch_add(1, Ordering::Release);
+            let frame = FRAME_COUNT.fetch_add(1, Ordering::Release).wrapping_add(1);
             FRAME_WAKER.wake();
+            // ウォッチドッグの監視 (0.4.1〜、`ticker` が `supervisor::start` した後だけ動く)
+            crate::supervisor::on_frame(frame);
         }
     }
 }

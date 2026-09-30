@@ -35,6 +35,9 @@ pub static LEVEL: AtomicU8 = AtomicU8::new(32);
 pub static FRAME_SLOT: Signal<ThreadModeRawMutex, ()> = Signal::new();
 /// main が OTA の確認〜検証の間だけ立てる (切り替え / 読み込みを止める)
 pub static PAUSE: AtomicBool = AtomicBool::new(false);
+/// 取得タスクが最初の OTA 確認を終えたら立てる。これが立つか [`SlideConfig::start_by`] を過ぎるまで SD の
+/// 写真には触れない (0.4.1〜: 起動したら何より先に OTA 確認まで進み、壊れた版でも次の版で直せるように)
+pub static START: AtomicBool = AtomicBool::new(false);
 /// 直近の読み込み失敗 (main が状態行 1 に出して消す)
 pub static LAST_ERROR: Mutex<ThreadModeRawMutex, RefCell<Option<String<64>>>> = Mutex::new(RefCell::new(None));
 
@@ -49,6 +52,8 @@ pub struct SlideConfig {
     pub images: String<{ config::IMAGES_MAX }>,
     pub layout: Layout,
     pub sd_fast: bool,
+    /// [`START`] が立たなくてもこの時刻には始める (Wi-Fi が無い / つながらない場合)
+    pub start_by: Instant,
 }
 
 /// 既定のグラデーションを背景にする (起動時 / 写真が 1 枚も読めないとき)
@@ -186,6 +191,11 @@ fn image_list(volume_mgr: &SdVolumeManager, cfg: &SlideConfig) -> Vec<String<12>
 
 #[embassy_executor::task]
 pub async fn slideshow_task(volume_mgr: SdVolumeManager, cfg: SlideConfig) {
+    // 起動直後は描画 / Wi-Fi の初期化と最初の OTA 確認を先に進める (ルートの走査もその後)
+    Timer::after(Duration::from_millis(1500)).await;
+    while !START.load(Ordering::Relaxed) && Instant::now() < cfg.start_by {
+        Timer::after(Duration::from_millis(250)).await;
+    }
     let list = image_list(&volume_mgr, &cfg);
     defmt::info!("slideshow: {} image(s), interval {} s", list.len(), cfg.interval.as_secs());
     if list.is_empty() {
@@ -193,8 +203,6 @@ pub async fn slideshow_task(volume_mgr: SdVolumeManager, cfg: SlideConfig) {
     }
     let mut fast = cfg.sd_fast;
     sdcard::set_fast(&volume_mgr, fast);
-    // 起動直後は描画 / Wi-Fi の初期化を先に進める
-    Timer::after(Duration::from_millis(1500)).await;
 
     let mut index = 0usize;
     let mut shown: Option<usize> = None;

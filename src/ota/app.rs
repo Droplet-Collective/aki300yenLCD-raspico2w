@@ -30,7 +30,7 @@ use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use super::http::{self, BodySink};
 use super::manifest::{Manifest, Version};
 use super::slot::{self, OtaFlash, SectorBuffers, SlotWriter, Slots, slot_label};
-use super::{MANIFEST_NAME, OtaError, URL_MAX, latest_asset_url};
+use super::{MANIFEST_NAME, OtaError, URL_MAX, set_latest_asset_url};
 use crate::ab_boot::{self, BootInfo};
 use crate::boot_trace::{self, ResetReason, SelftestCounters, Stage, Trace};
 use crate::wifi::{self, WifiCredentials, ascii_label};
@@ -92,6 +92,8 @@ pub const TCP_TX_SIZE: usize = 2048;
 pub const HTTP_HEADER_SIZE: usize = 8192;
 /// 本文の受信単位
 pub const CHUNK_SIZE: usize = 2048;
+// `http::fetch` はリダイレクト先 (Location) を一旦 `chunk` に写す
+const _: () = assert!(CHUNK_SIZE >= URL_MAX);
 /// manifest.json の上限
 pub const MANIFEST_MAX: usize = 512;
 
@@ -364,7 +366,10 @@ impl BootStatus {
                 Tone::Error
             }
         };
-        if let Some(t) = watchdog_remaining_tenths() {
+        // bootrom の TBYB ウォッチドッグの残り (buy 後に ticker が動かす監視用のウォッチドッグは出さない)
+        if matches!(self.buy, BuyState::Pending | BuyState::TimedOut)
+            && let Some(t) = watchdog_remaining_tenths()
+        {
             let _ = write!(line, " WDT {}.{}s", t / 10, t % 10);
         }
         tone
@@ -635,8 +640,15 @@ impl OtaState {
 
     /// DHCP が通ったら初回確認の時刻を決める (未定のときだけ)
     pub fn schedule_first_check(&mut self) {
-        if self.next_check.is_none() {
-            self.next_check = Some(Instant::now() + OTA_FIRST_CHECK_DELAY);
+        self.schedule_first_check_in(OTA_FIRST_CHECK_DELAY);
+    }
+
+    /// [`schedule_first_check`](Self::schedule_first_check) の待ち時間を指定する版。`ticker` (0.4.1〜) は
+    /// 0 s で呼び、接続後の最初の仕事を OTA 確認にする (新しい版で直せるように、他の取得より先に)。
+    /// 一度でも確認を始めたら (`checks > 0`) 何もしない。
+    pub fn schedule_first_check_in(&mut self, delay: Duration) {
+        if self.next_check.is_none() && self.checks == 0 && matches!(self.phase, OtaPhase::Idle) {
+            self.next_check = Some(Instant::now() + delay);
         }
     }
 
@@ -885,7 +897,7 @@ pub async fn run_ota_check(
     let mut client = net.client(&mut bufs.tls_rx, &mut bufs.tls_tx);
 
     // --- [1] manifest ---
-    bufs.url = latest_asset_url(MANIFEST_NAME);
+    set_latest_asset_url(&mut bufs.url, MANIFEST_NAME);
     let manifest_len = {
         let mut sink = ManifestSink {
             buf: &mut bufs.manifest,
@@ -936,7 +948,7 @@ pub async fn run_ota_check(
         total: manifest.size,
     })
     .await;
-    bufs.url = latest_asset_url(&manifest.bin);
+    set_latest_asset_url(&mut bufs.url, &manifest.bin);
     let mut writer = SlotWriter::new(flash, sectors, &slots.target, manifest.size)?;
     writer.begin()?; // 先頭セクタを消して無効化
 

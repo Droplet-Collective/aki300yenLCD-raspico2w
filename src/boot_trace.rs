@@ -24,6 +24,12 @@
 //! | SCRATCH5 | `MAGIC` (上位 12 bit) \| IMAGE_DEF major (4 bit) \| IMAGE_DEF minor (16 bit)。書いた版の識別 |
 //! | SCRATCH6 | 稼働時間 (100 ms 単位、上位 24 bit) \| `Stage` (下位 8 bit) |
 //! | SCRATCH7 | 付加情報。PANIC なら行番号、HARDFAULT なら PC、それ以外は [`SelftestCounters`] |
+//! | SCRATCH0 | (0.4.1〜) 付加情報 2。PANIC なら `&Location` のアドレス、HARDFAULT / スタック溢れなら LR |
+//! | SCRATCH1 | (0.4.1〜) 連続して異常終了した回数 (`ticker::health::streak_after_boot`) |
+//!
+//! 0.4.1 の `ticker` は TBYB でない起動 (buy 済みの版の通常起動) でも記録し、buy の後も段階
+//! `Running` のまま更新を続ける。panic / HardFault / タスクの停止 (ウォッチドッグ) を記録してから
+//! 自分でリセットし、次の起動 (同じ版) が状態行 1 に `last reset: ...` と出す (docs/ticker.md「止まったとき」)。
 //!
 //! bootrom が FLASH_UPDATE 再起動で書く SCRATCH5 (0xFFFFFFFE) やリセット値 0 は `MAGIC` と一致しない
 //! ので、新版起動直後や電源投入直後に「前回の記録」を誤検出することはない。
@@ -77,10 +83,20 @@ pub enum Stage {
     WifiPowerCycle = 17,
     /// DHCP タイムアウト後に AP から離脱し、再 join する (0.2.6〜)。次のループで `Joining` に進む
     DhcpRetry = 18,
-    /// panic ハンドラに入った (SCRATCH7 = 行番号)
+    /// 通常運転 (buy 済み、または TBYB でない起動で監視を始めた。0.4.1〜)
+    Running = 19,
+    /// panic ハンドラに入った (SCRATCH7 = 行番号、SCRATCH0 = `&Location` のアドレス (0.4.1〜))
     Panic = 0xE0,
-    /// HardFault に入った (SCRATCH7 = PC)
+    /// HardFault に入った (SCRATCH7 = PC、SCRATCH0 = LR (0.4.1〜))
     HardFault = 0xE1,
+    /// スタック下限 (MSPLIM) を越えた (SCRATCH7 = PC、SCRATCH0 = LR。0.4.1〜)
+    StackOverflow = 0xE2,
+    /// ウォッチドッグの監視で main / 取得 / 描画タスクの停止を検出した (SCRATCH7 = 止まっていた ms。0.4.1〜)
+    WdtMain = 0xE3,
+    WdtJobs = 0xE4,
+    WdtRender = 0xE5,
+    /// 登録していない割り込みが来た (SCRATCH7 = IRQ 番号。0.4.1〜)
+    UnhandledIrq = 0xE6,
 }
 
 impl Stage {
@@ -105,8 +121,14 @@ impl Stage {
             16 => Self::SelftestTimedOut,
             17 => Self::WifiPowerCycle,
             18 => Self::DhcpRetry,
+            19 => Self::Running,
             0xE0 => Self::Panic,
             0xE1 => Self::HardFault,
+            0xE2 => Self::StackOverflow,
+            0xE3 => Self::WdtMain,
+            0xE4 => Self::WdtJobs,
+            0xE5 => Self::WdtRender,
+            0xE6 => Self::UnhandledIrq,
             _ => return None,
         })
     }
@@ -132,8 +154,14 @@ impl Stage {
             Self::SelftestTimedOut => "selftest-timeout",
             Self::WifiPowerCycle => "cyw43-pwr-cycle",
             Self::DhcpRetry => "dhcp-rejoin",
+            Self::Running => "running",
             Self::Panic => "PANIC",
             Self::HardFault => "HARDFAULT",
+            Self::StackOverflow => "STACK-OVERFLOW",
+            Self::WdtMain => "WDT-MAIN",
+            Self::WdtJobs => "WDT-JOBS",
+            Self::WdtRender => "WDT-RENDER",
+            Self::UnhandledIrq => "UNHANDLED-IRQ",
         }
     }
 
@@ -189,6 +217,8 @@ pub struct Trace {
     pub uptime_ds: u32,
     /// SCRATCH7 の生値 (意味は `stage` による)
     pub info: u32,
+    /// SCRATCH0 の生値 (0.4.1〜の付加情報: panic の `&Location`、HardFault の LR。旧版は書かない)
+    pub extra: u32,
 }
 
 impl Trace {
@@ -255,7 +285,18 @@ pub fn read() -> Option<Trace> {
         stage_code,
         uptime_ds: s6 >> 8,
         info: WATCHDOG.scratch7().read(),
+        extra: WATCHDOG.scratch0().read(),
     })
+}
+
+/// SCRATCH1 (連続クラッシュの回数、`ticker::health::streak_after_boot`) を読む。
+/// bootrom は SCRATCH0/1 に書かない (SCRATCH2〜7 だけ、冒頭のコメント参照)
+pub fn read_streak() -> u32 {
+    WATCHDOG.scratch1().read()
+}
+
+pub fn write_streak(word: u32) {
+    WATCHDOG.scratch1().write_value(word);
 }
 
 /// 記録を開始する (TBYB で起動した側が main の最初で呼ぶ)。SCRATCH5..7 を初期化する。
@@ -265,7 +306,14 @@ pub fn arm() {
         .write_value(MAGIC | (u32::from(IMAGE_DEF_MAJOR) & 0xf) << 16 | u32::from(IMAGE_DEF_MINOR));
     WATCHDOG.scratch6().write_value(0);
     WATCHDOG.scratch7().write_value(0);
+    WATCHDOG.scratch0().write_value(0);
     ARMED.store(true, Ordering::SeqCst);
+}
+
+/// 記録を消す (picotool の reset interface など、意図したリセットの直前に呼ぶ。0.4.1〜)
+pub fn clear() {
+    ARMED.store(false, Ordering::SeqCst);
+    WATCHDOG.scratch5().write_value(0);
 }
 
 pub fn is_armed() -> bool {
@@ -287,6 +335,13 @@ pub fn heartbeat() {
     }
 }
 
+/// 付加情報 2 (SCRATCH0) を書く (0.4.1〜。`ticker` は監視中の印 `ticker::health::SUPERVISED_MARK` を置く)
+pub fn set_extra(word: u32) {
+    if is_armed() {
+        WATCHDOG.scratch0().write_value(word);
+    }
+}
+
 /// 付加情報 (SCRATCH7) を書く
 pub fn info(word: u32) {
     if is_armed() {
@@ -297,13 +352,20 @@ pub fn info(word: u32) {
 /// 異常終了を記録する (panic / HardFault ハンドラから)。既に異常終了が記録されていれば
 /// 上書きしない (panic → udf → HardFault の順で来るので、最初の PANIC を残す)。
 pub fn fault(stage: Stage, info: u32) {
+    fault_with(stage, info, 0);
+}
+
+/// [`fault`] に SCRATCH0 の付加情報 (`extra`) を加えたもの (0.4.1〜)。記録したら true
+pub fn fault_with(stage: Stage, info: u32, extra: u32) -> bool {
     if !is_armed() {
-        return;
+        return false;
     }
     let current = (WATCHDOG.scratch6().read() & 0xff) as u8;
     if Stage::from_code(current).is_some_and(Stage::is_fault) {
-        return;
+        return false;
     }
-    WATCHDOG.scratch6().write_value(uptime_ds() << 8 | u32::from(stage as u8));
+    WATCHDOG.scratch0().write_value(extra);
     WATCHDOG.scratch7().write_value(info);
+    WATCHDOG.scratch6().write_value(uptime_ds() << 8 | u32::from(stage as u8));
+    true
 }
