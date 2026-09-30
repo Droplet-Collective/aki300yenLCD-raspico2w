@@ -4,7 +4,8 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use crate::scenario::Scenario;
+use crate::scenario::{RecoveryJson, Scenario, tone};
+use crate::ui::recovery::{self, RecoveryView};
 use crate::ui::bmp::{BmpInfo, HEADER_LEN, Resampler};
 use crate::ui::canvas::Canvas;
 use crate::ui::color;
@@ -83,8 +84,28 @@ pub fn background_for(sc: &Scenario, base: &Path) -> Result<Frame, String> {
     Ok(bg)
 }
 
+/// 回復モードの画面 (0.4.2〜、`ui::recovery`)
+pub fn render_recovery(rec: &RecoveryJson) -> Frame {
+    let mut px = vec![0u16; PIXELS];
+    let mut canvas = Canvas::new(&mut px);
+    let empty = (String::new(), String::new());
+    let view = RecoveryView {
+        title: if rec.title.is_empty() { "RECOVERY MODE" } else { &rec.title },
+        ident: &rec.ident,
+        rows: core::array::from_fn(|i| {
+            let (text, t) = rec.rows.get(i).unwrap_or(&empty);
+            (text.as_str(), tone(t))
+        }),
+    };
+    recovery::render(&mut canvas, &view);
+    px
+}
+
 /// 1 枚描く
 pub fn render_frame(sc: &Scenario, bg: &[u16], bg_level: u8, layout: Layout, extra_secs: u32, scroll_x: i32) -> Frame {
+    if let Some(rec) = &sc.recovery {
+        return render_recovery(rec);
+    }
     let mut px = vec![0u16; PIXELS];
     let mut canvas = Canvas::new(&mut px);
     let view = sc.view(extra_secs, scroll_x);
@@ -131,7 +152,7 @@ pub fn render_scenario(sc: &Scenario, base: &Path, out: &Path, name: &str, gif: 
         let file = if scale == 1 { format!("{name}.png") } else { format!("{name}@{scale}x.png") };
         write_png(&out.join(file), w, h, &rgb)?;
     }
-    if gif {
+    if gif && sc.recovery.is_none() {
         write_animation(sc, base, bg, &out.join(format!("{name}.gif")))?;
     }
     Ok(())

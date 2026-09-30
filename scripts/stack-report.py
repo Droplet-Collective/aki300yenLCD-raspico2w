@@ -27,7 +27,8 @@ UNREACHABLE_WITH_TLS_VERIFY_NONE = re.compile(
 ROOTS = [
     ("main task", r"embassy_main_task_inner_function0B5_$"),
     ("jobs_task", r"jobs_task_task.*inner_function0E4poll"),
-    ("render_task", r"render_task_task.*inner_function0E4poll"),
+    ("render_task", r"___render_task_task.*inner_function0E4poll"),
+    ("recovery_render_task", r"recovery_render_task_task.*inner_function0E4poll"),
     ("slideshow_task", r"slideshow_task_task.*inner_function0E4poll"),
     ("cyw43_task", r"cyw43_task_task.*inner_function0E4poll"),
     ("net_task", r"net_task_task.*inner_function0E4poll"),

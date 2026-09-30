@@ -25,7 +25,7 @@
 //! | SCRATCH6 | 稼働時間 (100 ms 単位、上位 24 bit) \| `Stage` (下位 8 bit) |
 //! | SCRATCH7 | 付加情報。PANIC なら行番号、HARDFAULT なら PC、それ以外は [`SelftestCounters`] |
 //! | SCRATCH0 | (0.4.1〜) 付加情報 2。PANIC なら `&Location` のアドレス、HARDFAULT / スタック溢れなら LR |
-//! | SCRATCH1 | (0.4.1〜) 連続して異常終了した回数 (`ticker::health::streak_after_boot`) |
+//! | SCRATCH1 | (0.4.1〜) 連続して異常終了した回数。0.4.2〜は `boot_policy::BootState` (回数 / 回復モード / 他方区画へ戻した) |
 //!
 //! 0.4.1 の `ticker` は TBYB でない起動 (buy 済みの版の通常起動) でも記録し、buy の後も段階
 //! `Running` のまま更新を続ける。panic / HardFault / タスクの停止 (ウォッチドッグ) を記録してから
@@ -85,6 +85,14 @@ pub enum Stage {
     DhcpRetry = 18,
     /// 通常運転 (buy 済み、または TBYB でない起動で監視を始めた。0.4.1〜)
     Running = 19,
+    /// 回復モードで起動した (Wi-Fi + OTA だけ。0.4.2〜)
+    Recovery = 20,
+    /// OTA の manifest 確認が TLS + HTTP を最後まで通った (0.4.2〜)
+    OtaProved = 21,
+    /// 他方区画へ FLASH_UPDATE 起動する直前 (0.4.2〜)
+    FallbackReboot = 22,
+    /// SD の初期化 / wifi.txt / ticker.txt の読み込み中 (0.4.2〜)
+    SdInit = 23,
     /// panic ハンドラに入った (SCRATCH7 = 行番号、SCRATCH0 = `&Location` のアドレス (0.4.1〜))
     Panic = 0xE0,
     /// HardFault に入った (SCRATCH7 = PC、SCRATCH0 = LR (0.4.1〜))
@@ -122,6 +130,10 @@ impl Stage {
             17 => Self::WifiPowerCycle,
             18 => Self::DhcpRetry,
             19 => Self::Running,
+            20 => Self::Recovery,
+            21 => Self::OtaProved,
+            22 => Self::FallbackReboot,
+            23 => Self::SdInit,
             0xE0 => Self::Panic,
             0xE1 => Self::HardFault,
             0xE2 => Self::StackOverflow,
@@ -155,6 +167,10 @@ impl Stage {
             Self::WifiPowerCycle => "cyw43-pwr-cycle",
             Self::DhcpRetry => "dhcp-rejoin",
             Self::Running => "running",
+            Self::Recovery => "recovery",
+            Self::OtaProved => "ota-ok",
+            Self::FallbackReboot => "fallback",
+            Self::SdInit => "sd-init",
             Self::Panic => "PANIC",
             Self::HardFault => "HARDFAULT",
             Self::StackOverflow => "STACK-OVERFLOW",
@@ -297,6 +313,18 @@ pub fn read_streak() -> u32 {
 
 pub fn write_streak(word: u32) {
     WATCHDOG.scratch1().write_value(word);
+}
+
+/// SCRATCH0 の生の値 (`arm()` の前に読む。0.4.2〜: 他方区画へ戻した版の印 `boot_policy::fallback_marker`)
+pub fn read_scratch0() -> u32 {
+    WATCHDOG.scratch0().read()
+}
+
+/// 他方区画へ FLASH_UPDATE 起動する直前に、戻した版の印を SCRATCH0 に置く (0.4.2〜)。
+/// bootrom の FLASH_UPDATE 再起動は SCRATCH2〜7 だけを書くので、次の起動 (他方区画の版) が読める。
+pub fn write_fallback_marker(word: u32) {
+    ARMED.store(false, Ordering::SeqCst);
+    WATCHDOG.scratch0().write_value(word);
 }
 
 /// 記録を開始する (TBYB で起動した側が main の最初で呼ぶ)。SCRATCH5..7 を初期化する。

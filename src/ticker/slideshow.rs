@@ -38,6 +38,9 @@ pub static PAUSE: AtomicBool = AtomicBool::new(false);
 /// 取得タスクが最初の OTA 確認を終えたら立てる。これが立つか [`SlideConfig::start_by`] を過ぎるまで SD の
 /// 写真には触れない (0.4.1〜: 起動したら何より先に OTA 確認まで進み、壊れた版でも次の版で直せるように)
 pub static START: AtomicBool = AtomicBool::new(false);
+/// 最初の写真の読み込みを試し終えた (成否を問わない。写真が 1 枚も無い / SD が無いときも立つ)。
+/// TBYB の buy 条件「機能の一巡」の 1 つ (0.4.2〜、`boot_policy::Round::slideshow`)
+pub static FIRST_DONE: AtomicBool = AtomicBool::new(false);
 /// 直近の読み込み失敗 (main が状態行 1 に出して消す)
 pub static LAST_ERROR: Mutex<ThreadModeRawMutex, RefCell<Option<String<64>>>> = Mutex::new(RefCell::new(None));
 
@@ -54,6 +57,8 @@ pub struct SlideConfig {
     pub sd_fast: bool,
     /// [`START`] が立たなくてもこの時刻には始める (Wi-Fi が無い / つながらない場合)
     pub start_by: Instant,
+    /// 試験用 (`debug_crash=slideshow`): 最初の写真を読み始めたら panic する
+    pub crash_on_first: bool,
 }
 
 /// 既定のグラデーションを背景にする (起動時 / 写真が 1 枚も読めないとき)
@@ -199,6 +204,7 @@ pub async fn slideshow_task(volume_mgr: SdVolumeManager, cfg: SlideConfig) {
     let list = image_list(&volume_mgr, &cfg);
     defmt::info!("slideshow: {} image(s), interval {} s", list.len(), cfg.interval.as_secs());
     if list.is_empty() {
+        FIRST_DONE.store(true, Ordering::Relaxed);
         return; // グラデーションのまま
     }
     let mut fast = cfg.sd_fast;
@@ -213,6 +219,9 @@ pub async fn slideshow_task(volume_mgr: SdVolumeManager, cfg: SlideConfig) {
         fade(true).await;
         LEVEL.store(slide::LOADING_LEVEL, Ordering::Relaxed);
         let started = Instant::now();
+        if cfg.crash_on_first && !FIRST_DONE.load(Ordering::Relaxed) {
+            panic!("debug_crash=slideshow");
+        }
         let result = loop {
             let result = load(&volume_mgr, name, cfg.layout).await;
             if let Err(LoadError::Io(_)) = result
@@ -242,6 +251,7 @@ pub async fn slideshow_task(volume_mgr: SdVolumeManager, cfg: SlideConfig) {
                 }
             }
         }
+        FIRST_DONE.store(true, Ordering::Relaxed);
         fade(false).await;
         LEVEL.store(32, Ordering::Relaxed);
 

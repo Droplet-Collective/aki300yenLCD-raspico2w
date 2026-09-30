@@ -151,7 +151,7 @@ const STATUS_PANEL: Panel = Panel {
     radius: 4,
 };
 
-fn tone_color(tone: Tone) -> Color {
+pub fn tone_color(tone: Tone) -> Color {
     match tone {
         Tone::Muted => palette::MUTED,
         Tone::Normal => palette::OFF_WHITE,

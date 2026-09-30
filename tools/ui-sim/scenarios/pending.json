@@ -1,0 +1,17 @@
+{
+  "layout": "glass",
+  "background": "../samples/SUNSET.BMP",
+  "status": {
+    "expanded": true,
+    "line1": "aterm-abff4a-g 192.168.200.130 | NTP ok s1 | WX ok | MSG fetching",
+    "line1_tone": "ok",
+    "ident_head": "ticker v0.4.2 via OTA",
+    "ident_rest": " slot B TBYB:pending 41/180s wait:message",
+    "ident_tone": "busy",
+    "ota": "OTA: up to date (latest 0.4.2), next check in 52s",
+    "ota_tone": "ok",
+    "wifi": "ok", "ntp": "ok", "wx": "ok", "msg": "busy",
+    "version": "v0.4.2"
+  },
+  "animation": { "duration_ms": 1000 }
+}

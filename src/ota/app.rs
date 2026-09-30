@@ -3,9 +3,13 @@
 //! v0.2.8 までは `src/bin/wifi_ota.rs` にあったものを、表示 (LCD の描画) だけを bin 側に残して
 //! ここへ移した。振る舞いは変えていない (docs/wifi-ota.md §1, §5)。
 //!
-//! - **TBYB**: bootrom のウォッチドッグ (16.7 s) を [`tbyb_watchdog_task`] が 2 s ごとに再ロードして延ばし、
-//!   自己診断 (LCD 走査中 + Wi-Fi join + DHCP) が通ったら [`BootStatus::selftest_tick`] が `explicit_buy`
-//!   する。起動から [`TBYB_SELFTEST_DEADLINE_SECS`] 経っても通らなければ延長をやめ、旧版へ戻る。
+//! - **TBYB**: 0.4.2〜の buy 条件は `boot_policy::BuyGate` (Wi-Fi + DHCP、OTA の manifest 確認が TLS + HTTP を
+//!   最後まで通った、bin ごとの機能の一巡、その後 25 s の健全な稼働)。[`BootStatus::buy_tick`] が判定して
+//!   `explicit_buy` する。起動から [`TBYB_SELFTEST_DEADLINE_SECS`] (180 s) 経っても揃わなければ buy せず旧版へ
+//!   戻る。buy 待ちの間の OTA 確認は manifest を読むだけで、ダウンロードは buy の後 ([`CheckMode`]。
+//!   buy 待ちの間の書き込み先は、戻り先になる旧版の区画だから)。
+//!   ウォッチドッグは `wifi_ota` なら [`tbyb_watchdog_task`] が bootrom の 16.7 s を 2 s ごとに延ばし、
+//!   `ticker` は `supervisor` が生存確認つきで再ロードする (止まったタスクがあれば旧版へ戻る)。
 //! - **接続管理**: [`LinkManager`] が join → DHCP (20 s) → 通らなければ離脱して再 join、を回す。
 //!   進行は `boot_trace` に記録する (巻き戻ったときに旧版が読む)。
 //! - **OTA**: [`run_ota_check`] が manifest → 新版なら他方区画へストリーミング書き込み → 検証、
@@ -32,6 +36,7 @@ use super::manifest::{Manifest, Version};
 use super::slot::{self, OtaFlash, SectorBuffers, SlotWriter, Slots, slot_label};
 use super::{MANIFEST_NAME, OtaError, URL_MAX, set_latest_asset_url};
 use crate::ab_boot::{self, BootInfo};
+use crate::boot_policy::{BUY_SETTLE_MS, BuyGate, BuyInputs, BuyStep, CheckOutcome, Round};
 use crate::boot_trace::{self, ResetReason, SelftestCounters, Stage, Trace};
 use crate::wifi::{self, WifiCredentials, ascii_label};
 
@@ -58,12 +63,10 @@ pub const REBOOT_AFTER: Duration = Duration::from_secs(2);
 /// ダウンロード中の進捗通知間隔
 pub const PROGRESS_REDRAW: Duration = Duration::from_millis(250);
 
-/// TBYB 起動時、explicit_buy を許す最短稼働時間 (LCD 走査が回っていることの確認)
-pub const BUY_MIN_UPTIME: Duration = Duration::from_secs(2);
-/// TBYB 自己診断の締め切り (起動からの秒数)。この間は `tbyb_watchdog_task` が bootrom のウォッチドッグを
-/// 延長し続ける。過ぎたら延長をやめて buy もしない (最長 16.7 s 後にウォッチドッグで旧版へ戻る)。
-/// join 再試行 (5〜60 s) + DHCP (最大 20 s) を数回やり直せる長さ。
-pub const TBYB_SELFTEST_DEADLINE_SECS: u64 = 120;
+/// TBYB 自己診断の締め切り (起動からの秒数、`boot_policy::BUY_DEADLINE_MS`)。この間はウォッチドッグを
+/// 再ロードし続ける。過ぎたら再ロードをやめて buy もしない (ウォッチドッグで旧版へ戻る)。
+/// 0.4.1 までは 120 s (join + DHCP だけ)。0.4.2〜は OTA 確認と機能の一巡、25 s の様子見が入るので 180 s。
+pub const TBYB_SELFTEST_DEADLINE_SECS: u64 = (crate::boot_policy::BUY_DEADLINE_MS / 1000) as u64;
 /// ウォッチドッグを再ロードする周期 (16.7 s に対して十分短く、フラッシュ操作や scan の待ちより長い)
 pub const TBYB_WATCHDOG_FEED_INTERVAL: Duration = Duration::from_secs(2);
 /// WATCHDOG.LOAD に書く値。24 bit × 1 µs = 16.7 s で、bootrom が TBYB 起動時に設定するのと同じ最大値。
@@ -225,6 +228,12 @@ pub struct BootStatus {
     pub reset_reason: ResetReason,
     /// 前回の TBYB 起動が SCRATCH5〜7 に残した記録 (巻き戻り後の旧版で見える)
     pub prev_trace: Option<Trace>,
+    /// SCRATCH0 の生の値 (`boot_trace::arm` の前に読む。他方区画へ戻した印 `boot_policy::fallback_marker`)
+    pub scratch0: u32,
+    /// buy 条件の判定 (0.4.2〜)
+    pub gate: BuyGate,
+    /// 直近の判定結果 (LCD の `wait:ota` / `settle 12s`)
+    pub last_step: BuyStep,
 }
 
 impl BootStatus {
@@ -242,7 +251,15 @@ impl BootStatus {
             boot_at: Instant::now(),
             reset_reason: ResetReason::read(),
             prev_trace: boot_trace::read(),
+            scratch0: boot_trace::read_scratch0(),
+            gate: BuyGate::new(crate::boot_policy::BUY_DEADLINE_MS, BUY_SETTLE_MS),
+            last_step: BuyStep::Waiting { missing: "wifi" },
         }
+    }
+
+    /// `reboot(FLASH_UPDATE)` で起動した (OTA で書いた版、または他方区画へ戻した版)。buy 済みかどうかは問わない
+    pub fn is_flash_update_boot(&self) -> bool {
+        self.is_ota_boot()
     }
 
     /// 起動診断行 (起動種別 / 診断ワード / リセット理由) を出すか。電源投入直後の通常起動では出さない
@@ -283,20 +300,32 @@ impl BootStatus {
         );
     }
 
-    /// TBYB の自己診断 = LCD 走査中 (`BUY_MIN_UPTIME`) + Wi-Fi join + DHCP で IP 取得 → `explicit_buy`。
-    /// 成立するまでは `tbyb_watchdog_task` がウォッチドッグを延長する。締め切りを過ぎたら延長も buy も
-    /// やめ、最長 16.7 s 後にウォッチドッグで旧版へ戻る。メインループで毎回呼ぶ。
-    /// 状態が変わったら true (表示を更新する)。
-    pub fn selftest_tick(&mut self, network_up: bool, display_running: bool) -> bool {
-        if self.buy == BuyState::Pending && Instant::now() >= self.selftest_deadline() {
+    /// TBYB の buy 条件 (`boot_policy::BuyGate`、0.4.2〜) を判定し、揃えば `explicit_buy` する。
+    /// `ota_proved` = OTA の manifest 確認が一度でも TLS + HTTP を最後まで通った ([`check_outcome`])、
+    /// `round` = bin ごとの機能の一巡 (`wifi_ota` は `Round::DONE`)、`healthy` = 生存確認が揃っている
+    /// (`wifi_ota` は LCD 走査中)。締め切りを過ぎたら buy せず、ウォッチドッグで旧版へ戻るのを待つ。
+    /// メインループで毎回呼ぶ。状態が変わったら true (表示を更新する)。
+    pub fn buy_tick(&mut self, network_up: bool, ota_proved: bool, round: Round, healthy: bool) -> bool {
+        if self.buy != BuyState::Pending {
+            return false;
+        }
+        let step = self.gate.tick(&BuyInputs {
+            now_ms: self.boot_at.elapsed().as_millis() as u32,
+            network_up,
+            ota_proved,
+            round,
+            healthy,
+        });
+        self.last_step = step;
+        if step == BuyStep::TimedOut {
             TBYB_FEEDING.store(false, Ordering::Relaxed);
             self.buy = BuyState::TimedOut;
             boot_trace::stage(Stage::SelftestTimedOut);
             defmt::warn!("TBYB self-test timed out; not buying, waiting for the watchdog to roll back");
             return true;
         }
-        if self.buy == BuyState::Pending && network_up && self.boot_at.elapsed() >= BUY_MIN_UPTIME && display_running {
-            defmt::info!("self-test passed (Wi-Fi + DHCP up), explicit_buy ...");
+        if step == BuyStep::Buy {
+            defmt::info!("self-test passed (Wi-Fi + OTA check + first round + settle), explicit_buy ...");
             // bootrom の explicit_buy は最初に WATCHDOG.CTRL.ENABLE を落とす (成否によらず) ので、
             // 以後の再ロードは不要。先にフラグを落としてタスクを終わらせる。
             TBYB_FEEDING.store(false, Ordering::Relaxed);
@@ -319,9 +348,15 @@ impl BootStatus {
         false
     }
 
-    /// OTA を行ってよいか (buy 待ち / 巻き戻し待ちの間は行わない)
+    /// OTA のダウンロード / 書き込みを行ってよいか (buy 待ち / 巻き戻し待ちの間は行わない。
+    /// 書き込み先の他方区画は、buy されなかったときの戻り先だから)
     pub fn ota_allowed(&self) -> bool {
         !matches!(self.buy, BuyState::Pending | BuyState::TimedOut)
+    }
+
+    /// OTA の manifest 確認を行ってよいか (0.4.2〜: buy 待ちの間も行う。buy 条件の 1 つ)
+    pub fn ota_check_allowed(&self) -> bool {
+        self.buy != BuyState::TimedOut
     }
 
     /// LCD 用: ` slot B TBYB:pending 37/120s WDT 15.1s` の形の文字列と、その色調。
@@ -344,13 +379,22 @@ impl BootStatus {
                 Tone::Muted
             }
             BuyState::Pending => {
-                // ウォッチドッグを延長しながら自己診断中。締め切りまでの経過秒を出す
+                // ウォッチドッグを再ロードしながら自己診断中。締め切りまでの経過秒と、待っている条件を出す
                 let _ = write!(
                     line,
                     " TBYB:pending {}/{}s",
                     self.boot_at.elapsed().as_secs().min(TBYB_SELFTEST_DEADLINE_SECS),
                     TBYB_SELFTEST_DEADLINE_SECS
                 );
+                match self.last_step {
+                    BuyStep::Waiting { missing } => {
+                        let _ = write!(line, " wait:{}", missing);
+                    }
+                    BuyStep::Settling { left_ms } => {
+                        let _ = write!(line, " settle {}s", left_ms.div_ceil(1000));
+                    }
+                    _ => {}
+                }
                 Tone::Busy
             }
             BuyState::TimedOut => {
@@ -366,8 +410,8 @@ impl BootStatus {
                 Tone::Error
             }
         };
-        // bootrom の TBYB ウォッチドッグの残り (buy 後に ticker が動かす監視用のウォッチドッグは出さない)
-        if matches!(self.buy, BuyState::Pending | BuyState::TimedOut)
+        // 巻き戻るまでの残り (0.4.2〜: buy 待ちの間は 0.5 s ごとに再ロードされるので、締め切り後だけ出す)
+        if self.buy == BuyState::TimedOut
             && let Some(t) = watchdog_remaining_tenths()
         {
             let _ = write!(line, " WDT {}.{}s", t / 10, t % 10);
@@ -607,6 +651,10 @@ pub enum OtaPhase {
     /// manifest が 404 (Release 無し)
     NoRelease,
     UpToDate { latest: Version },
+    /// 新しい版がある (buy 待ちなので、ダウンロードは buy の後。0.4.2〜)
+    NewerAvailable { latest: Version },
+    /// 新しい版があるが、他方区画へ戻す原因になった版 (以下) なので入れない (0.4.2〜、`persist`)
+    Blocked { latest: Version },
     Downloading { version: Version, received: u32, total: u32 },
     Verifying { version: Version },
     /// 検証済み。`REBOOT_AFTER` 後に FLASH_UPDATE 再起動
@@ -667,7 +715,7 @@ impl OtaState {
     pub fn apply(&mut self, result: Result<OtaPhase, OtaError>) {
         let now = Instant::now();
         match result {
-            Ok(phase @ (OtaPhase::NoRelease | OtaPhase::UpToDate { .. })) => {
+            Ok(phase @ (OtaPhase::NoRelease | OtaPhase::UpToDate { .. } | OtaPhase::Blocked { .. })) => {
                 self.rejected = None;
                 self.backoff = OTA_BACKOFF_MIN;
                 self.phase = phase;
@@ -755,6 +803,17 @@ impl OtaState {
                     let _ = write!(line, ", next check in {}s", secs_until(next));
                 }
                 Tone::Ok
+            }
+            OtaPhase::NewerAvailable { latest } => {
+                let _ = write!(line, "OTA: {} available, download after TBYB buy", latest);
+                Tone::Busy
+            }
+            OtaPhase::Blocked { latest } => {
+                let _ = write!(line, "OTA: latest {} blocked (fell back from it), waiting", latest);
+                if let Some(next) = self.next_check {
+                    let _ = write!(line, " {}s", secs_until(next));
+                }
+                Tone::Error
             }
             OtaPhase::Downloading {
                 version,
@@ -883,13 +942,56 @@ impl<U: OtaUi> BodySink for DownloadSink<'_, '_, U> {
     }
 }
 
-/// 1 回の更新確認。戻り値の `OtaPhase` は NoRelease / UpToDate / Rejected / Rebooting のいずれか。
+/// 1 回の確認で何をするか (0.4.2〜)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckMode {
+    /// 新しい版があってもダウンロードしない (TBYB の buy 待ち。`NewerAvailable` を返す)
+    pub check_only: bool,
+    /// この版数語以下は入れない (`boot_policy::Record::blocked`、0 = 無し)
+    pub blocked: u32,
+}
+
+/// 確認の結果の分類 (`boot_policy::CheckOutcome`)。HTTP の応答を受けた (manifest を解釈した / 確定した
+/// ステータス / 本文の検証まで進んだ) なら `Proved` = この版の TLS + HTTP の経路が最後まで動いた。
+/// DNS / TCP / TLS / 時間切れ / 区画の問題は `Transport` (経路を試し切れていない)。
+pub fn check_outcome(result: &Result<OtaPhase, OtaError>) -> CheckOutcome {
+    match result {
+        Ok(_) => CheckOutcome::Proved,
+        Err(
+            OtaError::HttpStatus(_)
+            | OtaError::HttpHeaderTooLong
+            | OtaError::HttpCodec
+            | OtaError::HttpRedirect
+            | OtaError::TooManyRedirects
+            | OtaError::LocationTooLong
+            | OtaError::Manifest
+            | OtaError::BadSize
+            | OtaError::SizeMismatch
+            | OtaError::ShaMismatch
+            | OtaError::ReadbackMismatch
+            | OtaError::Flash,
+        ) => CheckOutcome::Proved,
+        Err(
+            OtaError::Dns
+            | OtaError::Network
+            | OtaError::Tls
+            | OtaError::HttpProtocol
+            | OtaError::Timeout
+            | OtaError::NoPartitionTable
+            | OtaError::NoTarget,
+        ) => CheckOutcome::Transport,
+    }
+}
+
+/// 1 回の更新確認。戻り値の `OtaPhase` は NoRelease / UpToDate / NewerAvailable / Blocked / Rejected /
+/// Rebooting のいずれか。
 pub async fn run_ota_check(
     net: &Net<'_>,
     bufs: &mut NetBuffers,
     flash: &mut OtaFlash,
     sectors: &mut SectorBuffers,
     slots: Slots,
+    mode: CheckMode,
     ui: &mut impl OtaUi,
 ) -> Result<OtaPhase, OtaError> {
     ui.ota_phase(OtaPhase::Checking).await;
@@ -925,6 +1027,18 @@ pub async fn run_ota_check(
     );
     if !manifest.is_newer_than_current() {
         return Ok(OtaPhase::UpToDate {
+            latest: manifest.version,
+        });
+    }
+    let latest_word = crate::boot_policy::version_word(manifest.version.major, manifest.version.minor, manifest.version.patch);
+    if mode.blocked != 0 && latest_word <= mode.blocked {
+        defmt::warn!("manifest {} is blocked (fell back from it); not installing", manifest.version);
+        return Ok(OtaPhase::Blocked {
+            latest: manifest.version,
+        });
+    }
+    if mode.check_only {
+        return Ok(OtaPhase::NewerAvailable {
             latest: manifest.version,
         });
     }

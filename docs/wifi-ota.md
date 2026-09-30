@@ -174,8 +174,9 @@ v0.2.2 までの `wifi_ota` はこのウォッチドッグに一切触れず、1
 - `LOAD` は書き込み専用でカウンタを再ロードするだけ。`CTRL` (ENABLE / PAUSE_*) や、bootrom の
   再起動パラメータが入る `SCRATCH2..7` には触れない。embassy の `Watchdog::start` は `CTRL` と
   `SCRATCH` を書き換えるので使わない。
-- 起動から 120 s (`TBYB_SELFTEST_DEADLINE_SECS`) までに自己診断 (LCD 走査中 + 起動 2 s 以上 +
-  Wi-Fi join + DHCP で IP 取得) が通らなければ延長をやめ、buy もしない。以後は最長 16.7 s で
+- 起動から 120 s (`TBYB_SELFTEST_DEADLINE_SECS`、0.4.2〜 180 s) までに自己診断 (0.4.1 まで: LCD 走査中 + 起動 2 s 以上 +
+  Wi-Fi join + DHCP で IP 取得。0.4.2〜: LCD 走査中 + Wi-Fi + DHCP + OTA の manifest 確認が TLS + HTTP を最後まで通った
+  + 25 s。`ticker` はさらに機能の一巡、[ticker.md §8.2](ticker.md)) が通らなければ延長をやめ、buy もしない。以後は最長 16.7 s で
   ウォッチドッグが発火し、bootrom が旧版で通常起動する。これが「延長し続けて抜けられなくなる」
   ことへの歯止めで、LCD には `TBYB: self-test timed out (120 s), rolling back` と出る。
 - 自己診断が通ったら `explicit_buy`。bootrom の `explicit_buy` は最初に `CTRL.ENABLE` を落とす
@@ -316,3 +317,4 @@ manifest 自体が同じ経路で来る以上、改竄対策にはならない�
 | 0.3.1 | `ticker` の日本語フォントを美咲 8×8 の 2 倍表示から東雲 14 ドット (Public Domain) の等倍に変更。実機の写真で 2 px の線が LCD 上で太く潰れて見えたため、線 1 px のフォントにした ([ticker.md §5](ticker.md))。流れる文字の帯の下の区切り線が状態行 1 の文字に重なっていた配置も修正。`wifi_ota` の挙動は変えていない |
 | 0.4.0 | `ticker` に SD の写真のスライドショー背景とガラス風の新しい画面 ([ticker.md](ticker.md) §1)、PC の画面シミュレータ `tools/ui-sim` ([ui-sim.md](ui-sim.md))。LCD のバックバッファを RGB666 `u32` から RGB565 `u16` にした (垂直ブランキングのコピーで表引きして 18 bit に広げる。全 bin 共通、`wifi_ota` の RAM も 76.8 kB 空く)。OTA / TBYB の手順は変えていない |
 | 0.4.1 | `ticker` が起動 1 分ほどで固まる不具合 (最初の HTTPS の TLS ハンドシェイクでスタック溢れ) を修正し、固まったら自分で戻るようにした ([ticker.md §7.1 / §8](ticker.md))。スタックの上端を 0x2008_2000 (SRAM8/9) にしたので全 bin の空きスタックが 8 kB 増える。`ota::http::fetch` はリダイレクト先を `chunk` に一旦写す (2 kB のローカル変数を無くした)。`BootStatus::write_tbyb_line` の `WDT` 残り秒は buy 待ち / 巻き戻り待ちのときだけ出す。boot_trace に段階 `Running` と異常終了 0xE2〜0xE6、SCRATCH0/1 の付加情報を追加 (SCRATCH5〜7 の形は同じなので旧版も読める)。picotool の USB reset interface でのリセット前に記録を消す。`wifi_ota` の OTA / TBYB の手順は変えていない |
+| 0.4.2 | `ticker` の **OTA 到達保証** ([ticker.md §8](ticker.md))。共有の `ota::app`: buy 条件を `boot_policy::BuyGate` (Wi-Fi + DHCP + OTA の manifest 確認が TLS + HTTP を最後まで通った + bin ごとの機能の一巡 + 25 s) に変え、締め切りを 120 → 180 s。buy 待ちの間も manifest の確認だけは行い (`CheckMode::check_only`、新しい版は `NewerAvailable` として buy 後にダウンロード)、通信の失敗なら 10 s ごとに試し直す。`wifi_ota` も同じ buy 条件 (機能の一巡は無し) を使い、ウォッチドッグは従来どおり延長タスク。`OtaPhase` に `NewerAvailable` / `Blocked`、boot_trace に段階 `recovery` / `ota-ok` / `fallback` / `sd-init` を追加。SD の転送に期限 (`sdcard::set_deadline`) |

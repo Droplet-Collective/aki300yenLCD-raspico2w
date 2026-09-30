@@ -13,6 +13,7 @@
 //! - [`background`] — 写真が無いときのグラデーション、フェード
 //! - [`screen`] — 画面構成 ([`screen::View`] を [`screen::Layout`] で描く)
 //! - [`slide`] — スライドショーの切り替え (背景のフェード) の明るさ
+//! - [`recovery`] — 回復モードの画面 (黒地に `FONT_6X10` だけ、0.4.2〜)
 
 pub mod aafont;
 pub mod aafont_data;
@@ -21,6 +22,7 @@ pub mod bmp;
 pub mod canvas;
 pub mod color;
 pub mod icons;
+pub mod recovery;
 pub mod screen;
 pub mod slide;
 
