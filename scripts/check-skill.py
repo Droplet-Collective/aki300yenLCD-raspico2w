@@ -20,15 +20,15 @@ def check(root):
         errors.append(f"{SKILL} is missing")
     else:
         lines = open(path, encoding="utf-8").read().splitlines()
-        if not lines or lines[0].strip() != "---":
+        if not lines or lines[0].rstrip("\r") != "---":
             errors.append(f"{SKILL}: line 1 must be '---' (YAML frontmatter)")
         else:
-            end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+            end = next((i for i in range(1, len(lines)) if lines[i].rstrip("\r") == "---"), None)
             if end is None:
                 errors.append(f"{SKILL}: frontmatter has no closing '---'")
             else:
                 front = lines[1:end]
-                if "name: ota-firmware" not in (l.strip() for l in front):
+                if "name: ota-firmware" not in (l.rstrip() for l in front):
                     errors.append(f"{SKILL}: frontmatter has no 'name: ota-firmware'")
                 if not any(l.startswith("description:") and l[len("description:"):].strip() for l in front):
                     errors.append(f"{SKILL}: frontmatter has no 'description:'")
