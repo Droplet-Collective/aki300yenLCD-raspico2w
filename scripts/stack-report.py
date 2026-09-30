@@ -39,14 +39,16 @@ EXCEPTION_FRAME = 112
 
 
 def tool(name):
-    for cand in (f"llvm-{name}", name):
-        path = shutil.which(cand)
-        if path:
-            return path
+    # rustup の llvm-tools (rust-toolchain.toml で入る) を優先し、無ければ PATH の llvm-<name>。
+    # GNU binutils の objdump / nm (x86 用) は ARM の ELF を読めないので使わない。
     sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip()
-    for root, _, files in os.walk(os.path.join(sysroot, "lib", "rustlib")):
-        if f"llvm-{name}" in files:
-            return os.path.join(root, f"llvm-{name}")
+    if sysroot:
+        for root, _, files in os.walk(os.path.join(sysroot, "lib", "rustlib")):
+            if f"llvm-{name}" in files:
+                return os.path.join(root, f"llvm-{name}")
+    path = shutil.which(f"llvm-{name}")
+    if path:
+        return path
     sys.exit(f"llvm-{name} not found (rustup component add llvm-tools)")
 
 
