@@ -108,6 +108,25 @@ pub fn read_credentials(volume_mgr: &SdVolumeManager) -> Result<WifiCredentials,
     parse_credentials(&buf[..len])
 }
 
+/// data 区画の写し (`persist`、0.4.2〜の回復モード) から資格情報を作る (`parse_credentials` と同じ検査)
+pub fn credentials_from_bytes(ssid: &[u8], password: &[u8]) -> Result<WifiCredentials, &'static str> {
+    let ssid = core::str::from_utf8(ssid).map_err(|_| "wifi copy: not UTF-8")?;
+    let password = core::str::from_utf8(password).map_err(|_| "wifi copy: not UTF-8")?;
+    if ssid.is_empty() || ssid.len() > 32 {
+        return Err("wifi copy: bad SSID");
+    }
+    if !password.is_empty() && !(8..=63).contains(&password.len()) {
+        return Err("wifi copy: bad password");
+    }
+    let mut credentials = WifiCredentials {
+        ssid: String::new(),
+        password: String::new(),
+    };
+    let _ = credentials.ssid.push_str(ssid);
+    let _ = credentials.password.push_str(password);
+    Ok(credentials)
+}
+
 /// 1 行目 SSID、2 行目パスワード。CR/LF のみ除去し、空行は読み飛ばす。
 pub fn parse_credentials(bytes: &[u8]) -> Result<WifiCredentials, &'static str> {
     let text = core::str::from_utf8(bytes).map_err(|_| "wifi.txt: not UTF-8")?;

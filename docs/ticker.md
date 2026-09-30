@@ -1,4 +1,4 @@
-# ネットワーク・ティッカー (`ticker`, v0.3.0〜、現行 v0.4.0)
+# ネットワーク・ティッカー (`ticker`, v0.3.0〜、現行 v0.4.2)
 
 Pico 2 W + 300 円 LCD を「時計 + 天気 + 流れる文字」の小さな情報端末にする bin。
 v0.4.0 から SD の写真 (BMP) をスライドショーで背景に敷き、その上に半透明の「ガラス」の板で情報を重ねる。
@@ -48,7 +48,7 @@ OTA の診断に欠かせないが画面の 3 分の 1 を使うので、**必�
 3. 起動診断 (前回の TBYB の記録) / `ticker.txt` の注意を出している間 (60 s / 90 s)
 4. Wi-Fi が IP を得ていない間
 5. OTA のダウンロード中 / 検証中 / 再起動待ち (進捗バー付き) と、OTA の失敗・巻き戻り (`OTA:` 行が赤)
-6. TBYB の buy 待ち (`TBYB:pending`) / buy 失敗 / 締め切り切れ
+6. TBYB の buy 待ち (`TBYB:pending 41/180s wait:weather` / `settle 12s`、0.4.2〜 最長 180 s) / buy 失敗 / 締め切り切れ
 
 `ticker.txt` の `status=full` で常に 3 行、`status=compact` で常に小さな 1 行 (既定 `auto` は上の規則)。
 3 行の文言は 0.3.1 と同じ (下記)。
@@ -111,10 +111,11 @@ OTA の診断に欠かせないが画面の 3 分の 1 を使うので、**必�
 
 ## 3. TBYB と OTA
 
-- 自己診断 (buy 条件) は `wifi_ota` と同じ「LCD 走査中 + Wi-Fi join + DHCP で IP 取得」だけ
-  (0.4.1〜: 「LCD 走査中」= 描画タスクが 2 s 以内に 1 フレーム描いている)。
-  **NTP / 天気 / 文字の取得が失敗しても buy には関係しない** (それらは buy が済むまで始めない。取得の待ち時間で
-  buy を遅らせないため)。締め切り 120 s、ウォッチドッグ延長 2 s ごと、巻き戻り時の記録も同じ。
+- 自己診断 (buy 条件) は 0.4.2 から「Wi-Fi + DHCP、OTA の manifest 確認 (TLS + HTTP)、NTP / 天気 / 文字 / SD の設定 /
+  最初の写真を 1 回ずつ試す、その後 25 s 健全に動く」(締め切り 180 s、§8.2)。0.4.1 までは Wi-Fi + DHCP だけで、
+  OTA 確認より前に buy していた (OTA の経路が壊れた版でも buy してしまう)。取得の成否は問わない (落ちずに戻ってくればよい)。
+- buy 待ちの間 (OTA で届いてから 40〜60 s。状態行 2 が黄色の `TBYB:pending 41/180s wait:message` → `settle 12s`) は、
+  時計・天気・文字・写真は普段どおり動く。OTA 確認は manifest を読むだけ (buy の後にダウンロード)。
 - OTA イメージの切り替え: v0.2.x の `wifi_ota` は manifest の `bin` に書かれた名前をそのまま
   `releases/latest/download/<bin>` から取る (`src/ota/app.rs` の `latest_asset_url(&manifest.bin)`)。
   v0.3.0 の Release では `manifest.json` が `ticker.bin` を指すので、**0.2.8 の `wifi_ota` が動いている機体は
@@ -153,6 +154,7 @@ images=IMAGE.BMP,IMAGE2.BMP   # 背景に使う BMP と順番 (省略時はル�
 layout=glass         # 画面構成 glass / dock / classic (§1)
 status=auto          # 状態 3 行 auto (必要なときだけ、§1.1) / full (常に) / compact (常に小さな 1 行)
 sdfast=1             # 写真を読むときの SD の速さ 1 = 速い (読み誤りで自動的に低速へ) / 0 = 常に低速
+debug_crash=ota      # 試験用 (0.4.2〜): boot / ota / slideshow でわざと panic する (回復モードの確認用、§8)。既定は無し
 ```
 
 | キー | 既定値 | 備考 |
@@ -167,6 +169,7 @@ sdfast=1             # 写真を読むときの SD の速さ 1 = 速い (読み�
 | `layout` | `glass` | `glass` / `dock` / `classic` |
 | `status` | `auto` | `auto` / `full` / `compact` |
 | `sdfast` | 1 | `0` / `1` |
+| `debug_crash` | (無し) | `boot` (ticker.txt を読んだ直後) / `ota` (最初の OTA 確認の直前) / `slideshow` (最初の写真を読み始めたとき) / `none`。**buy 済みの版の通常起動でだけ効く** (TBYB の buy 待ちと回復モードでは無視。回復モードは ticker.txt を読まない)。2 回で回復モードになり、10 分ごとに通常モードを試してまた落ちる。消せば次の通常モードの試行で元に戻る |
 
 不正な値のキーは無視して既定値のまま。有効なキーが 1 つも無ければ `ticker.txt: no valid keys, ...` と出る。
 
@@ -191,16 +194,21 @@ sdfast=1             # 写真を読むときの SD の速さ 1 = 速い (読み�
 ## 6. 構成
 
 ```text
-src/bin/ticker.rs        main (SD → LCD → USB → CYW43 → 250 ms ループ: 接続 / TBYB / 状態行 / OTA の再起動)
-                         jobs_task (0.4.1〜、250 ms: 最初に OTA 確認、以後 OTA / NTP / 天気 / 文字を 1 つずつ)
+src/bin/ticker.rs        main (ウォッチドッグ → 起動の方針 → LCD → SD → USB → CYW43 → 250 ms ループ: 接続 / TBYB / 状態行 / OTA の再起動)
+                         jobs_task (0.4.1〜、250 ms: 最初に OTA 確認、以後 OTA / NTP / 天気 / 文字を 1 つずつ。
+                         0.4.2〜 回復モードのときは回復モード全体 = 画面 + Wi-Fi + 60 s ごとの OTA、§8.3)
+                         recovery_render_task (回復モードの画面)、fallback_now (他方区画へ、§8.4)
                          render_task (垂直同期ごとに全画面を描き直し、文字を scroll px 動かす。状態 3 行の規則 §1.1)
                          panic / HardFault / DefaultHandler (記録してリセット、§8)
-src/supervisor.rs        ウォッチドッグ + 生存確認 + MSPLIM + スタックの塗りと最大使用量 (0.4.1〜、§8)
-src/ticker/health.rs     止まったタスクの判定、`last reset: ...` の文字列、連続クラッシュ回数 (純粋、ホストのテストあり)
+src/supervisor.rs        ウォッチドッグ (0.4.2〜 main の最初から) + 生存確認 + buy 待ちの締め切り + MSPLIM + スタックの塗り (§8)
+src/boot_policy.rs       起動の方針 (通常 / 回復 / 他方区画)、buy 条件、SCRATCH の語、data 区画の記録 (0.4.2〜、純粋、§8)
+src/persist.rs           data 区画の記録の読み書き (Wi-Fi の資格情報の写し、入れない版。0.4.2〜)
+src/noinline.rs          大きな future の poll をインライン展開させない包み (スタック対策、0.4.2〜)
+src/ticker/health.rs     止まったタスクの判定、`last reset: ...` の文字列 (純粋、ホストのテストあり)
 scripts/stack-report.py  ELF の逆アセンブルから各タスクの最悪スタック深さを見積もる (§7.1)
                          共有モデル MODEL (ThreadModeRawMutex + RefCell。main が文字列を入れ、render が読む)
 src/ticker/slideshow.rs  背景の写真 (SD の BMP を 1 ブロックずつ読む、フェード、OTA 中は停止。§1.2)
-src/ui/                  画面の描画 (no_std の純粋なコード。tools/ui-sim と共用): screen.rs (3 つの構成)、
+src/ui/                  画面の描画 (no_std の純粋なコード。tools/ui-sim と共用): screen.rs (3 つの構成)、recovery.rs (回復モード)、
                          canvas.rs (ガラス板 / 文字 / アイコン)、bmp.rs (BMP → 400×96、拡大縮小 + 切り出し + ディザ)、
                          color.rs (RGB565 / 666 / 888、合成)、aafont*.rs (AA 数字)、icons.rs、background.rs、slide.rs
 tools/ui-sim/            画面シミュレータ (PNG / GIF、docs/ui-sim.md)
@@ -212,7 +220,8 @@ src/ticker/sntp.rs       SNTP パケット (純粋)、sntp_net.rs: embassy-net �
 src/ticker/digits.rs     5×7 の数字 (0.3.x の時計。v0.4.0 の画面では使わない、テストのみ)
 src/font/shinonome.rs    東雲フォント (14 ドット) の検索と描画
 tools/bdf2bin.py         BDF → テーブル (JIS X 0208 / JIS X 0201 / Unicode 符号の BDF に対応)
-tools/ticker-tests/      上の純粋なモジュールをホストでテストする (cd tools/ticker-tests && cargo test)
+tools/ticker-tests/      上の純粋なモジュールをホストでテストする (cd tools/ticker-tests && cargo test)。
+                         boot_sim.rs は起動の流れの模擬 (故障の注入、§8.7)。CI の host-tests で毎回走る
 ticker/message.txt       流れる文字の既定の取得元
 ```
 
@@ -229,6 +238,7 @@ ticker/message.txt       流れる文字の既定の取得元
 
 | bin | `.text` + `.rodata` | `.data` + `.bss` + `.uninit` | スタック |
 |---|---|---|---|
+| `ticker` 0.4.2 | 777,968 + 531,536 = 1,309,504 B ≈ **1,279 kB** (1 スロット 1920 kB の 67 %) | 4,144 + 489,160 + 1,024 = 494,328 B | **38,152 B ≈ 37.3 KiB** (§7.1) |
 | `ticker` 0.4.1 | 726,380 + 528,992 = 1,255,372 B ≈ **1,226 kB** (1 スロット 1920 kB の 65 %) | 4,144 + 486,848 + 1,024 = 492,016 B | **40,464 B ≈ 39.5 KiB** (0x2008_2000 まで、§7.1) |
 | `ticker` 0.4.0 | 720,720 + 528,348 = 1,249,068 B ≈ **1,220 kB** (1 スロット 1920 kB の 65 %) | 4,136 + 491,024 + 1,024 = 496,184 B | ≈ **27.4 kB** |
 | `ticker` 0.3.1 | 677,772 + 515,768 = 1,193,540 B ≈ 1,166 kB (61 %) | 2,064 + 483,056 + 1,024 = 486,144 B | ≈ 37.3 kB |
@@ -267,6 +277,12 @@ cortex-m-rt の配置では、スタックは RAM の最上位から下へ伸び
 | 0.3.1 | 38,144 B | 34,608 B: main の poll 13.3 kB → `fetch_small` 4.8 kB → reqwless `request` 7.5 kB → TLS ハンドシェイク (P-256) | +3.5 kB |
 | 0.4.0 | 28,104 B | 35,072 B: 同じ経路 (main 14.0 kB) | **−7.0 kB (溢れる)** |
 | 0.4.1 | 40,464 B | 24,868 B: `jobs_task` の poll 5.4 kB → `fetch_small` 2.8 kB → `request` 7.5 kB → TLS | **+15.6 kB** |
+| 0.4.2 | 38,152 B | 24,412 B: `jobs_task` (通常の取得 + 回復モード) の poll 2.7 kB → OTA 確認 2.9 kB → `fetch` 2.8 kB → `request` 7.5 kB → TLS | **+13.7 kB** |
+
+0.4.2 の注意 (試作で stack-report が見つけたもの): 回復モードを別のタスクにするとタスク領域 (OTA 確認の future ≈ 15 kB) が
+2 つ分要ってスタックが 15 kB 減るので、取得タスクの中で動かす。取得を `with_timeout` でもう 1 段包むと、包んだ future を一旦スタックに
+作ってから移すので取得タスクの poll が 30 kB になった (外した。内側の打ち切りで足りる)。大きな future は `noinline` で包み、
+poll をインライン展開させない (`src/noinline.rs`)。
 
 0.4.1 でしたこと:
 
@@ -284,25 +300,147 @@ cortex-m-rt の配置では、スタックは RAM の最上位から下へ伸び
 - 起動時に空きスタックを模様で塗り、どこまで上書きされたかを 1 s ごとに数えて、状態行 2 に
   `stk 22.9/39.5K` (最大使用量 / 大きさ) と出す (defmt にも `stack high-water: N of M B`)。実機の実測値はこれで分かる。
 
-## 8. 止まったとき (0.4.1〜、`src/supervisor.rs`)
+## 8. OTA 到達保証 (0.4.2〜、`src/boot_policy.rs` / `src/supervisor.rs`)
+
+**どんな壊れ方をした版が届いても、「ウォッチドッグで再起動 → 最新の版を確認 → 更新」までは必ず進む**ようにする仕組み。
+0.4.0 は OTA の経路そのもの (最初の HTTPS) で固まり、自分では直せず USB で書き直すしかなかった (§8.6)。
+0.4.2 は次の 3 段で守る。
+
+1. **壊れた版は buy しない** (§8.2): OTA で届いた版は、OTA 確認と各機能の一巡を実際にやってみて 25 s 健全に動くまで
+   buy しない。途中で落ちる / 止まる版は buy されず、bootrom が前の (動いていた) 版に戻す。
+2. **buy の後で落ちるようになったら回復モード** (§8.3): 2 回続けて異常終了したら、Wi-Fi + OTA だけの最小構成で起動する。
+3. **回復モードでも落ちるなら他方区画へ戻る** (§8.4): 前に buy した版を FLASH_UPDATE 起動する。
+
+どの段でも、ウォッチドッグ (8 s) は **main の最初から** 動いている (§8.1)。
+
+### 8.1 起動の流れ
+
+```text
+電源 / リセット
+  └─ bootrom: A/B のうち buy 済みで版数の大きい方 (FLASH_UPDATE 起動なら対象の区画、TBYB でも可)
+      └─ main: embassy_rp::init → ウォッチドッグ 8 s 開始 (TBYB 起動では bootrom の 16.7 s を縮めるだけ)
+          ├─ 前回の記録 (SCRATCH5〜7) / 連続異常終了の回数 (SCRATCH1) / 他方区画から戻された印 (SCRATCH0) を読む
+          ├─ boot_policy::decide ─┬─ 通常モード (TBYB の buy 待ちもここ)
+          │                       ├─ 回復モード (通常で 2 回続けて異常終了)
+          │                       └─ 他方区画へ (回復モードで 3 回続けて異常終了、1 回だけ)
+          │
+          ├─ 通常: LCD 準備 → SD (wifi.txt / ticker.txt、期限 5 s) → data 区画 (Wi-Fi の写し) → 走査開始 → 監視開始
+          │         → USB → CYW43 → join + DHCP → ★OTA 確認 (最初の仕事) → NTP / 天気 / 文字 / 最初の写真
+          │         → (TBYB なら) 25 s 健全 → explicit_buy → ウォッチドッグを動かし直す → 60 s ごとに OTA 確認
+          ├─ 回復: 画面 (黒地に文字) → Wi-Fi の資格情報 (data 区画の写し、無ければ SD の wifi.txt だけ 4 s)
+          │         → CYW43 → join + DHCP → ★OTA 確認 (60 s ごと) → 新しい版があれば入れて FLASH_UPDATE 起動
+          │         → 無ければ 10 分後に通常モードを 1 回試す (落ちたらすぐ回復モードへ戻る)
+          └─ 他方区画へ: SCRATCH0 に自分の版数を置き、画面も Wi-Fi も使わずに reboot(FLASH_UPDATE, 他方区画)
+```
+
+- **初期化中** (描画が始まるまで): main が各段階の前にウォッチドッグを明示的に再ロードする。SD の読み込みは期限付き
+  (`sdcard::set_deadline`: 期限を過ぎると SPI の転送を失敗させる。カードが無いと embedded-sdmmc の再試行が
+  ≈ 25 s 戻らなかった)。どこかで止まれば 8 s でリセット (記録は無いが「この版の記録 + 時間切れ」を異常終了と数える)。
+- **描画が始まってから**: 0.4.1 と同じ生存確認 (main / 取得 / 描画タスク。LCD のフレーム割り込みが 0.5 s ごとに確かめ、
+  揃っていれば再ロード、止まったタスクがあれば記録してすぐリセット)。TBYB の buy 待ちも同じ仕組みで再ロードする
+  (0.4.1 までは延長タスクが無条件に延ばしていたので、buy 待ちで止まったタスクがあっても締め切りまで待っていた)。
+- `explicit_buy` は bootrom がウォッチドッグを止める (CTRL.ENABLE = 0) ので、直後に動かし直す (`supervisor::rearm`)。
+- どの取得も内側で打ち切る (NTP 5 s × 3 段 × 2 ホスト、天気 / 文字 20 s、manifest 30 s、ダウンロード 300 s)。
+  OTA 確認は取得タスクの最優先なので、他の取得が詰まっても最長 ≈ 20 s しか遅れない。OTA 専用のタスクは作らない
+  (TLS のバッファ ≈ 30 kB を 2 組置く RAM が無い)。
+
+### 8.2 TBYB の buy 条件 (0.4.1 は Wi-Fi + DHCP だけだった)
+
+buy 待ちの版は、次が **全部** 揃ってから 25 s (`BUY_SETTLE_MS`) 健全に動いたら buy する (`boot_policy::BuyGate`)。
+
+| | 条件 | LCD の `wait:` |
+|---|---|---|
+| (a) | Wi-Fi に join して DHCP で IP を得た | `wifi` |
+| (b) | OTA の manifest 確認が TLS + HTTP を最後まで通った (manifest を読めた、または 404 / 5xx などの確定したステータス) | `ota` |
+| (c) | NTP / 天気 / 文字 / SD の設定 / 最初の写真を 1 回ずつ試した (成否は問わない、落ちずに戻った) | `ntp` `weather` `message` `sd` `photo` |
+| (d) | main / 取得 / 描画の生存確認が揃っている (途中で Wi-Fi が落ちる / 途切れたら 25 s を数え直す) | `health` / `settle 12s` |
+
+- 締め切りは起動から **180 s** (0.4.1 は 120 s)。過ぎたら buy せず、ウォッチドッグの再ロードをやめて 8 s 後に旧版へ戻る。
+- buy 待ちの間の OTA 確認は **manifest を読むだけ** (新しい版があっても落とさない。書き込み先の他方区画は、buy されなかった
+  ときの戻り先だから)。buy した直後にもう一度確認して、新しい版があればそこで落とす。
+- ネットワーク / GitHub が使えないとき:
+
+| 状況 | 結果 |
+|---|---|
+| join / DHCP が締め切りまで通らない | buy しない → 旧版へ戻る (旧版は動くので許容)。旧版は 10 分後に同じ版の FLASH_UPDATE 起動を再試行する |
+| つながるが manifest の取得が DNS / TCP / TLS / 時間切れで失敗 | 締め切りまで **10 s ごと**に試し直す (`PENDING_OTA_RETRY_MS`) |
+| TLS は通るが HTTP 5xx / 404 | TLS + HTTP の経路は通っているので (b) を満たす |
+
+- 巻き戻った版の再試行は 0.2.4 からの 10 分ごと (`REJECTED_RETRY_DELAY`) のまま。壊れた版が届いた場合、旧版は 10 分に
+  1 回それを試して戻る (1 回の試行は締め切り以内、早く落ちる版ほど早く戻る)。直した版が出れば次の確認 (60 s 以内) で
+  そちらを入れる。
+
+### 8.3 回復モード
+
+**通常モードで 2 回続けて異常終了**したら (`boot_policy::RECOVERY_AFTER`)、次の起動は回復モードになる。
+
+| 使うもの | 使わないもの |
+|---|---|
+| ウォッチドッグ + 生存確認、LCD (黒地に `FONT_6X10` の文字だけ)、CYW43 + join + DHCP、OTA の確認 / ダウンロード / 検証 / FLASH_UPDATE | SD (写真、ticker.txt、BMP の一覧)、NTP、天気、文字、写真の背景、AA 数字、東雲フォント、USB |
+
+- 異常終了として数えるもの: panic / HardFault / スタック溢れ / タスクの停止 / 未登録の割り込み (どれも記録してリセット) と、
+  **記録の無いウォッチドッグの時間切れ** (この版の記録が残っているのに時間切れで戻った = 割り込みごと止まった / 初期化中に止まった)。
+  TBYB で試した **他の版** の記録 (巻き戻り) は数えない。
+- Wi-Fi の資格情報は data 区画の写し (`src/persist.rs`、通常モードが wifi.txt を読めたときに内容が変わっていれば書く) を使い、
+  SD には触れない。写しが無いとき (0.4.2 が一度も通常モードで起動できなかった) だけ、期限 4 s で `wifi.txt` だけを読む。
+  写しはパスワードも平文 (SD の wifi.txt と同じ)。picotool で読み出せるので、消したいときは data 区画を消去する。
+- OTA 確認は 60 s ごと (失敗しても 60 s。通常モードのバックオフ 10 分までは待たない)。新しい版があれば通常と同じく落として
+  検証し、FLASH_UPDATE 起動する (TBYB で §8.2 の条件を満たせば buy)。
+- 確認が通って新しい版が無ければ、**10 分後に通常モードを 1 回試す** (一時的な故障なら元に戻る。回数を「あと 1 回で回復モード」
+  にしておくので、落ちればすぐ回復モードに戻る)。Wi-Fi の資格情報が無いなど OTA ができないときも、10 分後に通常モードを試す。
+- 回数は「通常モードで OTA 確認が通ってから 10 分異常なく動いた」ときに 0 に戻る (0.4.1 は起動から 10 分)。電源の入れ直しでも 0。
+
+画面 (`src/ui/recovery.rs`、シミュレータ `tools/ui-sim/scenarios/recovery.json`):
+
+```text
+RECOVERY MODE                                         ticker v0.4.2 slot B   ← 赤い帯
+last reset: panic src/ticker/slideshow.rs:231 @42s #2                         ← 赤: 前回の理由と連続回数
+crashed 2x in normal mode -> Wi-Fi + OTA only (rec #0)                        ← 黄
+Wi-Fi: aterm-abff4a-g 192.168.200.130                                         ← 緑 / 黄 / 赤
+OTA: up to date (latest 0.4.2), next check in 42s                             ← wifi_ota と同じ OTA 行
+no newer release: retry normal mode in 9:18                                   ← 次にすること
+Wi-Fi credentials: flash copy (SD not used)
+NORMAL P1 A:0021 consid B:4C4D launched reset:force                           ← 起動種別 / リセット理由
+fix: publish a newer release (checked every 60 s) or USB
+```
+
+### 8.4 他方区画へ戻る
+
+回復モードでも **3 回続けて異常終了**したら (`FALLBACK_AFTER`)、画面も Wi-Fi も使わずに、SCRATCH0 に自分の版数を置いて
+**他方区画を `reboot(FLASH_UPDATE)` で起動する** (`ab_boot::reboot_flash_update`、OTA の再起動と同じ API)。
+
+- bootrom (pico-bootrom-rp2350 の `varm_flash_boot.c` / `varm_launch_image.c`) は、FLASH_UPDATE の対象区画に正しいイメージが
+  あれば **版数によらず** それを選ぶ。対象の方が版数が小さく、TBYB でない (前に buy された) イメージなら、起動時に
+  **他方 (落ち続けた版) の区画の先頭セクタを消す** (版数の巻き戻し)。つまり「1 回だけの起動」ではなく、以後はその版だけが起動する。
+- 戻った先の版 (0.4.2 以降) は SCRATCH0 の印を読み、状態行 1 に 5 分間赤で `FALLBACK: v0.4.3 kept crashing, back on v0.4.2 (blocked)`
+  と出し、その版を data 区画に **入れない版** として記録する。以後 OTA はその版以下を入れない
+  (`OTA: latest 0.4.3 blocked (fell back from it), waiting`)。直した版 (より新しい版数) が出れば入れる。
+- 行き来の防止: 他方区画へ戻すのは 1 回だけ (`BootState::fell_back`)。他方区画に起動できるイメージが無く同じ版がまた起動したら
+  (印が自分の版数)、以後は回復モードのまま (`fallback to the other slot failed ...`)。入れない版の記録は電源を切っても残る。
+- 他方区画に buy されていない新しい版 (巻き戻った TBYB の版) があれば、それが TBYB で試される (条件を満たせば buy、だめなら戻る)。
+
+### 8.5 限界 (正直なところ)
+
+- **両方の区画が壊れている** (他方区画も、回復モードの OTA も通らない) 場合は、USB (BOOTSEL + UF2 の D&D、`ticker.uf2`) でしか直せない。
+- 戻り先が **0.4.1** のとき (0.4.2 が初めての版なので、0.4.2 自体が buy 後に落ち続けた場合): 0.4.1 は印も入れない版も知らないので、
+  0.4.2 をもう一度落として試す (10 分おき)。0.4.2 は §8.2 の条件で再び buy され、また落ちて戻る、を繰り返しうる。どの周回でも
+  OTA 確認までは進むので、直した版 (0.4.3) を出せば入れ替わる。
+- 他方区画に巻き戻った TBYB の版が残っていると、印 (SCRATCH0) はその版の起動で消えるので、戻したことを覚えていられない
+  (落ちる版とその TBYB 版の間を行き来しうる。どの周回でも OTA 確認はする)。
+- buy 待ちでは ダウンロード → 書き込み の経路 (manifest の後) は試せない (試すと戻り先の区画を壊すため)。この経路は各版で共通の
+  コード (`ota::app::run_ota_check`) で、0.2.6 から実機で動いている。
+- 異常終了の回数は SCRATCH (電源断で消える) にあるので、電源を入れ直すと 0 から数え直す。
+- 試験用に落とす手段: `ticker.txt` に `debug_crash=boot` / `ota` / `slideshow` (§4)。buy 済みの版の通常起動でだけ効く。
+
+### 8.6 0.4.0 / 0.4.1 の経緯
 
 0.4.0 は、OTA で入った直後の 1 分ほどで画面が固まった (時計が止まり、状態 3 行のまま。2026-09-30 の写真)。
 原因は §7.1 のスタック溢れ: 接続 → buy → NTP の直後、最初の HTTPS (天気) の TLS ハンドシェイクで ≈7 kB 溢れ、
 .bss の最上位にある `FRAME_WAKER` (LCD のフレーム割り込みが毎フレーム起こす waker) や USB の waker を壊した。
 次のフレーム割り込みが壊れた waker を呼んで HardFault になり、当時の HardFault ハンドラは `loop {}` だった。
-buy の後は bootrom のウォッチドッグも止まっているので、そのまま何時間も止まっていた (走査は SRAM の DMA リングで
-続くので、最後のフレームが出続ける)。0.4.1 は次のように「止まったら記録して自分で戻る」:
-
-- **ウォッチドッグ**: buy の後 (TBYB でない起動なら描画開始の直後) から 8 s のハードウェア・ウォッチドッグを動かす
-  (buy 待ちの間は従来どおり bootrom の 16.7 s を延長タスクが延ばす)。
-- **生存確認**: main ループ / 取得タスク / 描画タスクがそれぞれ生存を知らせ、LCD のフレーム割り込みが 0.5 s ごとに
-  確かめる。全員が期限内 (main・取得 90 s、描画 5 s) ならウォッチドッグを再ロード、誰かが止まっていたら
-  記録してすぐリセットする。OTA のダウンロード中は 250 ms ごとの進捗通知で取得タスクの生存を知らせる。
-  フラッシュの消去 (割り込み禁止 ≤ 0.4 s) は期限よりずっと短い。割り込みごと止まった場合は再ロードが止まり、
-  8 s でウォッチドッグがリセットする。
-- **panic / HardFault / スタック溢れ / 未登録の割り込み**: 理由を WATCHDOG の SCRATCH に書いてすぐリセット
-  (以前は `loop {}` で止まったまま)。
-- **次の起動で表示**: 状態行 1 に 5 分間、赤で出す (状態 3 行もその間出る)。
+buy の後は bootrom のウォッチドッグも止まっているので、そのまま何時間も止まっていた。0.4.0 の buy 条件は Wi-Fi + DHCP だけで、
+OTA 確認 (同じ TLS の経路) より前に buy していたので、自分の OTA でも直せなかった。0.4.1 は「止まったら記録して自分で戻る」
+ようにした (下の表示。0.4.2 でもそのまま):
 
 | 表示 | 意味 |
 |---|---|
@@ -310,19 +448,31 @@ buy の後は bootrom のウォッチドッグも止まっているので、そ�
 | `last reset: HardFault pc=1000abcd lr=10001235 @12s` | HardFault。PC を `llvm-addr2line -e ticker.elf 0x1000abcd` で引く |
 | `last reset: STACK OVERFLOW pc=... @2s` | MSPLIM を越えた (§7.1) |
 | `last reset: wdt: render stalled 5s @300s` | 描画タスクが 5 s 以上止まった (`main` / `jobs` も同様、90 s) |
-| `last reset: wdt timeout (no record, running) @3600s` | 割り込みも止まった (ロックアップ等) ので記録できず、ウォッチドッグの時間切れで戻った |
-| 末尾の `#3` | 3 回続けて異常終了した |
+| `last reset: wdt timeout (no record, cyw43-init) @3s` | 割り込みも止まった / 初期化中に止まったので記録できず、ウォッチドッグの時間切れで戻った (括弧内は最後の段階) |
+| 末尾の `#2` | 2 回続けて異常終了した (次は回復モード) |
 
-- リセット後は同じ (buy 済みの) 区画が起動する。**接続後の最初の仕事は OTA 確認** (§2) なので、新しい版自体が
-  どこかで止まる場合でも、起動のたびに OTA 確認までは進み、直した版を配れば入れ替わる。
-- **安全モード**: 3 回続けて異常終了したら、写真 / 天気 / 文字を止めて OTA と NTP だけで動く
-  (状態行 1 に `SAFE MODE: 3 crashes in a row, ...`)。異常終了せずに 10 分動くと回数は 0 に戻る。
-  電源を入れ直しても 0 に戻る (SCRATCH は電源断で消える)。
-- 記録の置き場所: SCRATCH5〜7 は TBYB の記録 ([wifi-ota.md §5.2](wifi-ota.md)) と同じ形 (段階 `Running` と異常終了の
-  段階 0xE0〜0xE6 を追加)、SCRATCH0 に付加情報 (panic の `&Location`、HardFault の LR、監視中の印)、SCRATCH1 に
-  連続回数。bootrom は SCRATCH0/1 に書かない。picotool の USB reset interface でリセットするときは記録を消す。
-- buy 待ち中 (TBYB) の panic / HardFault もすぐリセットするので、16.7 s を待たずに旧版へ戻る (旧版が `TBYB x.y.z: PANIC ...`
-  または `last reset: ...` と出す)。
+- 記録の置き場所: SCRATCH5〜7 は TBYB の記録 ([wifi-ota.md §5.2](wifi-ota.md)) と同じ形 (段階 `Running` / `recovery` / `ota-ok` /
+  `fallback` / `sd-init` と異常終了の段階 0xE0〜0xE6)、SCRATCH0 に付加情報 (panic の `&Location`、HardFault の LR、
+  監視中の印、他方区画へ戻す印)、SCRATCH1 に `boot_policy::BootState`。bootrom は SCRATCH0/1 に書かない。
+  picotool の USB reset interface でリセットするときは記録を消す。
+- buy 待ち中 (TBYB) の panic / HardFault / 停止もすぐリセットするので、締め切りを待たずに旧版へ戻る (旧版が `TBYB x.y.z: PANIC ...` と出す)。
+
+### 8.7 ホストでの確認 (`tools/ticker-tests`)
+
+`boot_policy` の判定 (回数の数え方、回復 / 他方区画、buy 条件、data 区画の記録) の単体テストに加えて、`boot_sim.rs` が
+起動の流れを模擬する: bootrom の A/B / TBYB / FLASH_UPDATE / 版数の巻き戻しの選び方、SCRATCH の残り方、各段階の所要時間と
+ウォッチドッグ、OTA (60 s ごと、10 分後の再試行)、回復モードを模型にし、**本物の `boot_policy` で** 動かす。
+
+| 注入した故障 | 確かめたこと |
+|---|---|
+| 新しい版が LCD / SD / CYW43 / join / DHCP / OTA の TLS / NTP / 天気 / 文字 / 写真 の各段階で落ちる・止まる (20 通り) | buy しない、旧版へ戻る、再試行は 10 分ごと (1 時間で 5 回)、OTA 確認の間隔は最大 172 s、直した版で直る |
+| buy の後 30 s / 5 分 / 20 分で落ちる | 回復モードに入る (20 分は 10 分で回数が戻るので入らない)、OTA 確認の間隔は最大 94 s、直した版が 61 分に動く |
+| 回復モードでも落ちる (CYW43 / 画面 / OTA / 30 s 後) | 3 回で他方区画へ戻る、戻った版は落ちた版を入れ直さない、直した版で直る |
+| buy 待ちの間 Wi-Fi が無い / GitHub に届かない | buy せず戻り、後で buy する |
+| GitHub が 5xx | buy する (経路は通っている) |
+| 他方区画が空のまま落ち続ける | 他方区画へは 1 回だけ、以後は回復モードで OTA 確認を続け、新しい版で直る |
+| 途中で電源を入れ直す | 直した版にたどり着く |
+| 両方の区画が壊れていて回復モードも落ちる | OTA 確認に届かない (§8.5 の限界) ことを確認 |
 
 ## 9. 既知の制限
 
@@ -340,7 +490,10 @@ buy の後は bootrom のウォッチドッグも止まっているので、そ�
 - 切り替えの途中で読めなかった写真は元に戻せないのでグラデーションになる (次の間隔で次の写真へ)。
 - 実機確認: v0.3.0 は 0.2.8 からの OTA で実機に載り、NTP / 天気 / 文字の取得と表示を確認した (2026-09-29)。
   v0.3.1 のフォントは実機の写真で確認済み (「きれいに見えた」)。v0.4.0 は写真の背景とガラスの画面が表示されたが、
-  最初の HTTPS で固まった (§8)。**v0.4.1 のスタック対策 / ウォッチドッグ / 記録と表示は実機で未確認**
+  最初の HTTPS で固まった (§8.6)。v0.4.1 は USB で書き直した後、時計 / 天気 / 写真 / 文字と状態表示 `v0.4.1` が動くことを
+  実機の写真で確認した (2026-09-30)。**v0.4.2 の OTA 到達保証 (buy 条件、main の最初からのウォッチドッグ、回復モード、
+  他方区画へ戻る、data 区画の写し、SD の期限) は実機で未確認** (判定はホストのテストと起動の流れの模擬で確認、§8.7)。
+  以下は v0.4.1 までの注記:
   (スタックは逆アセンブルからの見積もり、生存確認の判定と表示の文字列はホストのテストで確認)。
 
 ## 10. 履歴
@@ -351,3 +504,4 @@ buy の後は bootrom のウォッチドッグも止まっているので、そ�
 | 0.3.1 | 日本語フォントを美咲 8×8 の 2 倍表示から東雲 14 ドットの等倍に変更 (実機で線が太く潰れて見えたため。§5)。流れる文字の下の区切り線が状態行 1 の文字に重なっていたのを直し、状態行を 9 px ピッチ (y 68 / 77 / 86) に、時計・日付・天気を 1 px 上に |
 | 0.4.0 | **写真の背景 + モダンな画面**。SD の BMP のスライドショー (§1.2、`slide` / `images` / `sdfast`)、ガラスの板・AA 数字の時計・天気アイコン・降水確率の錠剤 (§1、`layout`)、状態 3 行を必要なときだけ出す (§1.1、`status`)。描画を `src/ui/` に分けて PC のシミュレータ `tools/ui-sim` と共用 ([ui-sim.md](ui-sim.md))。バックバッファを RGB565 にして背景用の RAM を作った (§7) |
 | 0.4.1 | **固まる不具合の修正と自動復帰** (§7.1、§8)。0.4.0 は最初の HTTPS (天気) の TLS ハンドシェイクでスタックが溢れて固まっていた (ticker.txt とは無関係。無くても既定値で動く、§4)。取得を別タスクに分け、2 kB の URL の一時領域を無くし、スタックを SRAM8/9 まで伸ばし、使わないヒープを減らして、空き 27.4 kB → 39.5 kB、最深経路 35.1 kB → 24.9 kB。MSPLIM でスタック溢れを検出。buy の後もウォッチドッグ (8 s) を動かし、main / 取得 / 描画の生存確認が揃うときだけ再ロード。panic / HardFault / 停止は記録してリセットし、次の起動が `last reset: ...` と出す。接続後の最初の仕事を OTA 確認にし、写真の読み込みもその後。3 回続けて異常終了したら安全モード。状態行 2 にスタックの最大使用量 `stk` |
+| 0.4.2 | **OTA 到達保証** (§8): 壊れた版が届いても「ウォッチドッグで再起動 → 最新の版を確認 → 更新」まで必ず進む。(1) TBYB の buy 条件を Wi-Fi + DHCP + OTA の manifest 確認 (TLS + HTTP) + NTP / 天気 / 文字 / SD / 最初の写真の一巡 + 25 s の健全な稼働に強化 (締め切り 180 s、buy 待ちの OTA は manifest だけ)。(2) ウォッチドッグ (8 s) を main の最初から、どの起動でも。buy 待ちも生存確認つきで再ロード。SD の読み込みに期限 (カード無しで 25 s 止まっていた)。(3) 安全モードを **回復モード** に置き換え: 2 回続けて異常終了したら SD を使わず Wi-Fi + OTA だけ (資格情報は data 区画の写し)、60 s ごとに OTA、10 分後に通常モードを再試行。(4) 回復モードでも 3 回落ちたら他方区画を FLASH_UPDATE 起動し、戻った版はその版を入れない。(5) 試験用 `debug_crash=`。(6) ホストで起動の流れを模擬するテスト (`boot_sim`) と CI の host-tests |

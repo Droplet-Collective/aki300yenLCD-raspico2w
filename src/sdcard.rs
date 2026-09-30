@@ -3,8 +3,16 @@
 //! 基板配線 (CS=GP26, CMD/MOSI=GP27, CLK=GP28, DAT0/MISO=GP0) は
 //! ハードウェア SPI のピン組み合わせではないため GPIO で SPI を生成する。
 //! `sd_bmp_viewer` と同じ実装を bin 間で共有できるよう切り出したもの。
+//!
+//! # 時間切れ (0.4.2〜、[`set_deadline`])
+//!
+//! embedded-sdmmc の再試行は「約 10 µs × 回数」で数えるが、この GPIO SPI では 1 バイトに ≈ 40 µs かかるので、
+//! カードが無いと `init_sd` は ≈ 25 s 戻らない (CMD0 の応答待ち 10,000 回 × 50 回)。起動時の SD は同期処理で
+//! executor ごと止まるので、ウォッチドッグ (8 s、`supervisor`) の方が先に切れて起動を繰り返してしまう。
+//! `set_deadline` を設定している間は、期限を過ぎたら SPI の各転送を `BusTimeout` で失敗させ
+//! (embedded-sdmmc は `Error::Transport` として返す)、SD の処理を必ず期限内に終わらせる。
 
-use core::convert::Infallible;
+use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_rp::Peri;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{PIN_0, PIN_26, PIN_27, PIN_28};
@@ -89,12 +97,40 @@ impl Drop for BitBangSd {
     }
 }
 
+/// SD の処理の期限 (起動からの ms、0 = 無し)
+static DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+
+/// SD の各転送に期限を付ける (`None` で外す)。期限を過ぎた転送は [`BusTimeout`] で失敗する。
+/// 起動時の同期読み込み (wifi.txt / ticker.txt) の間だけ設定する。
+pub fn set_deadline(deadline: Option<embassy_time::Instant>) {
+    let ms = deadline.map_or(0, |d| (d.as_millis() as u32).max(1));
+    DEADLINE_MS.store(ms, Ordering::Relaxed);
+}
+
+fn past_deadline() -> bool {
+    let deadline = DEADLINE_MS.load(Ordering::Relaxed);
+    deadline != 0 && embassy_time::Instant::now().as_millis() as u32 >= deadline
+}
+
+/// [`set_deadline`] の期限を過ぎた
+#[derive(Clone, Copy, Debug)]
+pub struct BusTimeout;
+
+impl embedded_hal::spi::Error for BusTimeout {
+    fn kind(&self) -> embedded_hal::spi::ErrorKind {
+        embedded_hal::spi::ErrorKind::Other
+    }
+}
+
 impl ErrorType for BitBangSd {
-    type Error = Infallible;
+    type Error = BusTimeout;
 }
 
 impl SpiDevice<u8> for BitBangSd {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+        if past_deadline() {
+            return Err(BusTimeout);
+        }
         for operation in operations {
             match operation {
                 Operation::Read(read) => {

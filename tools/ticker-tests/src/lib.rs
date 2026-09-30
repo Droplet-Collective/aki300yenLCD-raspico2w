@@ -1,5 +1,12 @@
 //! 本体クレートの純粋なモジュールを取り込んでホストでテストする (`cargo test`)
+//!
+//! `boot_sim` (0.4.2〜) は起動の流れ (bootrom の A/B 選択 + TBYB、ファームウェアの通常 / 回復 / 他方区画への
+//! 切り替え) を模擬し、本物の `boot_policy` で故障を注入して「必ず OTA 確認まで進む」「壊れた版を buy しない」を確かめる。
 
+#[path = "../../../src/boot_policy.rs"]
+pub mod boot_policy;
+#[cfg(test)]
+mod boot_sim;
 #[path = "../../../src/ticker/civil.rs"]
 pub mod civil;
 #[path = "../../../src/ticker/config.rs"]
@@ -273,6 +280,17 @@ mod tests {
         assert_eq!(c, default);
         assert_eq!(note.as_str(), "SD: SD INIT FAILED (ticker.txt skipped, using Tokyo)");
 
+        // 試験用 debug_crash (0.4.2〜)
+        let (c, _) = config::load(config::ConfigSource::Read(b"debug_crash=ota\n"));
+        assert_eq!(c.debug_crash, config::DebugCrash::Ota);
+        let (c, _) = config::load(config::ConfigSource::Read(b"debug_crash = Slideshow # test\n"));
+        assert_eq!(c.debug_crash, config::DebugCrash::Slideshow);
+        let (c, _) = config::load(config::ConfigSource::Read(b"debug_crash=boot\n"));
+        assert_eq!(c.debug_crash, config::DebugCrash::Boot);
+        let (c, _) = config::load(config::ConfigSource::Read(b"debug_crash=bogus\nplace=x\n"));
+        assert_eq!(c.debug_crash, config::DebugCrash::None);
+        assert_eq!(default.debug_crash, config::DebugCrash::None);
+
         // 正常なファイルは注意なし
         let (c, note) = config::load(config::ConfigSource::Read("place=大阪\nlat=34.7\n".as_bytes()));
         assert_eq!(c.place.as_str(), "大阪");
@@ -402,21 +420,182 @@ mod tests {
         assert!(t.len() <= 20 && t.ends_with(".rs"), "{t}");
     }
 
+    // ---- 0.4.2: 起動の方針 (boot_policy) ----
+
     #[test]
-    fn health_streak_and_safe_mode() {
-        use health::*;
-        // 電源投入直後 (SCRATCH1 = 0) の通常起動
-        assert_eq!(streak_after_boot(false, 0), (0, STREAK_MAGIC));
-        // 異常終了が 3 回続くと安全モード
-        let (n1, w1) = streak_after_boot(true, 0);
-        let (n2, w2) = streak_after_boot(true, w1);
-        let (n3, _) = streak_after_boot(true, w2);
-        assert_eq!((n1, n2, n3), (1, 2, 3));
-        assert!(n2 < SAFE_MODE_STREAK && n3 >= SAFE_MODE_STREAK);
-        // 異常終了でない再起動 (OTA、電源断) で 0 に戻る
-        assert_eq!(streak_after_boot(false, w2), (0, STREAK_MAGIC));
-        // magic の無いごみは 0 から
-        assert_eq!(streak_after_boot(true, 0x1234_5678).0, 1);
+    fn policy_state_word_roundtrip_and_legacy() {
+        use boot_policy::*;
+        let s = BootState {
+            crash_streak: 2,
+            recovery_streak: 1,
+            in_recovery: true,
+            fell_back: true,
+        };
+        assert_eq!(BootState::decode(s.encode()), s);
+        // 0.4.1 の SCRATCH1 (0xC0DE_nnnn) は連続回数として読む
+        assert_eq!(BootState::decode(0xC0DE_0003).crash_streak, 3);
+        // ごみ / 電源投入直後は 0
+        assert_eq!(BootState::decode(0), BootState::default());
+        assert_eq!(BootState::decode(0x1234_5678), BootState::default());
+        let retry = s.for_normal_retry();
+        assert_eq!((retry.crash_streak, retry.recovery_streak, retry.in_recovery, retry.fell_back), (RECOVERY_AFTER - 1, 0, false, true));
+    }
+
+    #[test]
+    fn policy_versions_and_marker() {
+        use boot_policy::*;
+        let v = version_word(0, 4, 2);
+        assert_eq!(v, 0x0000_0192); // 4 * 100 + 2 = 402
+        assert_eq!(version_parts(v), (0, 4, 2));
+        assert!(version_word(0, 4, 10) > version_word(0, 4, 9));
+        assert!(version_word(1, 0, 0) > version_word(0, 99, 99));
+        let m = fallback_marker(v);
+        assert_eq!(decode_fallback_marker(m), Some(v));
+        assert_eq!(decode_fallback_marker(fallback_marker(version_word(3, 12, 7))), Some(version_word(3, 12, 7)));
+        // SCRATCH0 の他の使い方とは区別できる
+        for other in [0u32, 0x5355_5056, 0x1000_1234, 0x2008_1fe0, 0xFFFF_FFF9, 0xFFFF_FFFE] {
+            assert_eq!(decode_fallback_marker(other), None, "{other:08x}");
+        }
+    }
+
+    #[test]
+    fn policy_decide_transitions() {
+        use boot_policy::*;
+        let own = version_word(0, 4, 2);
+        let crash = PrevBoot {
+            trace_version: Some(own),
+            fault_recorded: true,
+            watchdog_timeout: false,
+        };
+        let base = BootInputs {
+            own_version: own,
+            other_slot_known: true,
+            ..BootInputs::default()
+        };
+        // 電源投入: 通常
+        let p = decide(&BootInputs { hw_reset: true, ..base });
+        assert_eq!((p.mode, p.fault), (Mode::Normal, false));
+        // 1 回目の異常終了: 通常のまま、2 回目: 回復モード
+        let p1 = decide(&BootInputs { prev: crash, ..base });
+        assert_eq!((p1.mode, p1.fault, p1.state.crash_streak), (Mode::Normal, true, 1));
+        let p2 = decide(&BootInputs { prev: crash, state_word: p1.state.encode(), ..base });
+        assert_eq!((p2.mode, p2.state.crash_streak), (Mode::Recovery, 2));
+        assert!(p2.state.in_recovery);
+        // 記録の無いウォッチドッグの時間切れ (この版の記録あり) も異常終了
+        let wdt = PrevBoot {
+            trace_version: Some(own),
+            fault_recorded: false,
+            watchdog_timeout: true,
+        };
+        assert!(decide(&BootInputs { prev: wdt, ..base }).fault);
+        // 他の版の記録 (TBYB で試した版が巻き戻った) は数えない
+        let other = PrevBoot {
+            trace_version: Some(version_word(0, 4, 3)),
+            fault_recorded: true,
+            watchdog_timeout: true,
+        };
+        let p = decide(&BootInputs { prev: other, state_word: p1.state.encode(), ..base });
+        assert_eq!((p.fault, p.state.crash_streak, p.mode), (false, 1, Mode::Normal));
+        // 回復モードで 3 回落ちたら他方区画へ (1 回だけ)
+        let mut word = p2.state.encode();
+        let mut modes = Vec::new();
+        for _ in 0..4 {
+            let p = decide(&BootInputs { prev: crash, state_word: word, ..base });
+            modes.push(p.mode);
+            word = p.state.encode();
+        }
+        assert_eq!(modes, [Mode::Recovery, Mode::Recovery, Mode::Fallback, Mode::Recovery]);
+        // 他方区画が分からなければ回復モードのまま
+        let p = decide(&BootInputs {
+            prev: crash,
+            state_word: BootState { crash_streak: 2, recovery_streak: 2, in_recovery: true, fell_back: false }.encode(),
+            other_slot_known: false,
+            ..base
+        });
+        assert_eq!(p.mode, Mode::Recovery);
+        // TBYB の buy 待ちは常に通常、SCRATCH1 を書かない
+        let p = decide(&BootInputs { tbyb_pending: true, flash_update_boot: true, prev: crash, state_word: word, ..base });
+        assert_eq!((p.mode, p.write_state), (Mode::Normal, false));
+        // 他の版が戻してきた: その版を覚える、回数は 0 から
+        let p = decide(&BootInputs {
+            flash_update_boot: true,
+            marker_word: fallback_marker(version_word(0, 4, 3)),
+            state_word: word,
+            ..base
+        });
+        assert_eq!((p.mode, p.fell_back_from, p.state.crash_streak), (Mode::Normal, Some(version_word(0, 4, 3)), 0));
+        // 自分の印で戻ってきた (他方区画に起動できるものが無い): 回復モードのまま、二度と戻そうとしない
+        let p = decide(&BootInputs {
+            flash_update_boot: true,
+            marker_word: fallback_marker(own),
+            state_word: word,
+            ..base
+        });
+        assert_eq!((p.mode, p.fallback_failed, p.state.fell_back), (Mode::Recovery, true, true));
+        // OTA で入った版 (FLASH_UPDATE、印なし) は 0 から
+        let p = decide(&BootInputs { flash_update_boot: true, state_word: word, prev: crash, ..base });
+        assert_eq!((p.mode, p.fault, p.state.crash_streak), (Mode::Normal, false, 0));
+        // 回復モードから通常モードを試す (clean reset): もう 1 回落ちたらすぐ回復モード
+        let retry = BootState { crash_streak: 2, in_recovery: true, ..BootState::default() }.for_normal_retry();
+        let p = decide(&BootInputs { state_word: retry.encode(), ..base });
+        assert_eq!(p.mode, Mode::Normal);
+        let p = decide(&BootInputs { state_word: p.state.encode(), prev: crash, ..base });
+        assert_eq!(p.mode, Mode::Recovery);
+    }
+
+    #[test]
+    fn policy_buy_gate() {
+        use boot_policy::*;
+        let mut g = BuyGate::new(BUY_DEADLINE_MS, BUY_SETTLE_MS);
+        let all = BuyInputs {
+            now_ms: 0,
+            network_up: true,
+            ota_proved: true,
+            round: Round::DONE,
+            healthy: true,
+        };
+        // 条件の順に待つ
+        assert_eq!(g.tick(&BuyInputs { network_up: false, ..all }), BuyStep::Waiting { missing: "wifi" });
+        assert_eq!(g.tick(&BuyInputs { ota_proved: false, ..all }), BuyStep::Waiting { missing: "ota" });
+        let partial = Round { sd_config: true, ntp: true, ..Round::default() };
+        assert_eq!(g.tick(&BuyInputs { round: partial, ..all }), BuyStep::Waiting { missing: "weather" });
+        assert_eq!(g.tick(&BuyInputs { healthy: false, ..all }), BuyStep::Waiting { missing: "health" });
+        // 揃ってから 25 s
+        assert_eq!(g.tick(&BuyInputs { now_ms: 40_000, ..all }), BuyStep::Settling { left_ms: 25_000 });
+        assert_eq!(g.tick(&BuyInputs { now_ms: 50_000, ..all }), BuyStep::Settling { left_ms: 15_000 });
+        // 途中で Wi-Fi が落ちたら待ち直し
+        assert!(matches!(g.tick(&BuyInputs { now_ms: 55_000, network_up: false, ..all }), BuyStep::Waiting { .. }));
+        assert_eq!(g.tick(&BuyInputs { now_ms: 60_000, ..all }), BuyStep::Settling { left_ms: 25_000 });
+        assert_eq!(g.tick(&BuyInputs { now_ms: 85_000, ..all }), BuyStep::Buy);
+        // 1 度だけ
+        assert!(matches!(g.tick(&BuyInputs { now_ms: 86_000, ..all }), BuyStep::Waiting { .. }));
+        // 締め切り
+        let mut g = BuyGate::new(BUY_DEADLINE_MS, BUY_SETTLE_MS);
+        assert_eq!(g.tick(&BuyInputs { now_ms: 170_000, ..all }), BuyStep::Settling { left_ms: 25_000 });
+        assert_eq!(g.tick(&BuyInputs { now_ms: 180_000, ..all }), BuyStep::TimedOut);
+    }
+
+    #[test]
+    fn policy_record_roundtrip() {
+        use boot_policy::*;
+        let r = Record::default().with_credentials(b"MyHome-2G", b"secret-pass");
+        let r = Record { blocked: version_word(0, 4, 3), ..r };
+        let bytes = r.encode();
+        assert_eq!(Record::decode(&bytes), Some(r));
+        assert_eq!(r.ssid(), b"MyHome-2G");
+        assert_eq!(r.password(), b"secret-pass");
+        // 1 バイト壊れたら読まない、消去状態 (0xFF) も
+        let mut bad = bytes;
+        bad[20] ^= 1;
+        assert_eq!(Record::decode(&bad), None);
+        assert_eq!(Record::decode(&[0xff; RECORD_LEN]), None);
+        // 入れない版
+        assert!(!r.allows(version_word(0, 4, 3)));
+        assert!(!r.allows(version_word(0, 4, 2)));
+        assert!(r.allows(version_word(0, 4, 4)));
+        assert!(Record::default().allows(version_word(0, 4, 3)));
+        // CRC-32 (IEEE) の既知の値
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]

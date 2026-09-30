@@ -1,0 +1,15 @@
+{
+  "recovery": {
+    "ident": "ticker v0.4.2 slot B",
+    "rows": [
+      ["last reset: panic src/ticker/slideshow.rs:231 @42s #2", "error"],
+      ["crashed 2x in normal mode -> Wi-Fi + OTA only (rec #0)", "busy"],
+      ["Wi-Fi: aterm-abff4a-g 192.168.200.130", "ok"],
+      ["OTA: up to date (latest 0.4.2), next check in 42s", "ok"],
+      ["no newer release: retry normal mode in 9:18", "muted"],
+      ["Wi-Fi credentials: flash copy (SD not used)", "muted"],
+      ["NORMAL P1 A:0021 consid B:4C4D launched reset:force", "muted"],
+      ["fix: publish a newer release (checked every 60 s) or USB", "muted"]
+    ]
+  }
+}

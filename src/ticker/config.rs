@@ -13,7 +13,11 @@
 //! layout=glass     # 画面構成 glass / dock / classic (docs/ticker.md「画面」)
 //! status=auto      # 状態 3 行の表示 auto (必要なときだけ) / full (常に) / compact (常に 1 行)
 //! sdfast=1         # 写真を読むときの SD の速さ 1 = 速い (読み誤りがあれば自動で 0 に戻す) / 0 = 起動時と同じ低速
+//! debug_crash=ota  # 試験用 (0.4.2〜): boot / ota / slideshow の場所でわざと panic する。既定は無し
 //! ```
+//!
+//! `debug_crash` は回復モード (docs/ticker.md §8) を確かめるためのもの。buy 済みの版の通常起動でだけ効き、
+//! TBYB の buy 待ち (OTA で届いたばかりの版) と回復モードでは無視する (回復モードは ticker.txt を読まない)。
 
 use heapless::String;
 
@@ -48,6 +52,18 @@ pub enum StatusMode {
     Compact,
 }
 
+/// 試験用にわざと落ちる場所 (`debug_crash=`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugCrash {
+    None,
+    /// ticker.txt を読んだ直後 (LCD の前)
+    Boot,
+    /// 接続後、最初の OTA 確認の直前 (取得タスク)
+    Ota,
+    /// 最初の写真を読み始めたとき
+    Slideshow,
+}
+
 /// 既定の流れる文字の URL (このリポジトリの `ticker/message.txt`)
 pub const DEFAULT_MESSAGE_URL: &str =
     "https://raw.githubusercontent.com/Droplet-Collective/aki300yenLCD-raspico2w/main/ticker/message.txt";
@@ -70,6 +86,8 @@ pub struct TickerConfig {
     pub status: StatusMode,
     /// 写真の読み込みで SD を速く読むか
     pub sd_fast: bool,
+    /// 試験用にわざと落ちる場所 (既定 None)
+    pub debug_crash: DebugCrash,
 }
 
 impl Default for TickerConfig {
@@ -91,6 +109,7 @@ impl Default for TickerConfig {
             layout: LayoutName::Glass,
             status: StatusMode::Auto,
             sd_fast: true,
+            debug_crash: DebugCrash::None,
         }
     }
 }
@@ -170,6 +189,19 @@ impl TickerConfig {
                     None
                 };
                 mode.map(|m| config.status = m).is_some()
+            } else if key.eq_ignore_ascii_case("debug_crash") {
+                let crash = if value.eq_ignore_ascii_case("boot") {
+                    Some(DebugCrash::Boot)
+                } else if value.eq_ignore_ascii_case("ota") {
+                    Some(DebugCrash::Ota)
+                } else if value.eq_ignore_ascii_case("slideshow") {
+                    Some(DebugCrash::Slideshow)
+                } else if value.is_empty() || value.eq_ignore_ascii_case("none") || value == "0" {
+                    Some(DebugCrash::None)
+                } else {
+                    None
+                };
+                crash.map(|c| config.debug_crash = c).is_some()
             } else if key.eq_ignore_ascii_case("sdfast") {
                 match value {
                     "1" => {

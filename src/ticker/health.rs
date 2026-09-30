@@ -212,23 +212,7 @@ pub fn write_last_reset<const N: usize>(out: &mut String<N>, reset: &LastReset<'
     let _ = out.push_str(&suffix);
 }
 
-// ============================================================
-// 連続クラッシュの回数 (SCRATCH1) と安全モード
-// ============================================================
-
-/// SCRATCH1 の上位 16 bit (bootrom は SCRATCH0/1 に書かない)
-pub const STREAK_MAGIC: u32 = 0xC0DE_0000;
-/// この回数続けて異常終了したら、写真 / 天気 / 文字を止めて OTA と NTP だけにする
-pub const SAFE_MODE_STREAK: u32 = 3;
-/// 異常終了なしでこの時間動いたら回数を 0 に戻す
-pub const STREAK_CLEAR_MS: u32 = 10 * 60 * 1000;
-
-/// 起動時: 前回が異常終了なら回数 + 1、そうでなければ 0。戻り値は (今回の回数, SCRATCH1 に書く値)
-pub fn streak_after_boot(prev_was_fault: bool, scratch1: u32) -> (u32, u32) {
-    let stored = if scratch1 & 0xFFFF_0000 == STREAK_MAGIC { scratch1 & 0xFFFF } else { 0 };
-    let streak = if prev_was_fault { (stored + 1).min(0xFFFF) } else { 0 };
-    (streak, STREAK_MAGIC | streak)
-}
+// 連続異常終了の回数と回復モードは `crate::boot_policy` (0.4.2〜。0.4.1 の「3 回で安全モード」を置き換えた)
 
 // ============================================================
 // スタックの使用量 (起動時に塗った模様がどこまで残っているか)

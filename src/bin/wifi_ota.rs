@@ -6,8 +6,9 @@
 //!   自分より新しい版があれば `.bin` を **他方の A/B 区画** へストリーミング書き込みする
 //!   (`ota::slot`)。SHA-256 と読み戻しで検証した後、`reboot(FLASH_UPDATE)` で新版を起動する。
 //! - 新版は TBYB (Try Before You Buy) 付きなので bootrom のウォッチドッグ (16.7 s) 下で起動する。
-//!   本 bin は自己診断 = 「LCD 走査中 + Wi-Fi join + DHCP で IP 取得」が成立したら
-//!   `explicit_buy` で確定する。join + DHCP は 16.7 s に収まらないことがある (v0.2.2 の実機で
+//!   本 bin は自己診断 = 「LCD 走査中 + Wi-Fi join + DHCP で IP 取得 + OTA の manifest 確認が TLS + HTTP を
+//!   最後まで通った + 25 s」(0.4.2〜 `boot_policy::BuyGate`。0.4.1 までは Wi-Fi + DHCP だけ) が成立したら
+//!   `explicit_buy` で確定する。buy 待ちの間の OTA 確認は manifest を読むだけ (ダウンロードは buy の後)。join + DHCP は 16.7 s に収まらないことがある (v0.2.2 の実機で
 //!   DHCP 待ち中に巻き戻った) ので、buy 待ちの間は `tbyb_watchdog_task` が 2 s ごとに
 //!   WATCHDOG.LOAD を再ロードして延長する (データシート §5.1.17 が認める方法)。ただし起動から
 //!   `TBYB_SELFTEST_DEADLINE_SECS` 経っても成立しなければ延長をやめ、bootrom の設定どおり
@@ -70,6 +71,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
 use heapless::{String, Vec};
+use pico2w_300yen_lcd::boot_policy::{CheckOutcome, PENDING_OTA_RETRY_MS, Round};
 use pico2w_300yen_lcd::boot_trace::{self, Stage};
 use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, TBYB};
 use pico2w_300yen_lcd::lcd::display::{BACK_BLACK, BACK_HEIGHT, BACK_WIDTH, BackBuffer, Display, DisplayPins, FrameIrqHandler};
@@ -515,6 +517,7 @@ async fn main(spawner: Spawner) {
     let mut next_scan = Instant::now();
     let mut scan_count: u32 = 0;
     let ota_possible = credentials.is_ok() && ui.model.boot.slots.is_ok();
+    let mut ota_proved = false;
 
     loop {
 
@@ -524,21 +527,37 @@ async fn main(spawner: Spawner) {
             ui.model.ota.schedule_first_check();
         }
 
-        // --- TBYB: 自己診断 = LCD 走査中 + Wi-Fi join + DHCP で IP 取得 → explicit_buy (ota::app) ---
-        if ui.model.boot.selftest_tick(network_up, ui.display.is_running()) {
+        // --- TBYB: 自己診断 = LCD 走査中 + Wi-Fi join + DHCP + OTA の manifest 確認 (TLS + HTTP) + 25 s
+        //     → explicit_buy (ota::app、0.4.2〜。wifi_ota は機能の一巡を持たないので Round::DONE) ---
+        let was_pending = ui.model.boot.buy == app::BuyState::Pending;
+        if ui.model.boot.buy_tick(network_up, ota_proved, Round::DONE, ui.display.is_running()) {
+            if was_pending && ui.model.boot.buy == app::BuyState::Bought {
+                // buy 待ちの間に新しい版を見つけていたら、すぐにダウンロードする
+                ui.model.ota.next_check = Some(Instant::now());
+            }
             ui.present().await;
         }
 
-        // --- OTA (buy 待ち / 巻き戻し待ちの間は行わない) ---
+        // --- OTA (buy 待ちの間は manifest を読むだけ、巻き戻し待ちの間は行わない) ---
         if ota_possible
             && network_up
-            && ui.model.boot.ota_allowed()
+            && ui.model.boot.ota_check_allowed()
             && ui.model.ota.is_due()
             && let Ok(slots) = ui.model.boot.slots
         {
             ui.model.ota.begin_check();
-            let result = app::run_ota_check(&net, bufs, &mut flash, sectors, slots, &mut ui).await;
+            let mode = app::CheckMode {
+                check_only: !ui.model.boot.ota_allowed(),
+                blocked: 0,
+            };
+            let result = app::run_ota_check(&net, bufs, &mut flash, sectors, slots, mode, &mut ui).await;
+            let proved = app::check_outcome(&result) == CheckOutcome::Proved;
+            ota_proved |= proved;
             ui.model.ota.apply(result);
+            if !proved && ui.model.boot.buy == app::BuyState::Pending {
+                // buy 待ち: 通信の失敗は締め切りまで短い間隔で試し直す
+                ui.model.ota.next_check = Some(Instant::now() + Duration::from_millis(u64::from(PENDING_OTA_RETRY_MS)));
+            }
             ui.present().await;
         }
 

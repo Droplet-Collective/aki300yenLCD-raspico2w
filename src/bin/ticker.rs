@@ -36,16 +36,18 @@
 //! buy 待ち / 失敗。`status=full` で常に、`status=compact` で出さない)。それ以外は帯の右端の小さな表示だけ。
 //! 背景の写真は `ticker::slideshow` が SD から読み、切り替えは背景だけを暗くして行う。
 //!
-//! TBYB の自己診断 (buy 条件) は wifi_ota と同じ「LCD 走査中 + join + DHCP」だけ (0.4.1〜: 走査中 = 描画
-//! タスクが 2 s 以内に回っている)。NTP / 天気 / 文字の取得の成否は buy に関係しない (buy が済むまで始めない)。
+//! # OTA 到達保証 (0.4.2〜、docs/ticker.md §8、`boot_policy` / `supervisor`)
 //!
-//! # 止まったとき (0.4.1〜、`supervisor`)
-//!
-//! buy の後 (TBYB でない起動なら描画開始の直後) からハードウェアのウォッチドッグ (8 s) を動かし、main /
-//! 取得 / 描画の 3 タスクの生存確認が揃っている間だけ LCD のフレーム割り込みで再ロードする。panic /
-//! HardFault / スタック溢れ (MSPLIM) / タスクの停止は理由を WATCHDOG の SCRATCH に残してすぐリセットし、
-//! 次の起動が状態行 1 に `last reset: ...` と 5 分出す。3 回続けて異常終了したら安全モード (写真 / 天気 /
-//! 文字を止め、OTA と NTP だけ) で起動する。
+//! - ウォッチドッグ (8 s) は main の最初 (`embassy_rp::init` の直後) から、どの起動でも動かす。初期化の間は
+//!   main が明示的に再ロードし、描画が始まったら main / 取得 / 描画の 3 タスクの生存確認が揃っている間だけ
+//!   LCD のフレーム割り込みが再ロードする。panic / HardFault / スタック溢れ (MSPLIM) / タスクの停止は理由を
+//!   WATCHDOG の SCRATCH に残してすぐリセットし、次の起動が状態行 1 に `last reset: ...` と 5 分出す。
+//! - TBYB の buy 条件: Wi-Fi + DHCP、OTA の manifest 確認が TLS + HTTP を最後まで通った、NTP / 天気 / 文字 /
+//!   SD の設定 / 最初の写真を 1 回ずつ試した、その後 25 s 健全に動いた (`boot_policy::BuyGate`、締め切り 180 s)。
+//!   buy 待ちの間の OTA 確認は manifest を読むだけ (ダウンロードは buy の後)。
+//! - 通常モードで 2 回続けて異常終了したら **回復モード** (`recovery_main`、取得タスクの中で動く): 黒地の文字だけの画面、SD に触れない
+//!   (Wi-Fi の資格情報は data 区画の写し `persist`)、Wi-Fi + OTA 確認 (60 s ごと) だけ。回復モードでも 3 回
+//!   続けて落ちたら、他方区画 (前に buy した版) を FLASH_UPDATE 起動する。
 
 #![no_std]
 #![no_main]
@@ -69,26 +71,36 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embassy_usb::UsbDevice;
 use heapless::String;
+use embassy_rp::Peri;
+use pico2w_300yen_lcd::ab_boot;
+use pico2w_300yen_lcd::boot_policy::{
+    self, BootInputs, BootPlan, BootState, CheckOutcome, Mode, PENDING_OTA_RETRY_MS, PrevBoot, RECOVERY_NORMAL_RETRY_MS,
+    RECOVERY_OTA_INTERVAL_MS, Round,
+};
 use pico2w_300yen_lcd::boot_trace::{self, ResetReason, Stage, Trace};
 use pico2w_300yen_lcd::font::shinonome;
-use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, IMAGE_DEF_MAJOR, IMAGE_DEF_MINOR, TBYB};
+use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, IMAGE_DEF_MAJOR, IMAGE_DEF_MINOR, IMAGE_DEF_VERSION_WORD, TBYB};
 use pico2w_300yen_lcd::lcd::display::{BackBuffer, Display, DisplayPins, FrameIrqHandler};
 use pico2w_300yen_lcd::ota::app::{
-    self, BootStatus, BuyState, LinkManager, LinkUi, Net, NetBuffers, OtaPhase, OtaState, OtaUi, TcpState, Tone,
+    self, BootStatus, BuyState, CheckMode, LinkManager, LinkUi, Net, NetBuffers, OtaPhase, OtaState, OtaUi, TcpState,
+    Tone,
 };
 use pico2w_300yen_lcd::ota::http::{self, BodySink};
 use pico2w_300yen_lcd::ota::slot::{OtaFlash, SectorBuffers, Slots, slot_label};
 use pico2w_300yen_lcd::ota::OtaError;
-use pico2w_300yen_lcd::sdcard::{ReadError, SdVolumeManager, init_sd, read_root_file};
+use pico2w_300yen_lcd::noinline::noinline;
+use pico2w_300yen_lcd::persist;
+use pico2w_300yen_lcd::sdcard::{self, ReadError, SdVolumeManager, init_sd, read_root_file};
 use pico2w_300yen_lcd::supervisor;
 use pico2w_300yen_lcd::ticker::civil;
-use pico2w_300yen_lcd::ticker::config::{self, ConfigSource, LayoutName, StatusMode, TickerConfig};
+use pico2w_300yen_lcd::ticker::config::{self, ConfigSource, DebugCrash, LayoutName, StatusMode, TickerConfig};
 use pico2w_300yen_lcd::ticker::health::{self, LastReset, Limits, Who};
 use pico2w_300yen_lcd::ticker::slideshow::{self, SlideConfig};
 use pico2w_300yen_lcd::ticker::sntp::{self, SntpError};
 use pico2w_300yen_lcd::ticker::sntp_net::{self, SntpBuffers, Sync};
 use pico2w_300yen_lcd::ticker::weather::{self, Weather};
 use pico2w_300yen_lcd::ui::canvas::Canvas;
+use pico2w_300yen_lcd::ui::recovery::{self as recovery_ui, RecoveryView};
 use pico2w_300yen_lcd::ui::screen::{self, Clock, Layout, StatusView, Tone as UiTone, View, WeatherView};
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
 use pico2w_300yen_lcd::wifi::{self, Cyw43Pins, WifiCredentials, ascii_label, read_credentials};
@@ -174,6 +186,8 @@ const NOTE_SHOW: Duration = Duration::from_secs(90);
 const FAULT_DIAG_SHOW: Duration = Duration::from_secs(300);
 /// 接続後の最初の OTA 確認が済むまで写真の読み込みを待つ。ただしネットワークが無くてもこの時間で始める
 const SLIDESHOW_START_MAX: Duration = Duration::from_secs(45);
+/// 起動時に SD (wifi.txt / ticker.txt) を読む期限 (0.4.2〜、`sdcard::set_deadline`。カードが無いと ≈ 25 s かかっていた)
+const SD_BOOT_DEADLINE: Duration = Duration::from_secs(5);
 /// 流れる文字の最大長 (バイト。UTF-8 で日本語 ≈ 170 文字)
 const MESSAGE_MAX: usize = 512;
 /// `TICKER.TXT` の最大長
@@ -761,7 +775,8 @@ fn publish_ident(boot: &BootStatus) {
     let mut rest: String<64> = String::new();
     let tone = boot.write_tbyb_line(&mut rest, !TBYB);
     with_model(|m| {
-        if m.stack_total > 0 {
+        // buy 待ちの間は `wait:...` を出すので、スタックの表示は省く (66 桁に収めるため)
+        if m.stack_total > 0 && boot.buy != BuyState::Pending {
             let _ = rest.push_str(" stk ");
             let tenths = (m.stack_used as u64 * 10 + 512) / 1024;
             let _ = write!(rest, "{}.{}/", tenths / 10, tenths % 10);
@@ -801,25 +816,65 @@ fn panic_file(trace: &Trace) -> Option<&'static str> {
     (fp >= lo && fp + file.len() <= hi && file.len() <= 256).then_some(file)
 }
 
-/// 前回の起動の異常終了 (panic / HardFault / スタック溢れ / 停止 / 記録の無いウォッチドッグ) を復号する
-fn last_reset(boot: &BootStatus) -> Option<(LastReset<'static>, u32)> {
-    let trace = boot.prev_trace.as_ref()?;
-    let reset = health::decode(trace.stage_code, trace.info, trace.extra, panic_file(trace)).or_else(|| {
-        // 監視中 (buy 済み / TBYB でない) にウォッチドッグの時間切れ: 割り込みも止まって記録できなかった
-        (boot.reset_reason == ResetReason::WatchdogTimer && trace.extra == health::SUPERVISED_MARK).then(|| {
-            LastReset::WatchdogNoRecord {
-                stage: trace.stage_label(),
-            }
-        })
-    })?;
+/// 前回の記録を書いたのがこの版か
+fn trace_is_own(trace: &Trace) -> bool {
+    u16::from(trace.major) == IMAGE_DEF_MAJOR && trace.minor == IMAGE_DEF_MINOR
+}
+
+/// 起動の方針の入力 (`boot_policy::decide`)
+fn boot_inputs(boot: &BootStatus) -> BootInputs {
+    BootInputs {
+        own_version: IMAGE_DEF_VERSION_WORD,
+        hw_reset: boot.reset_reason == ResetReason::Hardware,
+        flash_update_boot: boot.is_flash_update_boot(),
+        tbyb_pending: boot.buy == BuyState::Pending,
+        prev: PrevBoot {
+            trace_version: boot
+                .prev_trace
+                .as_ref()
+                .map(|t| u32::from(t.major) << 16 | u32::from(t.minor)),
+            fault_recorded: boot.prev_trace.as_ref().is_some_and(|t| t.stage.is_some_and(Stage::is_fault)),
+            watchdog_timeout: boot.reset_reason == ResetReason::WatchdogTimer,
+        },
+        state_word: boot_trace::read_streak(),
+        marker_word: boot.scratch0,
+        other_slot_known: boot.slots.is_ok(),
+    }
+}
+
+/// 前回の起動 (この版) の異常終了 (panic / HardFault / スタック溢れ / 停止 / 記録の無いウォッチドッグ) を復号する。
+/// 他の版の記録 (TBYB で試した版が巻き戻った) は `BootStatus::write_prev_trace_line` が別に出す
+fn last_reset(boot: &BootStatus, plan: &BootPlan) -> Option<(LastReset<'static>, u32)> {
+    if !plan.fault {
+        return None;
+    }
+    let trace = boot.prev_trace.as_ref().filter(|t| trace_is_own(t))?;
+    let reset = health::decode(trace.stage_code, trace.info, trace.extra, panic_file(trace)).unwrap_or(
+        // ウォッチドッグの時間切れだが記録が無い: 割り込みも止まった (ロックアップ等) か、初期化の途中で止まった
+        LastReset::WatchdogNoRecord {
+            stage: trace.stage_label(),
+        },
+    );
     Some((reset, trace.uptime_ds))
 }
 
-/// 起動診断を状態行 1 に出す: 前回の異常終了 (5 分、赤) → 前回の TBYB 記録 → 起動種別 (60 s)
-fn publish_diag(boot: &BootStatus, streak: u32) {
+/// 版数語 → `0.4.2`
+fn write_version_word<const N: usize>(out: &mut String<N>, word: u32) {
+    let (major, minor, patch) = boot_policy::version_parts(word);
+    let _ = write!(out, "{}.{}.{}", major, minor, patch);
+}
+
+/// 起動診断を状態行 1 に出す: 他方区画から戻ってきた / 前回の異常終了 (5 分、赤) → 前回の TBYB 記録 →
+/// 起動種別 (60 s)
+fn publish_diag(boot: &BootStatus, plan: &BootPlan) {
     let mut line: String<80> = String::new();
-    let (tone, show) = if let Some((reset, uptime_ds)) = last_reset(boot) {
-        health::write_last_reset(&mut line, &reset, uptime_ds, streak);
+    let (tone, show) = if let Some(from) = plan.fell_back_from {
+        let _ = line.push_str("FALLBACK: v");
+        write_version_word(&mut line, from);
+        let _ = write!(line, " kept crashing, back on v{} (blocked)", FIRMWARE_VERSION);
+        (Tone::Error, FAULT_DIAG_SHOW)
+    } else if let Some((reset, uptime_ds)) = last_reset(boot, plan) {
+        health::write_last_reset(&mut line, &reset, uptime_ds, u32::from(plan.state.crash_streak));
         (Tone::Error, FAULT_DIAG_SHOW)
     } else if let Some(tone) = boot.write_prev_trace_line(&mut line) {
         (tone, DIAG_SHOW)
@@ -841,6 +896,17 @@ fn publish_diag(boot: &BootStatus, streak: u32) {
 // 取得タスク (OTA / NTP / 天気 / 文字)
 // ============================================================
 
+/// main → 取得タスク: OTA のダウンロードをしてよい (buy 済み、または TBYB でない起動)。buy 待ちは manifest の確認だけ
+static DOWNLOAD_OK: AtomicBool = AtomicBool::new(false);
+/// main → 取得タスク: すぐに OTA を確認してほしい (buy の直後。buy 待ちの間に新しい版を見つけていてもよいように)
+static OTA_NOW: AtomicBool = AtomicBool::new(false);
+/// 取得タスク → main: OTA の manifest 確認が TLS + HTTP を最後まで通った (buy 条件 (b))
+static OTA_PROVED: AtomicBool = AtomicBool::new(false);
+/// 取得タスク → main: 一巡 (buy 条件 (c)) のうち NTP / 天気 / 文字を 1 回ずつ試した
+static ROUND_NTP: AtomicBool = AtomicBool::new(false);
+static ROUND_WEATHER: AtomicBool = AtomicBool::new(false);
+static ROUND_MESSAGE: AtomicBool = AtomicBool::new(false);
+
 /// 取得タスクが持つもの (main が作って渡す)
 struct Jobs {
     net: Net<'static>,
@@ -855,76 +921,521 @@ struct Jobs {
     slots: Result<Slots, OtaError>,
     /// wifi.txt があり、A/B 区画も分かる
     ota_possible: bool,
-    /// 連続クラッシュ後の安全モード: 天気 / 文字を取得しない (OTA と NTP だけ)
-    safe_mode: bool,
+    /// この版数語以下は OTA で入れない (他方区画へ戻してきた版、`persist`)
+    blocked: u32,
+    /// 試験用 `debug_crash=ota` (buy 済みの通常起動だけ)
+    crash_before_ota: bool,
 }
 
-/// 250 ms ごとに 1 つずつ: OTA 確認 (接続後の最初の仕事、以後 60 s ごと) > NTP > 天気 > 文字。
+/// OTA 確認が TLS + HTTP を最後まで通った
+fn note_ota_proved(pending: bool) {
+    if !OTA_PROVED.swap(true, Ordering::Relaxed) {
+        defmt::info!("OTA check proved the TLS + HTTP path");
+    }
+    supervisor::ota_proved();
+    if pending {
+        boot_trace::stage(Stage::OtaProved);
+    }
+}
+
+/// 取得タスクの仕事: 通常モードの取得、または回復モード全体 (0.4.2〜)。
+/// 1 つのタスクにまとめるのは RAM のため: OTA 確認 (TLS) を含む future は ≈ 15 kB あり、別々のタスクにすると
+/// static なタスク領域が 2 つ分要ってスタックが 15 kB 減る。1 つのタスクなら大きい方の分だけで済む。
+#[allow(clippy::large_enum_variant)] // タスクの引数として static なタスク領域に 1 回置くだけ (ヒープは使わない)
+enum NetWork {
+    Normal(Jobs),
+    Recovery(Spawner, RecoveryParts),
+}
+
+/// 通常モード: 250 ms ごとに 1 つずつ: OTA 確認 (接続後の最初の仕事、以後 60 s ごと) > NTP > 天気 > 文字。
 /// 最初の OTA 確認が済むまでは他の取得も写真の読み込みも始めない (0.4.1〜。新しい版が壊れていても、
 /// 起動するたびに先に OTA 確認まで進めば、次の版で直せる)。
+/// TBYB の buy 待ちの間 (0.4.2〜) は manifest を読むだけで、通信の失敗なら 10 s 後に試し直す。
+///
+/// どの取得も内側で打ち切るので、OTA 確認の予定は他の取得が詰まっても最長 ≈ 20 s しか遅れない:
+/// NTP は DNS / 送信 / 受信それぞれ 5 s × 2 ホスト、天気 / 文字は `fetch_small` の 20 s (DNS + TCP + TLS +
+/// 本文まで全部)、OTA は manifest 30 s / ダウンロード 300 s。外側にもう 1 段 `with_timeout` を重ねると、
+/// 包んだ future (数 kB) を一旦スタックに作ってから移すので poll のフレームが 25 kB 増えた (0.4.2 の試作で
+/// stack-report が検出) ため、重ねない。OTA 専用のタスクを分けないのは TLS のバッファ (≈ 30 kB) が 1 組しか
+/// 置けないから。
+///
+/// 回復モード: `recovery` の節 (このタスクの後半)。
 #[embassy_executor::task]
-async fn jobs_task(mut j: Jobs) {
-    let mut ntp_job = Job::new();
-    let mut weather_job = Job::new();
-    let mut message_job = Job::new();
-    let mut weather_plain_http = false;
-    let mut first_ota_done = !j.ota_possible;
-    let mut reboot_requested = false;
-    if first_ota_done {
-        slideshow::START.store(true, Ordering::Relaxed);
-    }
-    loop {
-        supervisor::beat(Who::Jobs);
-        let ready = NET_READY.load(Ordering::Relaxed);
-        if ready && j.ota_possible {
-            j.ota.schedule_first_check_in(Duration::from_secs(0));
-        }
-        if reboot_requested {
-            // main が Wi-Fi を切って再起動するのを待つ
-        } else if j.ota_possible
-            && ready
-            && j.ota.is_due()
-            && let Ok(slots) = j.slots
-        {
-            j.ota.begin_check();
-            let mut ui = ModelUi {
-                ota: &mut j.ota,
-                slots: j.slots,
-            };
-            let result = app::run_ota_check(&j.net, j.bufs, &mut j.flash, j.sectors, slots, &mut ui).await;
-            ui.ota.apply(result);
-            ui.publish_ota();
-            if !first_ota_done {
-                first_ota_done = true;
+async fn jobs_task(work: NetWork) {
+    let (spawner, parts) = match work {
+        NetWork::Normal(mut j) => {
+            let mut ntp_job = Job::new();
+            let mut weather_job = Job::new();
+            let mut message_job = Job::new();
+            let mut weather_plain_http = false;
+            let mut first_ota_done = !j.ota_possible;
+            let mut reboot_requested = false;
+            if first_ota_done {
                 slideshow::START.store(true, Ordering::Relaxed);
-                defmt::info!("first OTA check done; starting NTP / weather / message / slideshow");
             }
-        } else if ready && first_ota_done && ntp_job.due() {
-            // --- NTP (UDP。TLS バッファは使わない) ---
-            do_ntp(j.stack, j.sntp_bufs, &mut ntp_job).await;
-        } else if ready && first_ota_done && !j.safe_mode && weather_job.due() {
-            do_weather(&j.net, j.bufs, &mut j.body[..], &j.config, &mut weather_plain_http, &mut weather_job).await;
-        } else if ready && first_ota_done && !j.safe_mode && message_job.due() {
-            do_message(&j.net, j.bufs, &mut j.body[..], &j.config, &mut message_job).await;
-        }
+            loop {
+                supervisor::beat(Who::Jobs);
+                let ready = NET_READY.load(Ordering::Relaxed);
+                if ready && j.ota_possible {
+                    j.ota.schedule_first_check_in(Duration::from_secs(0));
+                }
+                if OTA_NOW.swap(false, Ordering::Relaxed) && j.ota_possible && !reboot_requested {
+                    j.ota.next_check = Some(Instant::now());
+                }
+                if reboot_requested {
+                    // main が Wi-Fi を切って再起動するのを待つ
+                } else if j.ota_possible
+                    && ready
+                    && j.ota.is_due()
+                    && let Ok(slots) = j.slots
+                {
+                    if j.crash_before_ota {
+                        panic!("debug_crash=ota");
+                    }
+                    let download_ok = DOWNLOAD_OK.load(Ordering::Relaxed);
+                    j.ota.begin_check();
+                    let mut ui = ModelUi {
+                        ota: &mut j.ota,
+                        slots: j.slots,
+                    };
+                    let mode = CheckMode {
+                        check_only: !download_ok,
+                        blocked: j.blocked,
+                    };
+                    let result = noinline(app::run_ota_check(&j.net, j.bufs, &mut j.flash, j.sectors, slots, mode, &mut ui)).await;
+                    let proved = app::check_outcome(&result) == CheckOutcome::Proved;
+                    ui.ota.apply(result);
+                    if proved {
+                        note_ota_proved(!download_ok);
+                    } else if !download_ok {
+                        ui.ota.next_check = Some(Instant::now() + Duration::from_millis(u64::from(PENDING_OTA_RETRY_MS)));
+                    }
+                    ui.publish_ota();
+                    if !first_ota_done {
+                        first_ota_done = true;
+                        slideshow::START.store(true, Ordering::Relaxed);
+                        defmt::info!("first OTA check done; starting NTP / weather / message / slideshow");
+                    }
+                } else if ready && first_ota_done && ntp_job.due() {
+                    // --- NTP (UDP。TLS バッファは使わない) ---
+                    do_ntp(j.stack, j.sntp_bufs, &mut ntp_job).await;
+                    ROUND_NTP.store(true, Ordering::Relaxed);
+                } else if ready && first_ota_done && weather_job.due() {
+                    do_weather(&j.net, j.bufs, &mut j.body[..], &j.config, &mut weather_plain_http, &mut weather_job).await;
+                    ROUND_WEATHER.store(true, Ordering::Relaxed);
+                } else if ready && first_ota_done && message_job.due() {
+                    do_message(&j.net, j.bufs, &mut j.body[..], &j.config, &mut message_job).await;
+                    ROUND_MESSAGE.store(true, Ordering::Relaxed);
+                }
 
-        // --- 検証済みイメージへの FLASH_UPDATE 再起動 / 巻き戻されたイメージの再試行は main が行う ---
-        if !reboot_requested
-            && let Some(version) = j.ota.reboot_due()
-            && let Ok(slots) = j.slots
+                // --- 検証済みイメージへの FLASH_UPDATE 再起動 / 巻き戻されたイメージの再試行は main が行う ---
+                if !reboot_requested
+                    && let Some(version) = j.ota.reboot_due()
+                    && let Ok(slots) = j.slots
+                {
+                    defmt::info!("reboot(FLASH_UPDATE) into P{} for {}", slots.target.index, version);
+                    REBOOT_REQUEST.signal(slots);
+                    reboot_requested = true;
+                }
+
+                ModelUi {
+                    ota: &mut j.ota,
+                    slots: j.slots,
+                }
+                .publish_ota();
+                Timer::after(TICK).await;
+            }
+        }
+        NetWork::Recovery(spawner, parts) => (spawner, parts),
+    };
+
+    // ---- 回復モード: 最小限の画面 → Wi-Fi → OTA 確認 (60 s ごと)。新しい版があれば入れて FLASH_UPDATE 起動する。
+    // 確認が通って新しい版が無ければ、RECOVERY_NORMAL_RETRY_MS (10 分) 後に通常モードをもう一度試す (もう 1 回
+    // 落ちたらすぐ回復モードに戻る)。SD の写真、ticker.txt、NTP、天気、文字、USB は使わない ----
+    let RecoveryParts {
+        mut display,
+        sd_miso,
+        sd_cs,
+        sd_mosi,
+        sd_clk,
+        pio1,
+        cyw43,
+        flash,
+        boot,
+        plan,
+    } = parts;
+    boot_trace::stage(Stage::Recovery);
+    defmt::error!(
+        "RECOVERY MODE: crash streak {}, recovery streak {}, fell back {}",
+        plan.state.crash_streak,
+        plan.state.recovery_streak,
+        plan.state.fell_back
+    );
+
+    // --- 画面の文字 (起動時に決まるもの) ---
+    RECOVERY_MODEL.lock(|cell| {
+        let mut m = cell.borrow_mut();
+        let _ = write!(m.ident, "ticker v{}", FIRMWARE_VERSION);
+        if let Ok(slots) = &boot.slots {
+            let _ = write!(m.ident, " slot {}", slot_label(&slots.own));
+        }
+    });
+    let mut line: String<80> = String::new();
+    if plan.fallback_failed {
+        let _ = line.push_str("fallback to the other slot failed (no bootable image there)");
+    } else if let Some((reset, uptime_ds)) = last_reset(&boot, &plan) {
+        health::write_last_reset(&mut line, &reset, uptime_ds, u32::from(plan.state.crash_streak));
+    } else {
+        let _ = write!(line, "last reset: (not recorded) crashes {}", plan.state.crash_streak);
+    }
+    set_row(Row::LastReset, UiTone::Error, &line);
+    line.clear();
+    let _ = write!(
+        line,
+        "crashed {}x in normal mode -> Wi-Fi + OTA only (rec #{})",
+        plan.state.crash_streak,
+        plan.state.recovery_streak
+    );
+    set_row(Row::Why, UiTone::Busy, &line);
+    line.clear();
+    boot.write_boot_line(&mut line);
+    set_row(Row::Boot, UiTone::Muted, &line);
+    set_row(Row::Hint, UiTone::Muted, "fix: publish a newer release (checked every 60 s) or USB");
+
+    // --- Wi-Fi の資格情報: data 区画の写し → 無ければ SD の wifi.txt だけ (期限 4 s) ---
+    supervisor::feed_init();
+    let mut flash: OtaFlash = Flash::new_blocking(flash);
+    let record = persist::data_offset().and_then(persist::read);
+    let blocked = record.as_ref().map_or(0, |r| r.blocked);
+    let credentials: Result<WifiCredentials, &'static str> = match record.as_ref().filter(|r| r.has_credentials()) {
+        Some(r) => {
+            set_row(Row::Creds, UiTone::Muted, "Wi-Fi credentials: flash copy (SD not used)");
+            wifi::credentials_from_bytes(r.ssid(), r.password())
+        }
+        None => {
+            let creds = read_wifi_txt_only(sd_miso, sd_cs, sd_mosi, sd_clk, Duration::from_secs(4));
+            set_row(Row::Creds, UiTone::Muted, "Wi-Fi credentials: SD wifi.txt (no flash copy yet)");
+            creds
+        }
+    };
+    let mut ota = OtaState::new();
+    match &credentials {
+        Ok(c) => {
+            line.clear();
+            let _ = write!(line, "Wi-Fi: starting... ({})", ascii_label::<32>(c.ssid.as_bytes()));
+            set_row(Row::Wifi, UiTone::Busy, &line);
+        }
+        Err(message) => {
+            line.clear();
+            let _ = write!(line, "Wi-Fi: {}", message);
+            set_row(Row::Wifi, UiTone::Error, &line);
+            ota.phase = OtaPhase::Disabled(message);
+        }
+    }
+    if let Err(e) = &boot.slots {
+        ota.phase = OtaPhase::Disabled(e.label());
+    }
+    RecoveryOtaUi {
+        ota: &mut ota,
+        slots: boot.slots,
+    }
+    .publish();
+
+    // --- LCD (黒地に文字だけ) ---
+    supervisor::feed_init();
+    RECOVERY_MODEL.lock(|cell| draw_recovery(display.back(), &cell.borrow()));
+    display.start(Irqs);
+    boot_trace::stage(Stage::DisplayStarted);
+    spawner.spawn(recovery_render_task(display)).unwrap();
+    supervisor::start(Limits::TICKER);
+    // 回復モードでは回数を 0 に戻さない (通常モードを試して 10 分動いたときだけ)
+    supervisor::allow_streak_clear(false);
+
+    // --- CYW43439 + embassy-net ---
+    boot_trace::stage(Stage::WifiPowerCycle);
+    let pio1 = Pio::new(pio1, Irqs);
+    let wifi::Network { stack, mut control, .. } = noinline(wifi::start(
+        &spawner,
+        pio1,
+        cyw43,
+        PowerManagementMode::Performance,
+        || boot_trace::stage(Stage::WifiInit),
+    ))
+    .await;
+    boot_trace::stage(Stage::WifiReady);
+    // Safety: 回復モードでは取得タスクを起動しないので、これらの static はこのタスクだけが触る
+    let tcp_state = unsafe { &*addr_of_mut!(TCP_STATE) };
+    let bufs = unsafe { &mut *addr_of_mut!(NET_BUFFERS) };
+    let sectors = unsafe { &mut *addr_of_mut!(SECTOR_BUFFERS) };
+    let net = Net::new(stack, tcp_state);
+    let ota_possible = credentials.is_ok() && boot.slots.is_ok();
+    let mut link = LinkManager::new(&credentials);
+    let recovery_interval = Duration::from_millis(u64::from(RECOVERY_OTA_INTERVAL_MS));
+    let normal_retry = Duration::from_millis(u64::from(RECOVERY_NORMAL_RETRY_MS));
+    // OTA ができない (資格情報が無い / 区画が分からない) なら、回復モードに居ても直せないので、時間が来たら
+    // 通常モードを試す (電源の入れ直しと同じ)
+    let mut normal_retry_at: Option<Instant> = (!ota_possible).then(|| Instant::now() + normal_retry);
+
+    loop {
+        supervisor::beat(Who::Main);
+        supervisor::beat(Who::Jobs);
+        let network_up = noinline(link.step(&mut control, stack, &credentials, &mut RecoveryLinkUi)).await;
+        supervisor::beat(Who::Main);
+        supervisor::beat(Who::Jobs);
+        if network_up && ota_possible {
+            ota.schedule_first_check_in(Duration::from_secs(0));
+        }
+        if ota_possible
+            && network_up
+            && ota.is_due()
+            && let Ok(slots) = boot.slots
         {
-            defmt::info!("reboot(FLASH_UPDATE) into P{} for {}", slots.target.index, version);
-            REBOOT_REQUEST.signal(slots);
-            reboot_requested = true;
+            ota.begin_check();
+            let mut ui = RecoveryOtaUi {
+                ota: &mut ota,
+                slots: boot.slots,
+            };
+            let mode = CheckMode { check_only: false, blocked };
+            let result = noinline(app::run_ota_check(&net, bufs, &mut flash, sectors, slots, mode, &mut ui)).await;
+            let proved = app::check_outcome(&result) == CheckOutcome::Proved;
+            ui.ota.apply(result);
+            // 回復モードは失敗しても 60 s ごとに試す (通常モードのバックオフ 10 分までは待たない)
+            let soon = Instant::now() + recovery_interval;
+            ui.ota.next_check = Some(ui.ota.next_check.map_or(soon, |n| n.min(soon)));
+            ui.publish();
+            if proved {
+                boot_trace::stage(Stage::OtaProved);
+                if normal_retry_at.is_none() && matches!(ui.ota.phase, OtaPhase::UpToDate { .. } | OtaPhase::NoRelease | OtaPhase::Blocked { .. }) {
+                    normal_retry_at = Some(Instant::now() + normal_retry);
+                }
+            }
         }
 
-        ModelUi {
-            ota: &mut j.ota,
-            slots: j.slots,
+        // --- 新しい版 (検証済み) / 巻き戻された版の再試行へ FLASH_UPDATE 起動 ---
+        if ota.reboot_due().is_some()
+            && let Ok(slots) = boot.slots
+        {
+            line.clear();
+            let _ = write!(line, "rebooting into slot {} (P{})... wifi off", slot_label(&slots.target), slots.target.index);
+            set_row(Row::Next, UiTone::Ok, &line);
+            Timer::after(Duration::from_millis(50)).await;
+            boot_trace::clear();
+            app::reboot_into_slot(&mut control, slots).await;
         }
-        .publish_ota();
+
+        // --- 新しい版が無く、確認が通って 10 分動いた: 通常モードをもう一度試す ---
+        line.clear();
+        match normal_retry_at {
+            Some(at) if Instant::now() >= at => {
+                set_row(Row::Next, UiTone::Busy, "retrying normal mode now...");
+                boot_trace::write_streak(plan.state.for_normal_retry().encode());
+                Timer::after(Duration::from_millis(50)).await;
+                let _ = with_timeout(Duration::from_secs(2), control.leave()).await;
+                boot_trace::clear();
+                supervisor::reset_now();
+            }
+            Some(at) => {
+                let left = app::secs_until(at);
+                let _ = write!(line, "no newer release: retry normal mode in {}:{:02}", left / 60, left % 60);
+                set_row(Row::Next, UiTone::Muted, &line);
+            }
+            None => {
+                let _ = line.push_str("waiting for a successful OTA check (every 60 s)");
+                set_row(Row::Next, UiTone::Muted, &line);
+            }
+        }
+        if link.is_joined()
+            && let Ok(creds) = &credentials
+        {
+            line.clear();
+            let _ = write!(line, "Wi-Fi: {}", ascii_label::<32>(creds.ssid.as_bytes()));
+            let tone = match stack.config_v4() {
+                Some(cfg) => {
+                    let ip = cfg.address.address().octets();
+                    let _ = write!(line, " {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                    UiTone::Ok
+                }
+                None => {
+                    let _ = line.push_str(" no IP yet");
+                    UiTone::Busy
+                }
+            };
+            set_row(Row::Wifi, tone, &line);
+        } else if let app::Link::Disconnected {
+            last_error: Some(code),
+            next_attempt,
+            ..
+        } = &link.link
+        {
+            line.clear();
+            let _ = write!(line, "Wi-Fi: join failed ({}), retry in {}s", code, app::secs_until(*next_attempt));
+            set_row(Row::Wifi, UiTone::Error, &line);
+        }
+        RecoveryOtaUi {
+            ota: &mut ota,
+            slots: boot.slots,
+        }
+        .publish();
         Timer::after(TICK).await;
     }
+}
+
+
+// ============================================================
+// 回復モード (0.4.2〜): Wi-Fi + OTA だけ
+// ============================================================
+
+/// 回復モードの画面の内容 (recovery_task が書き、recovery_render_task が毎フレーム読む)
+struct RecoveryModel {
+    ident: String<40>,
+    rows: [(String<{ recovery_ui::COLUMNS }>, UiTone); recovery_ui::ROWS],
+}
+
+impl RecoveryModel {
+    const fn new() -> Self {
+        Self {
+            ident: String::new(),
+            rows: [const { (String::new(), UiTone::Muted) }; recovery_ui::ROWS],
+        }
+    }
+}
+
+static RECOVERY_MODEL: Mutex<ThreadModeRawMutex, RefCell<RecoveryModel>> = Mutex::new(RefCell::new(RecoveryModel::new()));
+
+/// 回復モードの画面の行 (上から)
+#[derive(Clone, Copy)]
+enum Row {
+    LastReset = 0,
+    Why = 1,
+    Wifi = 2,
+    Ota = 3,
+    Next = 4,
+    Creds = 5,
+    Boot = 6,
+    Hint = 7,
+}
+
+fn set_row(row: Row, tone: UiTone, text: &str) {
+    RECOVERY_MODEL.lock(|cell| {
+        let mut m = cell.borrow_mut();
+        let slot = &mut m.rows[row as usize];
+        slot.0.clear();
+        for ch in text.chars() {
+            if slot.0.push(ch).is_err() {
+                break;
+            }
+        }
+        slot.1 = tone;
+    });
+}
+
+fn draw_recovery(frame: &mut BackBuffer, m: &RecoveryModel) {
+    let view = RecoveryView {
+        title: "RECOVERY MODE",
+        ident: &m.ident,
+        rows: core::array::from_fn(|i| (m.rows[i].0.as_str(), m.rows[i].1)),
+    };
+    let mut canvas = Canvas::new(&mut frame.data);
+    recovery_ui::render(&mut canvas, &view);
+}
+
+/// 回復モードの描画 (毎フレーム。写真も AA 文字も使わない)
+#[embassy_executor::task]
+async fn recovery_render_task(mut display: Display) {
+    loop {
+        supervisor::beat(Who::Render);
+        RECOVERY_MODEL.lock(|cell| draw_recovery(display.back(), &cell.borrow()));
+        display.present().await;
+    }
+}
+
+/// 回復モードの OTA の途中経過を画面へ
+struct RecoveryOtaUi<'a> {
+    ota: &'a mut OtaState,
+    slots: Result<Slots, OtaError>,
+}
+
+impl RecoveryOtaUi<'_> {
+    fn publish(&self) {
+        let mut line: String<80> = String::new();
+        let (tone, _) = self.ota.write_line(&mut line, &self.slots);
+        set_row(Row::Ota, ui_tone(tone), &line);
+    }
+}
+
+impl OtaUi for RecoveryOtaUi<'_> {
+    async fn ota_phase(&mut self, phase: OtaPhase) {
+        supervisor::beat(Who::Jobs);
+        supervisor::beat(Who::Main);
+        self.ota.phase = phase;
+        self.publish();
+    }
+}
+
+struct RecoveryLinkUi;
+
+impl LinkUi for RecoveryLinkUi {
+    async fn link_status(&mut self, text: &str, _joined_ssid: Option<&String<32>>) {
+        supervisor::beat(Who::Main);
+        supervisor::beat(Who::Jobs);
+        let mut line: String<80> = String::new();
+        let _ = write!(line, "Wi-Fi: {}", text);
+        set_row(Row::Wifi, UiTone::Busy, &line);
+    }
+}
+
+/// 回復モードに渡すもの (main が `embassy_rp::init` の Peripherals から取り出す)
+struct RecoveryParts {
+    display: Display,
+    sd_miso: Peri<'static, PIN_0>,
+    sd_cs: Peri<'static, PIN_26>,
+    sd_mosi: Peri<'static, PIN_27>,
+    sd_clk: Peri<'static, PIN_28>,
+    pio1: Peri<'static, PIO1>,
+    cyw43: Cyw43Pins,
+    flash: Peri<'static, FLASH>,
+    boot: BootStatus,
+    plan: BootPlan,
+}
+
+/// SD の `wifi.txt` だけを、期限付きで読む (回復モードで data 区画に写しが無いとき)
+fn read_wifi_txt_only(
+    miso: Peri<'static, PIN_0>,
+    cs: Peri<'static, PIN_26>,
+    mosi: Peri<'static, PIN_27>,
+    clk: Peri<'static, PIN_28>,
+    deadline: Duration,
+) -> Result<WifiCredentials, &'static str> {
+    supervisor::feed_init();
+    boot_trace::stage(Stage::SdInit);
+    sdcard::set_deadline(Some(Instant::now() + deadline));
+    let result = match init_sd(miso, cs, mosi, clk) {
+        Ok(volume_mgr) => read_credentials(&volume_mgr),
+        Err(message) => Err(message),
+    };
+    sdcard::set_deadline(None);
+    supervisor::feed_init();
+    result
+}
+
+/// 他方区画へ FLASH_UPDATE 起動する (回復モードでも落ち続けた)。印を SCRATCH0 に置き、画面も Wi-Fi も
+/// 使わずにすぐ再起動する (壊れている箇所に触れないため)。戻らない。
+///
+/// bootrom (pico-bootrom-rp2350 `varm_flash_boot.c` / `varm_launch_image.c`) は FLASH_UPDATE の対象区画に
+/// 正しいイメージがあれば版数によらずそれを選び、他方 (この版) の方が新しければ、対象が TBYB でない (buy 済み)
+/// なら起動時に、この版の区画の先頭セクタを消す (版数の巻き戻し)。以後はその版だけが起動する。
+fn fallback_now(boot: &BootStatus) -> ! {
+    let Ok(slots) = boot.slots else {
+        supervisor::reset_now();
+    };
+    defmt::error!(
+        "recovery kept crashing: FLASH_UPDATE into the other slot P{} (marker for v{})",
+        slots.target.index,
+        FIRMWARE_VERSION
+    );
+    boot_trace::stage(Stage::FallbackReboot);
+    boot_trace::write_fallback_marker(boot_policy::fallback_marker(IMAGE_DEF_VERSION_WORD));
+    ab_boot::reboot_flash_update(slots.target.start_offset(), 100)
 }
 
 // ============================================================
@@ -937,6 +1448,9 @@ async fn main(spawner: Spawner) {
     supervisor::set_stack_limit();
     supervisor::paint_stack();
     let p = embassy_rp::init(Default::default());
+    // 0.4.2〜: ウォッチドッグ (8 s) を何より先に動かす (TBYB 起動では bootrom の 16.7 s を縮めるだけ)。
+    // 以後、描画が始まるまでは各段階の前に明示的に再ロードし、どこかで止まれば 8 s でリセットする
+    supervisor::start_early();
     // Safety: HEAP_MEM は他から参照されない。init は 1 回だけ。
     unsafe { pico2w_300yen_lcd::heap::init(&mut *addr_of_mut!(HEAP_MEM)) };
 
@@ -952,114 +1466,33 @@ async fn main(spawner: Spawner) {
     if let Some(trace) = &boot.prev_trace {
         defmt::warn!("previous boot left a trace: {:?}", trace);
     }
-    // 連続して異常終了した回数 (SCRATCH1)。3 回続いたら安全モード
-    let prev_fault = last_reset(&boot).is_some();
-    let (streak, streak_word) = health::streak_after_boot(prev_fault, boot_trace::read_streak());
-    boot_trace::write_streak(streak_word);
-    let safe_mode = streak >= health::SAFE_MODE_STREAK;
-    if safe_mode {
-        defmt::error!("{} faults in a row: safe mode (no slideshow / weather / message)", streak);
-    }
-    // TBYB 起動なら bootrom のウォッチドッグの延長を始める (ota::app。boot_trace も arm する)。
-    // TBYB でない起動 (buy 済みの版の通常起動、USB で書いた plain 版) も記録する (0.4.1〜)
-    boot.start_tbyb_feeding(&spawner);
-    if !boot_trace::is_armed() {
-        boot_trace::arm();
-        boot_trace::stage(Stage::MainEntered);
-    }
-
-    // --- SD カード: wifi.txt と ticker.txt (GPIO SPI は同期処理なので走査開始前に済ませる) ---
-    // ticker.txt は任意: 無い / 空 / 読めない / SD が無い、のどれでも東京の既定値で続ける (ticker::config::load)
-    let mut sd: Option<SdVolumeManager> = None;
-    let (config, config_note, credentials): (TickerConfig, String<80>, Result<WifiCredentials, &'static str>) =
-        match init_sd(p.PIN_0, p.PIN_26, p.PIN_27, p.PIN_28) {
-            Ok(volume_mgr) => {
-                let creds = read_credentials(&volume_mgr);
-                let mut buf = [0u8; CONFIG_MAX];
-                let source = match read_root_file(&volume_mgr, "TICKER.TXT", &mut buf) {
-                    Ok(len) => ConfigSource::Read(&buf[..len]),
-                    Err(ReadError::NotFound) => ConfigSource::NotFound,
-                    Err(ReadError::Other(e)) => ConfigSource::ReadFailed(e),
-                };
-                let (config, note) = config::load(source);
-                // 背景の写真 (スライドショー) は走査開始後に別タスクが読む
-                sd = Some(volume_mgr);
-                (config, note, creds)
-            }
-            Err(message) => {
-                let (config, note) = config::load(ConfigSource::NoCard(message));
-                (config, note, Err(message))
-            }
-        };
-    match &credentials {
-        Ok(c) => defmt::info!("wifi.txt: SSID={}", c.ssid.as_str()),
-        Err(message) => defmt::warn!("wifi.txt: {}", message),
+    // --- 起動の方針 (通常 / 回復 / 他方区画へ、boot_policy) ---
+    let plan = boot_policy::decide(&boot_inputs(&boot));
+    if plan.write_state {
+        boot_trace::write_streak(plan.state.encode());
     }
     defmt::info!(
-        "ticker.txt: lat {} lon {} tz {} s place {} scroll {} slide {} s images '{}' sdfast {} note '{}'",
-        config.lat,
-        config.lon,
-        config.tz_offset_secs,
-        config.place.as_str(),
-        config.scroll_px,
-        config.slide_secs,
-        config.images.as_str(),
-        config.sd_fast,
-        config_note.as_str()
+        "boot plan: mode {} fault {} crash streak {} recovery streak {} fell back from {:?}",
+        match plan.mode {
+            Mode::Normal => "normal",
+            Mode::Recovery => "RECOVERY",
+            Mode::Fallback => "FALLBACK",
+        },
+        plan.fault,
+        plan.state.crash_streak,
+        plan.state.recovery_streak,
+        plan.fell_back_from
     );
-    let layout = match config.layout {
-        LayoutName::Glass => Layout::Glass,
-        LayoutName::Dock => Layout::Dock,
-        LayoutName::Classic => Layout::Classic,
-    };
-    boot_trace::stage(Stage::SdRead);
+    // 記録を始める (前回の記録と SCRATCH0 は BootStatus::collect で読んだ)。TBYB の buy 待ちも、buy 済みの版も
+    boot_trace::arm();
+    boot_trace::stage(Stage::MainEntered);
+    let pending = boot.buy == BuyState::Pending;
+    if plan.mode == Mode::Fallback {
+        fallback_now(&boot);
+    }
 
-    // --- 共有モデルの初期値 ---
-    let mut ota = OtaState::new();
-    match &credentials {
-        Ok(c) => {
-            with_model(|m| {
-                let _ = write!(m.wifi, "Wi-Fi: starting... ({})", ascii_label::<32>(c.ssid.as_bytes()));
-            });
-        }
-        Err(message) => {
-            with_model(|m| {
-                let _ = write!(m.wifi, "Wi-Fi: {}", message);
-                m.wifi_tone = Tone::Error;
-            });
-            ota.phase = OtaPhase::Disabled(message);
-        }
-    }
-    if let Err(e) = &boot.slots {
-        ota.phase = OtaPhase::Disabled(e.label());
-    }
-    with_model(|m| {
-        m.tz_offset_secs = config.tz_offset_secs;
-        m.place = config.place.clone();
-        m.scroll_px = config.scroll_px;
-        m.layout = layout;
-        m.status_mode = config.status;
-        m.boot_at = Instant::now();
-        m.note_until = Some(Instant::now() + NOTE_SHOW);
-        if safe_mode {
-            let _ = write!(m.note, "SAFE MODE: {} crashes in a row, photos/weather/message off", streak);
-        } else if !config_note.is_empty() {
-            m.note = config_note.clone();
-        }
-        m.stack_total = supervisor::stack_size();
-        let _ = m.ntp.push_str("---");
-        let _ = m.wx.push_str("---");
-        let _ = m.msg.push_str("---");
-    });
-    publish_ident(&boot);
-    publish_diag(&boot, streak);
-    ModelUi {
-        ota: &mut ota,
-        slots: boot.slots,
-    }
-    .publish_ota();
-
-    // --- LCD: 初期画面を描いてから走査を開始し、以後は render_task が毎フレーム描く ---
+    // --- LCD (走査はまだ始めない) ---
+    supervisor::feed_init();
     let mut display = Display::new(DisplayPins {
         pio0: p.PIO0,
         pin2: p.PIN_2,
@@ -1088,6 +1521,159 @@ async fn main(spawner: Spawner) {
         dma_ch2: p.DMA_CH2,
         dma_ch3: p.DMA_CH3,
     });
+    let cyw43_pins = Cyw43Pins {
+        pwr: p.PIN_23,
+        cs: p.PIN_25,
+        dio: p.PIN_24,
+        clk: p.PIN_29,
+        dma: p.DMA_CH4,
+    };
+
+    if plan.mode == Mode::Recovery {
+        spawner
+            .spawn(jobs_task(NetWork::Recovery(spawner, RecoveryParts {
+                display,
+                sd_miso: p.PIN_0,
+                sd_cs: p.PIN_26,
+                sd_mosi: p.PIN_27,
+                sd_clk: p.PIN_28,
+                pio1: p.PIO1,
+                cyw43: cyw43_pins,
+                flash: p.FLASH,
+                boot,
+                plan,
+            })))
+            .unwrap();
+        return;
+    }
+
+    // --- SD カード: wifi.txt と ticker.txt (GPIO SPI は同期処理なので走査開始前に済ませる。期限 5 s) ---
+    // ticker.txt は任意: 無い / 空 / 読めない / SD が無い、のどれでも東京の既定値で続ける (ticker::config::load)
+    supervisor::feed_init();
+    boot_trace::stage(Stage::SdInit);
+    sdcard::set_deadline(Some(Instant::now() + SD_BOOT_DEADLINE));
+    let mut sd: Option<SdVolumeManager> = None;
+    let (config, config_note, credentials): (TickerConfig, String<80>, Result<WifiCredentials, &'static str>) =
+        match init_sd(p.PIN_0, p.PIN_26, p.PIN_27, p.PIN_28) {
+            Ok(volume_mgr) => {
+                let creds = read_credentials(&volume_mgr);
+                let mut buf = [0u8; CONFIG_MAX];
+                let source = match read_root_file(&volume_mgr, "TICKER.TXT", &mut buf) {
+                    Ok(len) => ConfigSource::Read(&buf[..len]),
+                    Err(ReadError::NotFound) => ConfigSource::NotFound,
+                    Err(ReadError::Other(e)) => ConfigSource::ReadFailed(e),
+                };
+                let (config, note) = config::load(source);
+                // 背景の写真 (スライドショー) は走査開始後に別タスクが読む
+                sd = Some(volume_mgr);
+                (config, note, creds)
+            }
+            Err(message) => {
+                let (config, note) = config::load(ConfigSource::NoCard(message));
+                (config, note, Err(message))
+            }
+        };
+    sdcard::set_deadline(None);
+    supervisor::feed_init();
+    match &credentials {
+        Ok(c) => defmt::info!("wifi.txt: SSID={}", c.ssid.as_str()),
+        Err(message) => defmt::warn!("wifi.txt: {}", message),
+    }
+    defmt::info!(
+        "ticker.txt: lat {} lon {} tz {} s place {} scroll {} slide {} s images '{}' sdfast {} note '{}'",
+        config.lat,
+        config.lon,
+        config.tz_offset_secs,
+        config.place.as_str(),
+        config.scroll_px,
+        config.slide_secs,
+        config.images.as_str(),
+        config.sd_fast,
+        config_note.as_str()
+    );
+    boot_trace::stage(Stage::SdRead);
+    // 試験用 (debug_crash=): buy 済みの版の通常起動でだけ効く。TBYB の buy 待ちでは無視する
+    let debug_crash = if pending { DebugCrash::None } else { config.debug_crash };
+    if debug_crash == DebugCrash::Boot {
+        panic!("debug_crash=boot");
+    }
+    let layout = match config.layout {
+        LayoutName::Glass => Layout::Glass,
+        LayoutName::Dock => Layout::Dock,
+        LayoutName::Classic => Layout::Classic,
+    };
+
+    // --- data 区画: Wi-Fi の資格情報の写し (回復モード用) と、入れない版。変わったときだけ書く ---
+    let mut flash: OtaFlash = Flash::new_blocking(p.FLASH);
+    let mut blocked = 0;
+    if let Some(offset) = persist::data_offset() {
+        let stored = persist::read(offset);
+        let mut record = stored.unwrap_or_default();
+        if let Ok(c) = &credentials {
+            record = record.with_credentials(c.ssid.as_bytes(), c.password.as_bytes());
+        }
+        if let Some(from) = plan.fell_back_from {
+            record.blocked = record.blocked.max(from);
+        }
+        blocked = record.blocked;
+        if stored != Some(record) && (record.has_credentials() || record.blocked != 0) {
+            supervisor::feed_init();
+            match persist::write_if_changed(&mut flash, offset, &record) {
+                Ok(true) => defmt::info!("persist: record written (blocked {})", record.blocked),
+                Ok(false) => {}
+                Err(e) => defmt::error!("persist: write failed: {}", e),
+            }
+            supervisor::feed_init();
+        }
+    }
+
+    // --- 共有モデルの初期値 ---
+    let mut ota = OtaState::new();
+    match &credentials {
+        Ok(c) => {
+            with_model(|m| {
+                let _ = write!(m.wifi, "Wi-Fi: starting... ({})", ascii_label::<32>(c.ssid.as_bytes()));
+            });
+        }
+        Err(message) => {
+            with_model(|m| {
+                let _ = write!(m.wifi, "Wi-Fi: {}", message);
+                m.wifi_tone = Tone::Error;
+            });
+            ota.phase = OtaPhase::Disabled(message);
+        }
+    }
+    if let Err(e) = &boot.slots {
+        ota.phase = OtaPhase::Disabled(e.label());
+    }
+    with_model(|m| {
+        m.tz_offset_secs = config.tz_offset_secs;
+        m.place = config.place.clone();
+        m.scroll_px = config.scroll_px;
+        m.layout = layout;
+        m.status_mode = config.status;
+        m.boot_at = Instant::now();
+        m.note_until = Some(Instant::now() + NOTE_SHOW);
+        if debug_crash != DebugCrash::None {
+            let _ = m.note.push_str("ticker.txt: debug_crash is set (test crash on purpose)");
+        } else if !config_note.is_empty() {
+            m.note = config_note.clone();
+        }
+        m.stack_total = supervisor::stack_size();
+        let _ = m.ntp.push_str("---");
+        let _ = m.wx.push_str("---");
+        let _ = m.msg.push_str("---");
+    });
+    publish_ident(&boot);
+    publish_diag(&boot, &plan);
+    ModelUi {
+        ota: &mut ota,
+        slots: boot.slots,
+    }
+    .publish_ota();
+
+    // --- LCD: 初期画面を描いてから走査を開始し、以後は render_task が毎フレーム描く ---
+    supervisor::feed_init();
     // 背景は写真を読むまで既定のグラデーション
     slideshow::fill_default(layout);
     MODEL.lock(|cell| {
@@ -1097,14 +1683,17 @@ async fn main(spawner: Spawner) {
     display.start(Irqs);
     boot_trace::stage(Stage::DisplayStarted);
     spawner.spawn(render_task(display)).unwrap();
-    // TBYB でない起動は描画が始まったらすぐ監視を始める (TBYB は buy の後)
-    if boot.buy == BuyState::NotTbyb {
-        supervisor::start(Limits::TICKER);
+    // 生存確認つきの監視 (TBYB の buy 待ちも。締め切りを過ぎたら再ロードをやめて旧版へ戻る)
+    supervisor::start(Limits::TICKER);
+    if pending {
+        supervisor::set_buy_deadline(Some(boot_policy::BUY_DEADLINE_MS));
+    } else {
+        boot_trace::stage(Stage::Running);
+        supervisor::allow_streak_clear(true);
+        DOWNLOAD_OK.store(true, Ordering::Relaxed);
     }
-    if let Some(volume_mgr) = sd
-        && !safe_mode
-    {
-        spawner
+    match sd {
+        Some(volume_mgr) => spawner
             .spawn(slideshow::slideshow_task(
                 volume_mgr,
                 SlideConfig {
@@ -1113,9 +1702,12 @@ async fn main(spawner: Spawner) {
                     layout,
                     sd_fast: config.sd_fast,
                     start_by: Instant::now() + SLIDESHOW_START_MAX,
+                    crash_on_first: debug_crash == DebugCrash::Slideshow,
                 },
             ))
-            .unwrap();
+            .unwrap(),
+        // SD が無ければ写真の一巡は済み (試すものが無い)
+        None => slideshow::FIRST_DONE.store(true, Ordering::Relaxed),
     }
 
     // --- picotool 用 USB reset interface ---
@@ -1136,13 +1728,7 @@ async fn main(spawner: Spawner) {
     } = wifi::start(
         &spawner,
         pio1,
-        Cyw43Pins {
-            pwr: p.PIN_23,
-            cs: p.PIN_25,
-            dio: p.PIN_24,
-            clk: p.PIN_29,
-            dma: p.DMA_CH4,
-        },
+        cyw43_pins,
         PowerManagementMode::Performance,
         || boot_trace::stage(Stage::WifiInit),
     )
@@ -1155,11 +1741,11 @@ async fn main(spawner: Spawner) {
     let tcp_state = unsafe { &*addr_of_mut!(TCP_STATE) };
     let ota_possible = credentials.is_ok() && boot.slots.is_ok();
     spawner
-        .spawn(jobs_task(Jobs {
+        .spawn(jobs_task(NetWork::Normal(Jobs {
             net: Net::new(stack, tcp_state),
             stack,
             bufs: unsafe { &mut *addr_of_mut!(NET_BUFFERS) },
-            flash: Flash::new_blocking(p.FLASH),
+            flash,
             sectors: unsafe { &mut *addr_of_mut!(SECTOR_BUFFERS) },
             sntp_bufs: unsafe { &mut *addr_of_mut!(SNTP_BUFFERS) },
             body: unsafe { &mut *addr_of_mut!(BODY) },
@@ -1167,8 +1753,9 @@ async fn main(spawner: Spawner) {
             ota,
             slots: boot.slots,
             ota_possible,
-            safe_mode,
-        }))
+            blocked,
+            crash_before_ota: debug_crash == DebugCrash::Ota,
+        })))
         .unwrap();
 
     let mut link = LinkManager::new(&credentials);
@@ -1181,15 +1768,36 @@ async fn main(spawner: Spawner) {
         let network_up = link.step(&mut control, stack, &credentials, &mut LinkModelUi).await;
         supervisor::beat(Who::Main);
 
-        // --- TBYB: 自己診断 = 描画が回っている + join + DHCP → explicit_buy (ota::app)。取得の成否は見ない ---
-        let render_alive = supervisor::alive(Who::Render, 2_000);
-        if boot.selftest_tick(network_up, render_alive) && matches!(boot.buy, BuyState::Bought | BuyState::Failed(_)) {
-            // explicit_buy は bootrom のウォッチドッグを止めるので、ここから監視用のウォッチドッグを動かす
-            supervisor::start(Limits::TICKER);
+        // --- TBYB: buy 条件 (boot_policy::BuyGate) = Wi-Fi + DHCP、OTA 確認が TLS + HTTP を通った、
+        //     NTP / 天気 / 文字 / SD の設定 / 最初の写真を 1 回ずつ試した、生存確認が揃って 25 s ---
+        if pending && boot.buy == BuyState::Pending {
+            let round = Round {
+                sd_config: true,
+                ntp: ROUND_NTP.load(Ordering::Relaxed),
+                weather: ROUND_WEATHER.load(Ordering::Relaxed),
+                message: ROUND_MESSAGE.load(Ordering::Relaxed),
+                slideshow: slideshow::FIRST_DONE.load(Ordering::Relaxed),
+            };
+            let healthy = supervisor::all_alive() && supervisor::alive(Who::Render, 2_000);
+            if boot.buy_tick(network_up, OTA_PROVED.load(Ordering::Relaxed), round, healthy)
+                && matches!(boot.buy, BuyState::Bought | BuyState::Failed(_))
+            {
+                // explicit_buy は bootrom がウォッチドッグを止めるので、すぐ動かし直す
+                supervisor::rearm();
+                if boot.buy == BuyState::Bought {
+                    boot_trace::stage(Stage::Running);
+                    // buy した版の回数は 0 から (旧版の SCRATCH1 は buy 待ちの間は触らない)
+                    boot_trace::write_streak(BootState::default().encode());
+                    supervisor::allow_streak_clear(true);
+                    DOWNLOAD_OK.store(true, Ordering::Relaxed);
+                    // buy 待ちの間に新しい版を見つけていてもよいように、すぐ確認し直す (今度はダウンロードまで)
+                    OTA_NOW.store(true, Ordering::Relaxed);
+                }
+            }
         }
 
-        // buy が済む (または TBYB でない) まで OTA も取得も始めない (buy を遅らせないため)
-        NET_READY.store(network_up && boot.ota_allowed(), Ordering::Relaxed);
+        // buy 待ちの間も OTA 確認 (manifest だけ) と取得は行う (buy 条件の一巡)。締め切り後は行わない
+        NET_READY.store(network_up && boot.ota_check_allowed(), Ordering::Relaxed);
 
         // --- 検証済みイメージへの FLASH_UPDATE 再起動 / 巻き戻されたイメージの再試行 (取得タスクの依頼) ---
         if let Some(slots) = REBOOT_REQUEST.try_take() {
@@ -1227,7 +1835,7 @@ async fn main(spawner: Spawner) {
                     }
                 }
             });
-        } else if let Ok(_) = &credentials
+        } else if credentials.is_ok()
             && let app::Link::Disconnected {
                 last_error, next_attempt, ..
             } = &link.link

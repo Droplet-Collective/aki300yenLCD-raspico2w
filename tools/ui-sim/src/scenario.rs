@@ -25,6 +25,18 @@ pub struct Scenario {
     pub scroll_x: i32,
     pub status: StatusJson,
     pub animation: AnimationJson,
+    /// 回復モードの画面 (0.4.2〜)。指定すると時計 / 天気 / 写真の代わりにこれを描く (GIF は作らない)
+    pub recovery: Option<RecoveryJson>,
+}
+
+/// 回復モードの画面 (`ui::recovery::RecoveryView`)
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct RecoveryJson {
+    pub title: String,
+    pub ident: String,
+    /// 本文 (上から最大 8 行): [文字, 色調]
+    pub rows: Vec<(String, String)>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -111,6 +123,7 @@ impl Default for Scenario {
             scroll_x: 0,
             status: StatusJson::default(),
             animation: AnimationJson::default(),
+            recovery: None,
         }
     }
 }

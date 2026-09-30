@@ -69,7 +69,10 @@ pub async fn query(
     let endpoint = IpEndpoint::new(IpAddress::Ipv4(addr), NTP_PORT);
     let request = request_packet();
     let sent_at = Instant::now();
-    socket.send_to(&request, endpoint).await.map_err(|_| SntpError::Send)?;
+    with_timeout(timeout, socket.send_to(&request, endpoint))
+        .await
+        .map_err(|_| SntpError::Timeout)?
+        .map_err(|_| SntpError::Send)?;
     let mut reply = [0u8; PACKET_LEN];
     let (n, _meta) = with_timeout(timeout, socket.recv_from(&mut reply))
         .await

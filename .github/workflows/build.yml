@@ -211,6 +211,24 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Host-side tests of the pure firmware logic (tools/ticker-tests): calendar, ticker.txt, SNTP, fonts,
+  # the supervisor, and (0.4.2) the boot policy with the boot-sequence simulation that injects hangs /
+  # crashes at every stage and checks that a broken build is never bought and the board always reaches
+  # an OTA check (docs/ticker.md §8). Required: a failing policy test fails the build and the release.
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/ticker-tests
+      - name: cargo test (tools/ticker-tests)
+        working-directory: tools/ticker-tests
+        run: cargo test --release -- --nocapture
+
   # Host-side UI simulator (tools/ui-sim, docs/ui-sim.md): unit tests + preview PNG/GIF of the
   # ticker screen rendered by the same src/ui code as the firmware. Informational only: it never
   # blocks the firmware build or a release (skipped when release.yml calls this workflow).
