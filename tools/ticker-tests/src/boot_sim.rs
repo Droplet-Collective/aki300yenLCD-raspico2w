@@ -18,7 +18,8 @@
 //!   OTA (60 s ごと、巻き戻った版の再試行 10 分後、ダウンロード 60 s)、回復モード (60 s ごとの確認、10 分で通常を再試行)。
 
 use crate::boot_policy::{
-    self, BUY_DEADLINE_MS, BUY_SETTLE_MS, BootInputs, BootState, BuyGate, BuyInputs, BuyStep, HEALTHY_CLEAR_MS, Mode,
+    self, BUY_DEADLINE_MS, BUY_SETTLE_MS, BootInputs, BootState, BuyGate, BuyInputs, BuyStep, CheckFailure, CheckOutcome,
+    HEALTHY_CLEAR_MS, Mode,
     PENDING_OTA_RETRY_MS, PrevBoot, RECOVERY_NORMAL_RETRY_MS, RECOVERY_OTA_INTERVAL_MS, Record, Round,
 };
 
@@ -110,6 +111,8 @@ pub enum Github {
     Http5xx,
     /// DNS / TCP / TLS が通らない
     Down,
+    /// 応答は来るが使えない (ヘッダがバッファに溢れる、構文エラー、manifest が切れている)
+    BadResponse,
 }
 
 pub struct Env {
@@ -342,9 +345,18 @@ impl Board {
         }
     }
 
-    /// OTA 確認 1 回 (TLS + HTTP)。戻り値: 経路が通ったか
+    /// OTA 確認 1 回 (TLS + HTTP)。戻り値: 経路が通ったか (本物の `classify_check` で分類する)
     fn ota_proved(&self, env: &Env) -> bool {
-        env.net_up(self.t) && (env.github)(self.t) != Github::Down
+        if !env.net_up(self.t) {
+            return false;
+        }
+        let (parsed, failure) = match (env.github)(self.t) {
+            Github::Ok => (true, None),
+            Github::Http5xx => (false, Some(CheckFailure::FinalStatus)),
+            Github::BadResponse => (false, Some(CheckFailure::BadResponse)),
+            Github::Down => (false, Some(CheckFailure::Transport)),
+        };
+        boot_policy::classify_check(parsed, failure) == CheckOutcome::Proved
     }
 
     /// 確認で見つかった入れるべき版 (5xx なら manifest は読めない)
@@ -842,6 +854,27 @@ fn github_down_during_pending_rolls_back() {
     let b = scenario(Image::good(V2), |env| env.github = gh);
     assert!(b.bought.contains(&V2), "bought after GitHub came back");
     assert!(b.boots_of(V2) >= 2, "first trial rolled back");
+    assert_eq!(b.running(), Some(V3));
+}
+
+/// 応答は来るが使えない (ヘッダの溢れ / 構文エラー / 切れた manifest): 経路の証拠にならないので buy しない
+#[test]
+fn github_bad_response_during_pending_is_not_proof() {
+    fn gh(t: u64) -> Github {
+        if (11 * MIN + 30_000..25 * MIN).contains(&t) { Github::BadResponse } else { Github::Ok }
+    }
+    let b = scenario(Image::good(V2), |env| env.github = gh);
+    // 1 回目の試行 (11〜14 分) は buy されずに戻り、25 分以降の再試行で buy される
+    let first_buy = b
+        .log
+        .iter()
+        .find_map(|e| match e {
+            Ev::Bought { t, version: V2 } => Some(*t),
+            _ => None,
+        })
+        .unwrap();
+    assert!(first_buy >= 25 * MIN, "bought at {} s on a bad response", first_buy / 1000);
+    assert!(b.boots_of(V2) >= 2);
     assert_eq!(b.running(), Some(V3));
 }
 

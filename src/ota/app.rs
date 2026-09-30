@@ -36,7 +36,7 @@ use super::manifest::{Manifest, Version};
 use super::slot::{self, OtaFlash, SectorBuffers, SlotWriter, Slots, slot_label};
 use super::{MANIFEST_NAME, OtaError, URL_MAX, set_latest_asset_url};
 use crate::ab_boot::{self, BootInfo};
-use crate::boot_policy::{BUY_SETTLE_MS, BuyGate, BuyInputs, BuyStep, CheckOutcome, Round};
+use crate::boot_policy::{BUY_SETTLE_MS, BuyGate, BuyInputs, BuyStep, CheckFailure, CheckOutcome, Round, classify_check};
 use crate::boot_trace::{self, ResetReason, SelftestCounters, Stage, Trace};
 use crate::wifi::{self, WifiCredentials, ascii_label};
 
@@ -951,40 +951,39 @@ pub struct CheckMode {
     pub blocked: u32,
 }
 
-/// 確認の結果の分類 (`boot_policy::CheckOutcome`)。HTTP の応答を受けた (manifest を解釈した / 確定した
-/// ステータス / 本文の検証まで進んだ) なら `Proved` = この版の TLS + HTTP の経路が最後まで動いた。
-/// DNS / TCP / TLS / 時間切れ / 区画の問題は `Transport` (経路を試し切れていない)。
-pub fn check_outcome(result: &Result<OtaPhase, OtaError>) -> CheckOutcome {
-    match result {
-        Ok(_) => CheckOutcome::Proved,
-        Err(
-            OtaError::HttpStatus(_)
-            | OtaError::HttpHeaderTooLong
-            | OtaError::HttpCodec
-            | OtaError::HttpRedirect
-            | OtaError::TooManyRedirects
-            | OtaError::LocationTooLong
-            | OtaError::Manifest
-            | OtaError::BadSize
-            | OtaError::SizeMismatch
-            | OtaError::ShaMismatch
-            | OtaError::ReadbackMismatch
-            | OtaError::Flash,
-        ) => CheckOutcome::Proved,
-        Err(
-            OtaError::Dns
-            | OtaError::Network
-            | OtaError::Tls
-            | OtaError::HttpProtocol
-            | OtaError::Timeout
-            | OtaError::NoPartitionTable
-            | OtaError::NoTarget,
-        ) => CheckOutcome::Transport,
+/// OTA の失敗 → `boot_policy::CheckFailure` (buy 条件 (b) の判定用)
+pub fn check_failure(error: OtaError) -> CheckFailure {
+    match error {
+        OtaError::HttpStatus(_) => CheckFailure::FinalStatus,
+        OtaError::HttpHeaderTooLong
+        | OtaError::HttpCodec
+        | OtaError::HttpRedirect
+        | OtaError::TooManyRedirects
+        | OtaError::LocationTooLong
+        | OtaError::Manifest => CheckFailure::BadResponse,
+        OtaError::Dns | OtaError::Network | OtaError::Tls | OtaError::HttpProtocol | OtaError::Timeout => {
+            CheckFailure::Transport
+        }
+        OtaError::BadSize
+        | OtaError::SizeMismatch
+        | OtaError::ShaMismatch
+        | OtaError::ReadbackMismatch
+        | OtaError::Flash
+        | OtaError::NoPartitionTable
+        | OtaError::NoTarget => CheckFailure::Local,
     }
 }
 
+/// [`run_ota_check`] の結果の分類 (`CheckOutcome::Proved` = この版の TLS + HTTP の経路が最後まで動いた)。
+/// `manifest_parsed` は `run_ota_check` が manifest を解釈できたときに立てる
+pub fn check_outcome(result: &Result<OtaPhase, OtaError>, manifest_parsed: bool) -> CheckOutcome {
+    classify_check(manifest_parsed, result.as_ref().err().map(|e| check_failure(*e)))
+}
+
 /// 1 回の更新確認。戻り値の `OtaPhase` は NoRelease / UpToDate / NewerAvailable / Blocked / Rejected /
-/// Rebooting のいずれか。
+/// Rebooting のいずれか。manifest を解釈できたら `manifest_parsed` を立てる (buy 条件 (b) の判定、
+/// [`check_outcome`])。結果を包む関数を挟まないのは、包むと中の future (≈ 15 kB) が一旦スタックに作られるため。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ota_check(
     net: &Net<'_>,
     bufs: &mut NetBuffers,
@@ -993,6 +992,7 @@ pub async fn run_ota_check(
     slots: Slots,
     mode: CheckMode,
     ui: &mut impl OtaUi,
+    manifest_parsed: &mut bool,
 ) -> Result<OtaPhase, OtaError> {
     ui.ota_phase(OtaPhase::Checking).await;
 
@@ -1018,6 +1018,7 @@ pub async fn run_ota_check(
         }
     };
     let manifest = Manifest::parse(&bufs.manifest[..manifest_len])?;
+    *manifest_parsed = true;
     defmt::info!(
         "manifest: version {} bin {} size {} (current {})",
         manifest.version,

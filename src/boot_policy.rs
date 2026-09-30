@@ -419,11 +419,39 @@ impl BuyGate {
 /// OTA の manifest 確認の結果の分類 (buy 条件 (b) と、buy 待ち中の再試行の間隔)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckOutcome {
-    /// HTTP の応答を受けた (manifest を解釈した、または 404 / 5xx などの確定したステータス)。
-    /// この版の TLS + HTTP の経路が最後まで動いた証拠になる
+    /// manifest.json を解釈できた、または (リダイレクトを追った後の) 確定した HTTP ステータス (404 / 5xx など)
+    /// を受けた。この版の TLS + HTTP の経路が最後まで動いた証拠になる
     Proved,
-    /// DNS / TCP / TLS / 時間切れ。経路を試し切れていない (buy 待ちなら [`PENDING_OTA_RETRY_MS`] 後に再試行)
+    /// 証拠にならない: DNS / TCP / TLS / 時間切れ、応答ヘッダの溢れ、応答の構文エラー、リダイレクトの不備、
+    /// 途中で切れた / 解釈できない manifest。buy 待ちなら [`PENDING_OTA_RETRY_MS`] 後に再試行し、締め切りまで
+    /// 通らなければ buy しない (旧版へ戻る)
+    Unproved,
+}
+
+/// OTA 確認の失敗の種類 (`ota::OtaError` をこれに写して [`classify_check`] に渡す)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckFailure {
+    /// リダイレクトを追った後の確定した HTTP ステータス (200 / 302 / 404 以外)
+    FinalStatus,
+    /// 応答は来たが使えない: ヘッダがバッファに収まらない、構文エラー、Location の不備 / 長すぎ / 多すぎ、
+    /// manifest.json が長すぎる / 解釈できない
+    BadResponse,
+    /// DNS / TCP / TLS / HTTP クライアント内部 / 時間切れ
     Transport,
+    /// 手元の問題 (区画、フラッシュ、書いたイメージの検証)。manifest を解釈した後にしか起きない
+    Local,
+}
+
+/// OTA 確認 1 回の分類。`failure` = None なら成功 (manifest を解釈した、または 404 = Release 無し)。
+/// manifest を解釈した後 (`manifest_parsed`) の失敗 (ダウンロードや検証) は経路が通った後なので `Proved`。
+/// 解釈する前の失敗は、確定した HTTP ステータスだけが `Proved`。
+pub fn classify_check(manifest_parsed: bool, failure: Option<CheckFailure>) -> CheckOutcome {
+    match failure {
+        None => CheckOutcome::Proved,
+        Some(_) if manifest_parsed => CheckOutcome::Proved,
+        Some(CheckFailure::FinalStatus) => CheckOutcome::Proved,
+        Some(CheckFailure::BadResponse | CheckFailure::Transport | CheckFailure::Local) => CheckOutcome::Unproved,
+    }
 }
 
 // ============================================================
