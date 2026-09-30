@@ -318,7 +318,7 @@ cortex-m-rt の配置では、スタックは RAM の最上位から下へ伸び
 | 0.4.0 | 28,104 B | 35,072 B: 同じ経路 (main 14.0 kB) | **−7.0 kB (溢れる)** |
 | 0.4.1 | 40,464 B | 24,868 B: `jobs_task` の poll 5.4 kB → `fetch_small` 2.8 kB → `request` 7.5 kB → TLS | **+15.6 kB** |
 | 0.4.2 | 38,144 B | 24,444 B: `jobs_task` (通常の取得 + 回復モード) の poll 2.7 kB → OTA 確認 2.9 kB → `fetch` 2.8 kB → `request` 7.5 kB → TLS | **+13.7 kB** |
-| 0.5.1 | 35,572 B | 24,780 B: 同じ経路 (`jobs_task` の poll 2.4 kB は同じ。TLS の `client_finished` / `write_record` のフレームが +1.2 kB: この変更では触っていない関数。fat LTO のインライン化が変わったと推定)。流れる文字の組み立ては描画タスク (2.2 kB) の中で、文字列は static | **+10.8 kB** |
+| 0.5.1 | 35,572 B | 24,752 B: 同じ経路 (`jobs_task` の poll 2.4 kB は同じ。TLS の `client_finished` / `write_record` のフレームが +1.2 kB: この変更では触っていない関数。fat LTO のインライン化が変わったと推定)。流れる文字の組み立ては描画タスク (2.2 kB) の中で、文字列は static | **+10.8 kB** |
 | 0.5.0 | 36,380 B | 23,588 B: 同じ経路 (`jobs_task` の poll 2.4 kB)。設定ページの経路 (`noinline(Server::serve)` → 設定の保存 → `TickerConfig::parse`) は ≈ 7.5 kB。待ち受けソケットのバッファ 2 kB を static に置いた分だけ空きが減った | **+12.8 kB** |
 
 0.4.2 の注意 (試作で stack-report が見つけたもの): 回復モードを別のタスクにするとタスク領域 (OTA 確認の future ≈ 15 kB) が
