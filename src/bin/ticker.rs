@@ -17,6 +17,8 @@
 //!   `MODEL` (共有モデル) と `slideshow::BG` (背景) から読む。
 //!   フラッシュ書き込み中 (数百 ms、割り込み禁止) は描画が止まるが、走査は SRAM の DMA リングで続く。
 //! - `slideshow_task`: SD の BMP を読み、背景を切り替える (`ticker::slideshow`)。OTA の確認〜検証中は止まる。
+//! - 設定ページの HTTP サーバ (0.5.0〜、`web::server`、docs/settings-server.md): 取得タスクの中で 1 要求ずつ動く
+//!   (OTA 確認の後、NTP / 天気 / 文字より先)。最初の OTA 確認が通ってから待ち受け、回復モードでは動かない。
 //!
 //! # 画面 (400×96、v0.4.0〜: SD の写真の上に重ね描き)
 //!
@@ -61,6 +63,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use cyw43::PowerManagementMode;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::flash::Flash;
 use embassy_rp::peripherals::*;
 use embassy_rp::pio::{InterruptHandler, Pio};
@@ -101,8 +104,11 @@ use pico2w_300yen_lcd::ticker::sntp_net::{self, SntpBuffers, Sync};
 use pico2w_300yen_lcd::ticker::weather::{self, Weather};
 use pico2w_300yen_lcd::ui::canvas::Canvas;
 use pico2w_300yen_lcd::ui::recovery::{self as recovery_ui, RecoveryView};
-use pico2w_300yen_lcd::ui::screen::{self, Clock, Layout, StatusView, Tone as UiTone, View, WeatherView};
+use pico2w_300yen_lcd::ui::screen::{self, Banner, Clock, Layout, StatusView, Tone as UiTone, View, WeatherView};
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
+use pico2w_300yen_lcd::web::auth;
+use pico2w_300yen_lcd::web::json::Json;
+use pico2w_300yen_lcd::web::server::{self as web_server, Server};
 use pico2w_300yen_lcd::wifi::{self, Cyw43Pins, WifiCredentials, ascii_label, read_credentials};
 use defmt_rtt as _;
 
@@ -189,9 +195,9 @@ const SLIDESHOW_START_MAX: Duration = Duration::from_secs(45);
 /// 起動時に SD (wifi.txt / ticker.txt) を読む期限 (0.4.2〜、`sdcard::set_deadline`。カードが無いと ≈ 25 s かかっていた)
 const SD_BOOT_DEADLINE: Duration = Duration::from_secs(5);
 /// 流れる文字の最大長 (バイト。UTF-8 で日本語 ≈ 170 文字)
-const MESSAGE_MAX: usize = 512;
-/// `TICKER.TXT` の最大長
-const CONFIG_MAX: usize = 512;
+const MESSAGE_MAX: usize = config::MESSAGE_MAX;
+/// 設定ページの案内 (URL とコード) を LCD に出す時間 (待ち受けの開始時 / ページの「LCD にコードを表示」)
+const BANNER_SHOW: Duration = Duration::from_secs(60);
 
 // ============================================================
 // static 配置のバッファ (BSS)
@@ -201,8 +207,11 @@ static mut NET_BUFFERS: NetBuffers = NetBuffers::new();
 static mut TCP_STATE: TcpState = TcpState::new();
 static mut SECTOR_BUFFERS: SectorBuffers = SectorBuffers::new();
 static mut SNTP_BUFFERS: SntpBuffers = SntpBuffers::new();
-/// 天気の JSON / 文字の本文の受信先 (どちらも同時には使わない)
+/// 天気の JSON / 文字の本文の受信先 (どちらも同時には使わない)。起動時は ticker.txt の読み込みにも使う
 static mut BODY: [u8; weather::BODY_MAX] = [0; weather::BODY_MAX];
+const _: () = assert!(weather::BODY_MAX >= config::CONFIG_MAX);
+/// SD (スライドショーと設定ページのサーバが `slideshow::SD_LOCK` で分け合う。0.5.0〜)
+static SD_CARD: static_cell::StaticCell<SdVolumeManager> = static_cell::StaticCell::new();
 
 // ============================================================
 // 共有モデル (main が書き、render_task が毎フレーム読む)
@@ -252,6 +261,14 @@ struct Shared {
     /// スタックの最大使用量 / 大きさ (バイト、状態行 2 の `stk 21.3/35.4K`。0.4.1〜)
     stack_used: u32,
     stack_total: u32,
+    /// 接続先の SSID (設定ページの状態表示。0.5.0〜)
+    ssid: String<32>,
+    /// 前回のリセット理由 (設定ページの状態表示)
+    last_reset: String<80>,
+    /// 設定ページの URL / アクセスコード / 案内を出す期限 (0.5.0〜)
+    web_url: String<24>,
+    web_code: String<8>,
+    banner_until: Option<Instant>,
 }
 
 impl Shared {
@@ -286,6 +303,11 @@ impl Shared {
             alert_until: None,
             stack_used: 0,
             stack_total: 0,
+            ssid: String::new(),
+            last_reset: String::new(),
+            web_url: String::new(),
+            web_code: String::new(),
+            banner_until: None,
         }
     }
 }
@@ -477,9 +499,18 @@ fn draw_screen(frame: &mut BackBuffer, bg: &[u16], m: &Shared, scroll_x: i32) {
             msg: job_tone(&m.msg),
             version: &version,
         },
+        banner: banner_of(m, now),
     };
     let mut canvas = Canvas::new(&mut frame.data);
     screen::render(&mut canvas, bg, slideshow::LEVEL.load(Ordering::Relaxed), &view, m.layout);
+}
+
+/// 設定ページの案内を出すか
+fn banner_of(m: &Shared, now: Instant) -> Option<Banner<'_>> {
+    (m.banner_until.is_some_and(|t| now < t) && !m.web_url.is_empty()).then_some(Banner {
+        url: &m.web_url,
+        code: &m.web_code,
+    })
 }
 
 /// 毎フレーム (LCD の垂直同期ごと) 画面を描き直し、流れる文字を動かす。
@@ -645,6 +676,8 @@ async fn do_ntp(stack: embassy_net::Stack<'static>, sntp_bufs: &mut SntpBuffers,
         Ok(sync) => {
             job.ok(NTP_RESYNC);
             with_model(|m| {
+                // SD に書くファイルの日時 (設定ページの保存 / 写真の追加)
+                sdcard::set_wall_clock((sync.now_unix() + i64::from(m.tz_offset_secs)).max(0) as u64);
                 m.clock = Some(sync);
                 m.ntp.clear();
                 let _ = write!(m.ntp, "ok s{}", sync.stratum);
@@ -886,6 +919,9 @@ fn publish_diag(boot: &BootStatus, plan: &BootPlan) {
     };
     defmt::warn!("boot diag: {}", line.as_str());
     with_model(|m| {
+        if tone == Tone::Error {
+            m.last_reset = line.clone();
+        }
         m.diag = line;
         m.diag_tone = tone;
         m.diag_until = Some(Instant::now() + show);
@@ -906,6 +942,10 @@ static OTA_PROVED: AtomicBool = AtomicBool::new(false);
 static ROUND_NTP: AtomicBool = AtomicBool::new(false);
 static ROUND_WEATHER: AtomicBool = AtomicBool::new(false);
 static ROUND_MESSAGE: AtomicBool = AtomicBool::new(false);
+/// 取得タスク → main: 設定ページのサーバが待ち受けを始めた (一巡の 1 つ、0.5.0〜)
+static ROUND_WEB: AtomicBool = AtomicBool::new(false);
+/// 取得タスク (設定ページ) → main: 再起動してほしい (Wi-Fi の電源断に `Control` が要る)
+static WEB_REBOOT: AtomicBool = AtomicBool::new(false);
 
 /// 取得タスクが持つもの (main が作って渡す)
 struct Jobs {
@@ -925,6 +965,206 @@ struct Jobs {
     blocked: u32,
     /// 試験用 `debug_crash=ota` (buy 済みの通常起動だけ)
     crash_before_ota: bool,
+    /// SD (設定ページの保存 / 写真。無ければ None)
+    sd: Option<&'static SdVolumeManager>,
+}
+
+// ============================================================
+// 設定ページ (0.5.0〜、web::server が頼むこと)
+// ============================================================
+
+/// 設定ページの URL を共有モデルへ (IP が変わったら直す)
+fn publish_web_url(stack: embassy_net::Stack<'static>) {
+    let Some(cfg) = stack.config_v4() else {
+        return;
+    };
+    let ip = cfg.address.address().octets();
+    let mut url: String<24> = String::new();
+    let _ = write!(url, "http://{}.{}.{}.{}/", ip[0], ip[1], ip[2], ip[3]);
+    with_model(|m| {
+        if m.web_url != url {
+            m.web_url = url;
+        }
+    });
+}
+
+/// 設定ページのサーバから見た ticker (取得タスクの持ち物を借りる)
+struct WebHost<'a> {
+    stack: embassy_net::Stack<'static>,
+    config: &'a mut TickerConfig,
+    weather_job: &'a mut Job,
+    message_job: &'a mut Job,
+    ota: &'a OtaState,
+    slots: &'a Result<Slots, OtaError>,
+    last_ota_check: Option<Instant>,
+}
+
+fn layout_of(name: LayoutName) -> Layout {
+    match name {
+        LayoutName::Glass => Layout::Glass,
+        LayoutName::Dock => Layout::Dock,
+        LayoutName::Classic => Layout::Classic,
+    }
+}
+
+/// 流れる文字として出せる形 (改行 / タブは空白、前後の空白を除く)
+fn message_from(text: &str) -> String<MESSAGE_MAX> {
+    let mut out: String<MESSAGE_MAX> = String::new();
+    for ch in text.chars() {
+        let ch = if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch };
+        if out.push(ch).is_err() {
+            break;
+        }
+    }
+    let trimmed = out.trim();
+    let mut message: String<MESSAGE_MAX> = String::new();
+    let _ = message.push_str(trimmed);
+    message
+}
+
+impl web_server::App for WebHost<'_> {
+    fn ip(&self) -> Option<[u8; 4]> {
+        self.stack.config_v4().map(|c| c.address.address().octets())
+    }
+
+    fn write_status(&mut self, j: &mut Json<'_>) {
+        let uptime = Instant::now().as_secs();
+        j.field_str("version", FIRMWARE_VERSION);
+        j.field_int("uptime_s", uptime as i64);
+        let mut ota_line: String<80> = String::new();
+        let (ota_tone, _) = self.ota.write_line(&mut ota_line, self.slots);
+        with_model(|m| {
+            j.field_str("ssid", &m.ssid);
+            j.key("ip");
+            match self.stack.config_v4() {
+                Some(cfg) => {
+                    let ip = cfg.address.address().octets();
+                    let mut s: String<16> = String::new();
+                    let _ = write!(s, "{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                    j.str(&s);
+                }
+                None => j.null(),
+            }
+            // cyw43 0.6 は接続中の RSSI を読む API を公開していない (docs/settings-server.md「制限」)
+            j.key("rssi");
+            j.null();
+            j.field_str("wifi", &m.wifi);
+            j.field_str("ntp", &m.ntp);
+            j.field_str("weather", &m.wx);
+            j.field_str("message_state", &m.msg);
+            j.field_str("ota", &ota_line);
+            j.field_str("ota_tone", tone_name(ota_tone));
+            j.field_str("ident", &m.ident_head);
+            j.field_str("tbyb", m.ident_rest.trim());
+            j.field_int("stack_used", i64::from(m.stack_used));
+            j.field_int("stack_total", i64::from(m.stack_total));
+            j.field_str("last_reset", &m.last_reset);
+            j.field_str("layout", m.layout.name());
+            j.key("weather_now");
+            match m.weather {
+                Some(w) => {
+                    j.begin_object();
+                    j.key("temperature");
+                    j.float(w.temperature, 1);
+                    j.field_int("code", i64::from(w.code));
+                    j.field_str("condition", w.condition_ja());
+                    j.end_object();
+                }
+                None => j.null(),
+            }
+        });
+        j.key("last_ota_check_s");
+        match self.last_ota_check {
+            Some(t) => j.int(t.elapsed().as_secs() as i64),
+            None => j.null(),
+        }
+        j.field_int("ota_checks", i64::from(self.ota.checks));
+        j.field_bool("pending", !DOWNLOAD_OK.load(Ordering::Relaxed));
+    }
+
+    fn config(&self) -> &TickerConfig {
+        self.config
+    }
+
+    fn write_local_message(&self, j: &mut Json<'_>) {
+        if self.config.local_message {
+            with_model(|m| j.str(&m.message));
+        } else {
+            j.str("");
+        }
+    }
+
+    fn apply(&mut self, new: &TickerConfig, message: Option<&str>) {
+        let old = core::mem::replace(self.config, new.clone());
+        if old.lat != new.lat || old.lon != new.lon {
+            // 地域が変わった: すぐ天気を取り直す
+            self.weather_job.next = Instant::now();
+            self.weather_job.failures = 0;
+            with_model(|m| m.weather = None);
+        }
+        if old.message_url != new.message_url || (old.local_message && !new.local_message) {
+            self.message_job.next = Instant::now();
+            self.message_job.failures = 0;
+        }
+        let layout = layout_of(new.layout);
+        with_model(|m| {
+            m.tz_offset_secs = new.tz_offset_secs;
+            m.place = new.place.clone();
+            m.scroll_px = new.scroll_px;
+            m.layout = layout;
+            m.status_mode = new.status;
+            if let Some(text) = message.filter(|_| new.local_message) {
+                let text = message_from(text);
+                if m.message != text {
+                    m.message = text;
+                    m.message_gen = m.message_gen.wrapping_add(1);
+                }
+                m.msg.clear();
+                let _ = m.msg.push_str("ok(local)");
+            } else if old.local_message {
+                m.msg.clear();
+                let _ = m.msg.push_str("---");
+            }
+        });
+        let reload = old.images != new.images || old.layout != new.layout;
+        slideshow::LIVE.lock(|l| {
+            let mut l = l.borrow_mut();
+            l.interval_secs = new.slide_secs;
+            l.images = new.images.clone();
+            l.layout = layout;
+        });
+        if reload {
+            slideshow::RELOAD.store(true, Ordering::Relaxed);
+        }
+        defmt::info!("web: settings applied (layout {}, slide {} s, reload {})", layout.name(), new.slide_secs, reload);
+    }
+
+    fn show_code(&mut self) {
+        with_model(|m| m.banner_until = Some(Instant::now() + BANNER_SHOW));
+    }
+
+    fn reboot(&mut self) -> Result<(), &'static str> {
+        if !DOWNLOAD_OK.load(Ordering::Relaxed) {
+            // buy 待ちで再起動すると、buy していないこの版は旧版へ戻ってしまう
+            return Err("更新の確認中 (TBYB の buy 待ち) なので再起動できません。数分後にもう一度");
+        }
+        WEB_REBOOT.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn ota_check(&mut self) {
+        OTA_NOW.store(true, Ordering::Relaxed);
+    }
+}
+
+fn tone_name(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Muted => "muted",
+        Tone::Normal => "normal",
+        Tone::Ok => "ok",
+        Tone::Busy => "busy",
+        Tone::Error => "error",
+    }
 }
 
 /// OTA 確認が TLS + HTTP を最後まで通った
@@ -970,12 +1210,38 @@ async fn jobs_task(work: NetWork) {
             let mut weather_plain_http = false;
             let mut first_ota_done = !j.ota_possible;
             let mut reboot_requested = false;
+            // 設定ページのサーバ (最初の OTA 確認が通ってから作る。0.5.0〜)
+            let mut web: Option<Server> = None;
+            let mut last_ota_check: Option<Instant> = None;
             if first_ota_done {
                 slideshow::START.store(true, Ordering::Relaxed);
+            }
+            if j.config.local_message {
+                // 流れる文字は ticker.txt の message= (取得するものが無い)
+                ROUND_MESSAGE.store(true, Ordering::Relaxed);
             }
             loop {
                 supervisor::beat(Who::Jobs);
                 let ready = NET_READY.load(Ordering::Relaxed);
+                let mut served = false;
+                // --- 設定ページ: 最初の OTA 確認が通ったら待ち受けを始める。以後は毎周片付けだけ ---
+                if web.is_none() && ready && OTA_PROVED.load(Ordering::Relaxed) {
+                    web = Some(Server::new(j.stack, j.sd, auth::code_from_random(RoscRng.next_u32())));
+                }
+                if let Some(server) = web.as_mut() {
+                    server.maintain();
+                    if server.is_listening() && !ROUND_WEB.load(Ordering::Relaxed) {
+                        ROUND_WEB.store(true, Ordering::Relaxed);
+                        boot_trace::stage(Stage::WebListening);
+                        let code = server.code();
+                        with_model(|m| {
+                            m.web_code.clear();
+                            let _ = write!(m.web_code, "{:06}", code);
+                            m.banner_until = Some(Instant::now() + BANNER_SHOW);
+                        });
+                    }
+                    publish_web_url(j.stack);
+                }
                 if ready && j.ota_possible {
                     j.ota.schedule_first_check_in(Duration::from_secs(0));
                 }
@@ -1006,6 +1272,7 @@ async fn jobs_task(work: NetWork) {
                     let result = noinline(app::run_ota_check(&j.net, j.bufs, &mut j.flash, j.sectors, slots, mode, &mut ui, &mut parsed)).await;
                     let proved = app::check_outcome(&result, parsed) == CheckOutcome::Proved;
                     ui.ota.apply(result);
+                    last_ota_check = Some(Instant::now());
                     if proved {
                         note_ota_proved(!download_ok);
                     } else if !download_ok {
@@ -1017,6 +1284,22 @@ async fn jobs_task(work: NetWork) {
                         slideshow::START.store(true, Ordering::Relaxed);
                         defmt::info!("first OTA check done; starting NTP / weather / message / slideshow");
                     }
+                } else if ready
+                    && let Some(server) = web.as_mut()
+                    && server.has_request()
+                {
+                    // --- 設定ページの要求 1 つ (OTA 確認の後、他の取得より先) ---
+                    let mut host = WebHost {
+                        stack: j.stack,
+                        config: &mut j.config,
+                        weather_job: &mut weather_job,
+                        message_job: &mut message_job,
+                        ota: &j.ota,
+                        slots: &j.slots,
+                        last_ota_check,
+                    };
+                    noinline(server.serve(&mut *j.bufs, &mut host)).await;
+                    served = true;
                 } else if ready && first_ota_done && ntp_job.due() {
                     // --- NTP (UDP。TLS バッファは使わない) ---
                     do_ntp(j.stack, j.sntp_bufs, &mut ntp_job).await;
@@ -1024,7 +1307,7 @@ async fn jobs_task(work: NetWork) {
                 } else if ready && first_ota_done && weather_job.due() {
                     do_weather(&j.net, j.bufs, &mut j.body[..], &j.config, &mut weather_plain_http, &mut weather_job).await;
                     ROUND_WEATHER.store(true, Ordering::Relaxed);
-                } else if ready && first_ota_done && message_job.due() {
+                } else if ready && first_ota_done && !j.config.local_message && message_job.due() {
                     do_message(&j.net, j.bufs, &mut j.body[..], &j.config, &mut message_job).await;
                     ROUND_MESSAGE.store(true, Ordering::Relaxed);
                 }
@@ -1044,7 +1327,14 @@ async fn jobs_task(work: NetWork) {
                     slots: j.slots,
                 }
                 .publish_ota();
-                Timer::after(TICK).await;
+                if served {
+                    // 続けて次の要求 (ページの JS は順に送る)。OTA 確認は毎周最初に見る
+                    embassy_futures::yield_now().await;
+                } else if let Some(server) = web.as_ref() {
+                    server.wait(TICK).await;
+                } else {
+                    Timer::after(TICK).await;
+                }
             }
         }
         NetWork::Recovery(spawner, parts) => (spawner, parts),
@@ -1555,17 +1845,35 @@ async fn main(spawner: Spawner) {
     boot_trace::stage(Stage::SdInit);
     sdcard::set_deadline(Some(Instant::now() + SD_BOOT_DEADLINE));
     let mut sd: Option<SdVolumeManager> = None;
+    // ticker.txt の中身は BODY (天気 / 文字の受信先、取得タスクを起動する前なので空いている) に読む
+    // Safety: 取得タスクを起動する前 (この後 Jobs に渡すまで) は main だけが触る
+    let config_buf = unsafe { &mut *addr_of_mut!(BODY) };
+    let mut local_message: String<MESSAGE_MAX> = String::new();
     let (config, config_note, credentials): (TickerConfig, String<80>, Result<WifiCredentials, &'static str>) =
         match init_sd(p.PIN_0, p.PIN_26, p.PIN_27, p.PIN_28) {
             Ok(volume_mgr) => {
                 let creds = read_credentials(&volume_mgr);
-                let mut buf = [0u8; CONFIG_MAX];
-                let source = match read_root_file(&volume_mgr, "TICKER.TXT", &mut buf) {
+                let buf = &mut config_buf[..config::CONFIG_MAX];
+                let mut read = read_root_file(&volume_mgr, "TICKER.TXT", buf);
+                // 0.5.0〜: 設定ページの保存が TICKER.TXT の書き換えで失敗すると、新しい内容は TICKER.NEW に残る
+                if matches!(read, Ok(0) | Err(ReadError::NotFound))
+                    && let Ok(n) = read_root_file(&volume_mgr, "TICKER.NEW", buf)
+                    && n > 0
+                {
+                    defmt::warn!("ticker.txt missing / empty: using TICKER.NEW ({} bytes)", n);
+                    read = Ok(n);
+                }
+                let source = match read {
                     Ok(len) => ConfigSource::Read(&buf[..len]),
                     Err(ReadError::NotFound) => ConfigSource::NotFound,
                     Err(ReadError::Other(e)) => ConfigSource::ReadFailed(e),
                 };
                 let (config, note) = config::load(source);
+                if let Ok(len) = read
+                    && let Some(text) = config::message_text(&buf[..len])
+                {
+                    local_message = message_from(text);
+                }
                 // 背景の写真 (スライドショー) は走査開始後に別タスクが読む
                 sd = Some(volume_mgr);
                 (config, note, creds)
@@ -1599,11 +1907,7 @@ async fn main(spawner: Spawner) {
     if debug_crash == DebugCrash::Boot {
         panic!("debug_crash=boot");
     }
-    let layout = match config.layout {
-        LayoutName::Glass => Layout::Glass,
-        LayoutName::Dock => Layout::Dock,
-        LayoutName::Classic => Layout::Classic,
-    };
+    let layout = layout_of(config.layout);
 
     // --- data 区画: Wi-Fi の資格情報の写し (回復モード用) と、入れない版。変わったときだけ書く ---
     let mut flash: OtaFlash = Flash::new_blocking(p.FLASH);
@@ -1664,7 +1968,30 @@ async fn main(spawner: Spawner) {
         m.stack_total = supervisor::stack_size();
         let _ = m.ntp.push_str("---");
         let _ = m.wx.push_str("---");
-        let _ = m.msg.push_str("---");
+        if config.local_message {
+            // ticker.txt の message= (取得しない)
+            m.message = local_message.clone();
+            m.message_gen = m.message_gen.wrapping_add(1);
+            let _ = m.msg.push_str("ok(local)");
+        } else {
+            let _ = m.msg.push_str("---");
+        }
+        if let Ok(c) = &credentials {
+            m.ssid = ascii_label::<32>(c.ssid.as_bytes());
+        }
+    });
+    slideshow::LIVE.lock(|l| {
+        let mut l = l.borrow_mut();
+        l.interval_secs = config.slide_secs;
+        l.images = config.images.clone();
+        l.layout = layout;
+    });
+    with_model(|m| {
+        let _ = m.last_reset.push_str(match boot.reset_reason {
+            ResetReason::Hardware => "power-on / reset pin",
+            ResetReason::WatchdogTimer => "watchdog timer (update reboot or timeout)",
+            ResetReason::WatchdogForce => "forced reset (reboot or recorded fault)",
+        });
     });
     publish_ident(&boot);
     publish_diag(&boot, &plan);
@@ -1694,14 +2021,12 @@ async fn main(spawner: Spawner) {
         supervisor::allow_streak_clear(true);
         DOWNLOAD_OK.store(true, Ordering::Relaxed);
     }
+    let sd: Option<&'static SdVolumeManager> = sd.map(|volume_mgr| &*SD_CARD.init(volume_mgr));
     match sd {
         Some(volume_mgr) => spawner
             .spawn(slideshow::slideshow_task(
                 volume_mgr,
                 SlideConfig {
-                    interval: Duration::from_secs(u64::from(config.slide_secs)),
-                    images: config.images.clone(),
-                    layout,
                     sd_fast: config.sd_fast,
                     start_by: Instant::now() + SLIDESHOW_START_MAX,
                     crash_on_first: debug_crash == DebugCrash::Slideshow,
@@ -1757,6 +2082,7 @@ async fn main(spawner: Spawner) {
             ota_possible,
             blocked,
             crash_before_ota: debug_crash == DebugCrash::Ota,
+            sd,
         })))
         .unwrap();
 
@@ -1779,6 +2105,7 @@ async fn main(spawner: Spawner) {
                 weather: ROUND_WEATHER.load(Ordering::Relaxed),
                 message: ROUND_MESSAGE.load(Ordering::Relaxed),
                 slideshow: slideshow::FIRST_DONE.load(Ordering::Relaxed),
+                web: ROUND_WEB.load(Ordering::Relaxed),
             };
             let healthy = supervisor::all_alive() && supervisor::alive(Who::Render, 2_000);
             if boot.buy_tick(network_up, OTA_PROVED.load(Ordering::Relaxed), round, healthy)
@@ -1816,6 +2143,19 @@ async fn main(spawner: Spawner) {
             Timer::after(Duration::from_millis(50)).await; // 1 フレーム描かせる
             boot_trace::clear();
             app::reboot_into_slot(&mut control, slots).await;
+        }
+
+        // --- 設定ページの「再起動」(buy 済みのときだけ受け付けている)。意図した再起動なので記録は消す ---
+        if WEB_REBOOT.load(Ordering::Relaxed) {
+            with_model(|m| {
+                m.wifi.clear();
+                let _ = m.wifi.push_str("rebooting (settings page)... wifi off");
+                m.wifi_tone = Tone::Busy;
+            });
+            Timer::after(Duration::from_millis(50)).await;
+            wifi::power_off_for_reboot(&mut control).await;
+            boot_trace::clear();
+            supervisor::reset_now();
         }
 
         // --- 状態行 (Wi-Fi) を更新 ---

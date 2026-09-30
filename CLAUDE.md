@@ -5,7 +5,7 @@ GitHub Release の `manifest.json` から Wi-Fi OTA で自己更新する。
 
 ## 最重要ルール
 
-**OTA で配るファームや `src/ota`・`src/boot_policy.rs`・`src/supervisor.rs`・`src/lcd`・メモリ配置・リリースワークフローを
+**OTA で配るファームや `src/ota`・`src/boot_policy.rs`・`src/supervisor.rs`・`src/lcd`・`src/web` (設定ページ)・メモリ配置・リリースワークフローを
 触るときは、必ず最初に [`.claude/skills/ota-firmware/SKILL.md`](.claude/skills/ota-firmware/SKILL.md) を読んで従うこと。**
 
 どんな壊れ方をした版でも「ウォッチドッグで再起動 → 最新ファームを確認 → 更新」まで必ず進むこと (OTA 到達保証) が絶対条件。
@@ -15,11 +15,12 @@ GitHub Release の `manifest.json` から Wi-Fi OTA で自己更新する。
 
 - bin (`src/bin/`): `ticker` (Release の OTA イメージ、`--features tbyb`)、`wifi_ota` (OTA の最小構成)、`wifi_status`、
   `ota_selftest` / `ota_selftest_min`、`sd_bmp_viewer`、`layer*` (LCD 駆動の検証用)。一覧は [README.md](README.md)。
-- 共用ライブラリ: `src/ota/` (OTA + TBYB)、`src/boot_policy.rs` (起動の方針、buy 条件)、`src/supervisor.rs` (ウォッチドッグ、
+- 共用ライブラリ: `src/ota/` (OTA + TBYB)、`src/web/` (設定ページの HTTP サーバ、0.5.0〜、[docs/settings-server.md](docs/settings-server.md))、`src/boot_policy.rs` (起動の方針、buy 条件)、`src/supervisor.rs` (ウォッチドッグ、
   スタック)、`src/lcd/` (PIO + DMA 走査)、`src/ui/` (描画、`tools/ui-sim` と共用)。
 - ドキュメントは `docs/` (日本語): OTA 到達保証は [docs/ticker.md §8](docs/ticker.md)、設計は [docs/ota-design.md](docs/ota-design.md)、
   画面シミュレータは [docs/ui-sim.md](docs/ui-sim.md)。
-- ホストのテスト: `tools/ticker-tests` (boot_sim を含む)、画面プレビュー: `tools/ui-sim`、スタック: `scripts/stack-report.py`。
+- ホストのテスト: `tools/ticker-tests` (boot_sim を含む)、画面プレビュー: `tools/ui-sim`、スタック: `scripts/stack-report.py`、
+  設定ページのプレビュー: `tools/settings-mock` (偽の端末 + Playwright の画面写真)。
 
 ## git / リリース
 

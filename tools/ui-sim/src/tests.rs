@@ -176,9 +176,14 @@ fn every_layout_renders_all_states() {
     use crate::ui::screen::Layout;
     let mut sc = Scenario::default();
     let bg = vec![0x7befu16; PIXELS];
+    let banner = crate::scenario::BannerJson {
+        url: "http://192.168.200.130/".into(),
+        code: "482913".into(),
+    };
     for layout in [Layout::Glass, Layout::Dock, Layout::Classic] {
-        for expanded in [false, true] {
+        for (expanded, with_banner) in [(false, false), (true, false), (false, true), (true, true)] {
             sc.status.expanded = expanded;
+            sc.banner = with_banner.then(|| banner.clone());
             sc.clock = None;
             sc.weather = None;
             let _ = crate::output::render_frame(&sc, &bg, 32, layout, 0, 0);
@@ -190,4 +195,17 @@ fn every_layout_renders_all_states() {
             }
         }
     }
+}
+
+/// 設定ページの案内 (0.5.0〜): 状態 3 行の行 1 に出す文字は 66 桁以内、最長の IP でも収まる
+#[test]
+fn settings_banner_fits() {
+    use crate::ui::screen::{Banner, banner_line};
+    let b = Banner {
+        url: "http://255.255.255.255/",
+        code: "999999",
+    };
+    let line = banner_line(&b);
+    assert!(line.len() <= 66, "{line}");
+    assert_eq!(line.as_str(), "settings: http://255.255.255.255/  code 999999");
 }

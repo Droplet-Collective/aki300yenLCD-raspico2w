@@ -1,9 +1,11 @@
-# ネットワーク・ティッカー (`ticker`, v0.3.0〜、現行 v0.4.2)
+# ネットワーク・ティッカー (`ticker`, v0.3.0〜、現行 v0.5.0)
 
 Pico 2 W + 300 円 LCD を「時計 + 天気 + 流れる文字」の小さな情報端末にする bin。
 v0.4.0 から SD の写真 (BMP) をスライドショーで背景に敷き、その上に半透明の「ガラス」の板で情報を重ねる。
 `wifi_ota` (v0.2.x) の後継で、**Release の OTA イメージはこれ** (`manifest.json` の `bin` が `ticker.bin`)。
 OTA / TBYB の仕組みは [wifi-ota.md](wifi-ota.md) と同じ (実装は `src/ota/app.rs` に共通化した)。
+v0.5.0 からは同じ LAN のブラウザで設定を変えられる (**設定ページ**、[settings-server.md](settings-server.md))。
+起動後 1 分、LCD の下の帯に `設定 http://192.168.x.y/  コード 123456` が出るので、その URL を開く。
 
 ## 1. 画面 (400×96、v0.4.0〜)
 
@@ -112,7 +114,7 @@ OTA の診断に欠かせないが画面の 3 分の 1 を使うので、**必�
 ## 3. TBYB と OTA
 
 - 自己診断 (buy 条件) は 0.4.2 から「Wi-Fi + DHCP、OTA の manifest 確認 (TLS + HTTP)、NTP / 天気 / 文字 / SD の設定 /
-  最初の写真を 1 回ずつ試す、その後 25 s 健全に動く」(締め切り 180 s、§8.2)。0.4.1 までは Wi-Fi + DHCP だけで、
+  最初の写真を 1 回ずつ試す (0.5.0〜 設定ページの待ち受け開始も)、その後 25 s 健全に動く」(締め切り 180 s、§8.2)。0.4.1 までは Wi-Fi + DHCP だけで、
   OTA 確認より前に buy していた (OTA の経路が壊れた版でも buy してしまう)。取得の成否は問わない (落ちずに戻ってくればよい)。
 - buy 待ちの間 (OTA で届いてから 40〜60 s。状態行 2 が黄色の `TBYB:pending 41/180s wait:message` → `settle 12s`) は、
   時計・天気・文字・写真は普段どおり動く。OTA 確認は manifest を読むだけ (buy の後にダウンロード)。
@@ -126,7 +128,10 @@ OTA の診断に欠かせないが画面の 3 分の 1 を使うので、**必�
 
 ## 4. 設定: SD カードの `ticker.txt` (任意)
 
-`WIFI.TXT` と同じく microSD のルートに置く (8.3 名 `TICKER.TXT`、UTF-8、BOM 可)。無ければ東京の既定値で動き、
+`WIFI.TXT` と同じく microSD のルートに置く (8.3 名 `TICKER.TXT`、UTF-8、BOM 可、1,536 バイトまで (0.5.0〜。0.4.x は 512))。
+0.5.0 からは **設定ページ** ([settings-server.md](settings-server.md)) からも書き換えられる。ページは変えたキーの行だけを書き換え、
+知らないキー / コメント / 行の順番は残す (書き込みは `TICKER.NEW` → 読み戻し → `TICKER.BAK` → `TICKER.TXT` → 読み戻し。
+`TICKER.TXT` が無い / 空で `TICKER.NEW` があれば、起動時にそれを読む)。無ければ東京の既定値で動き、
 起動後しばらく (起動診断の 60 s の後) 状態行 1 に `ticker.txt not found, using Tokyo (35.6812,139.7671 UTC+9)` と出る。
 
 **ticker.txt は無くても止まらない**。無い / 空 / 読めない / SD カードが無い、のどの場合も既定値で起動を続け、
@@ -155,6 +160,7 @@ layout=glass         # 画面構成 glass / dock / classic (§1)
 status=auto          # 状態 3 行 auto (必要なときだけ、§1.1) / full (常に) / compact (常に小さな 1 行)
 sdfast=1             # 写真を読むときの SD の速さ 1 = 速い (読み誤りで自動的に低速へ) / 0 = 常に低速
 debug_crash=ota      # 試験用 (0.4.2〜): boot / ota / slideshow でわざと panic する (回復モードの確認用、§8)。既定は無し
+message=こんにちは   # 流れる文字をこの端末で決める (0.5.0〜)。行末まで全部 (# もそのまま)。あれば message_url を取得しない
 ```
 
 | キー | 既定値 | 備考 |
@@ -169,6 +175,7 @@ debug_crash=ota      # 試験用 (0.4.2〜): boot / ota / slideshow でわざと
 | `layout` | `glass` | `glass` / `dock` / `classic` |
 | `status` | `auto` | `auto` / `full` / `compact` |
 | `sdfast` | 1 | `0` / `1` |
+| `message` | (無し) | 0.5.0〜。512 バイトまで。空 / 行が無ければ `message_url` から取得。設定ページの「この端末で決める」が書く |
 | `debug_crash` | (無し) | `boot` (ticker.txt を読んだ直後) / `ota` (最初の OTA 確認の直前) / `slideshow` (最初の写真を読み始めたとき) / `none`。**buy 済みの版の通常起動でだけ効く** (TBYB の buy 待ちと回復モードでは無視。回復モードは ticker.txt を読まない)。2 回で回復モードになり、10 分ごとに通常モードを試してまた落ちる。消せば次の通常モードの試行で元に戻る |
 
 不正な値のキーは無視して既定値のまま。有効なキーが 1 つも無ければ `ticker.txt: no valid keys, ...` と出る。
@@ -195,7 +202,7 @@ debug_crash=ota      # 試験用 (0.4.2〜): boot / ota / slideshow でわざと
 
 ```text
 src/bin/ticker.rs        main (ウォッチドッグ → 起動の方針 → LCD → SD → USB → CYW43 → 250 ms ループ: 接続 / TBYB / 状態行 / OTA の再起動)
-                         jobs_task (0.4.1〜、250 ms: 最初に OTA 確認、以後 OTA / NTP / 天気 / 文字を 1 つずつ。
+                         jobs_task (0.4.1〜、250 ms: 最初に OTA 確認、以後 OTA / 設定ページの要求 (0.5.0〜) / NTP / 天気 / 文字を 1 つずつ。
                          0.4.2〜 回復モードのときは回復モード全体 = 画面 + Wi-Fi + 60 s ごとの OTA、§8.3)
                          recovery_render_task (回復モードの画面)、fallback_now (他方区画へ、§8.4)
                          render_task (垂直同期ごとに全画面を描き直し、文字を scroll px 動かす。状態 3 行の規則 §1.1)
@@ -205,6 +212,9 @@ src/boot_policy.rs       起動の方針 (通常 / 回復 / 他方区画)、buy 
 src/persist.rs           data 区画の記録の読み書き (Wi-Fi の資格情報の写し、入れない版。0.4.2〜)
 src/noinline.rs          大きな future の poll をインライン展開させない包み (スタック対策、0.4.2〜)
 src/ticker/health.rs     止まったタスクの判定、`last reset: ...` の文字列 (純粋、ホストのテストあり)
+src/web/                 設定ページ (0.5.0〜、settings-server.md): server.rs (待ち受け、要求の処理、SD の読み書き、ticker.txt の安全な書き換え)、
+                         http.rs / form.rs / auth.rs / upload.rs / json.rs (純粋、ホストのテストあり)。web/settings/index.html を build.rs が gzip で埋め込む
+tools/settings-mock/     設定ページの偽の端末 (mock_server.py) と画面写真 (screenshots.mjs、Playwright)
 scripts/stack-report.py  ELF の逆アセンブルから各タスクの最悪スタック深さを見積もる (§7.1)
                          共有モデル MODEL (ThreadModeRawMutex + RefCell。main が文字列を入れ、render が読む)
 src/ticker/slideshow.rs  背景の写真 (SD の BMP を 1 ブロックずつ読む、フェード、OTA 中は停止。§1.2)
@@ -238,6 +248,7 @@ ticker/message.txt       流れる文字の既定の取得元
 
 | bin | `.text` + `.rodata` | `.data` + `.bss` + `.uninit` | スタック |
 |---|---|---|---|
+| `ticker` 0.5.0 | 874,108 + 555,748 = 1,429,856 B ≈ **1,396 kB** (1 スロット 1920 kB の 73 %、設定ページ +120 kB) | 4,540 + 490,532 + 1,024 = 496,096 B | **36,380 B ≈ 35.5 KiB** (§7.1) |
 | `ticker` 0.4.2 | 778,288 + 531,536 = 1,309,824 B ≈ **1,279 kB** (1 スロット 1920 kB の 67 %) | 4,144 + 489,168 + 1,024 = 494,336 B | **38,144 B ≈ 37.2 KiB** (§7.1) |
 | `ticker` 0.4.1 | 726,380 + 528,992 = 1,255,372 B ≈ **1,226 kB** (1 スロット 1920 kB の 65 %) | 4,144 + 486,848 + 1,024 = 492,016 B | **40,464 B ≈ 39.5 KiB** (0x2008_2000 まで、§7.1) |
 | `ticker` 0.4.0 | 720,720 + 528,348 = 1,249,068 B ≈ **1,220 kB** (1 スロット 1920 kB の 65 %) | 4,136 + 491,024 + 1,024 = 496,184 B | ≈ **27.4 kB** |
@@ -278,6 +289,7 @@ cortex-m-rt の配置では、スタックは RAM の最上位から下へ伸び
 | 0.4.0 | 28,104 B | 35,072 B: 同じ経路 (main 14.0 kB) | **−7.0 kB (溢れる)** |
 | 0.4.1 | 40,464 B | 24,868 B: `jobs_task` の poll 5.4 kB → `fetch_small` 2.8 kB → `request` 7.5 kB → TLS | **+15.6 kB** |
 | 0.4.2 | 38,144 B | 24,444 B: `jobs_task` (通常の取得 + 回復モード) の poll 2.7 kB → OTA 確認 2.9 kB → `fetch` 2.8 kB → `request` 7.5 kB → TLS | **+13.7 kB** |
+| 0.5.0 | 36,380 B | 23,588 B: 同じ経路 (`jobs_task` の poll 2.4 kB)。設定ページの経路 (`noinline(Server::serve)` → 設定の保存 → `TickerConfig::parse`) は ≈ 7.5 kB。待ち受けソケットのバッファ 2 kB を static に置いた分だけ空きが減った | **+12.8 kB** |
 
 0.4.2 の注意 (試作で stack-report が見つけたもの): 回復モードを別のタスクにするとタスク領域 (OTA 確認の future ≈ 15 kB) が
 2 つ分要ってスタックが 15 kB 減るので、取得タスクの中で動かす。取得を `with_timeout` でもう 1 段包むと、包んだ future を一旦スタックに
@@ -352,8 +364,8 @@ buy 待ちの版は、次が **全部** 揃ってから 25 s (`BUY_SETTLE_MS`) �
 |---|---|---|
 | (a) | Wi-Fi に join して DHCP で IP を得た | `wifi` |
 | (b) | OTA の manifest 確認が TLS + HTTP を最後まで通った (manifest.json を解釈できた、またはリダイレクトを追った後の 404 / 5xx などの確定したステータス。`boot_policy::classify_check`) | `ota` |
-| (c) | NTP / 天気 / 文字 / SD の設定 / 最初の写真を 1 回ずつ試した (成否は問わない、落ちずに戻った) | `ntp` `weather` `message` `sd` `photo` |
-| (d) | main / 取得 / 描画の生存確認が揃っている (途中で Wi-Fi が落ちる / 途切れたら 25 s を数え直す) | `health` / `settle 12s` |
+| (c) | NTP / 天気 / 文字 / SD の設定 / 最初の写真を 1 回ずつ試した (成否は問わない、落ちずに戻った)。0.5.0〜 設定ページのサーバが待ち受けを始めた | `sd` `web` `ntp` `weather` `message` `photo` |
+| (d) | main / 取得 / 描画 (/ 設定ページの要求の処理中は web) の生存確認が揃っている (途中で Wi-Fi が落ちる / 途切れたら 25 s を数え直す) | `health` / `settle 12s` |
 
 - 締め切りは起動から **180 s** (0.4.1 は 120 s)。過ぎたら buy せず、ウォッチドッグの再ロードをやめて 8 s 後に旧版へ戻る。
 - buy 待ちの間の OTA 確認は **manifest を読むだけ** (新しい版があっても落とさない。書き込み先の他方区画は、buy されなかった
@@ -485,6 +497,8 @@ OTA 確認 (同じ TLS の経路) より前に buy していたので、自分�
 - Open-Meteo の応答が 1,536 B を超える (項目を増やした) 場合は `too long`。無料枠 (1 日 10,000 / IP) を
   超えると `HTTP 429`。
 - 流れる文字は 512 バイトまで、1 行のみ。色や複数行の指定は無い。
+- 設定ページ (0.5.0〜) の制限 (平文の HTTP、接続 1 本ずつ、RSSI と mDNS は無し、OTA / 取得の間は応答しない) は
+  [settings-server.md §4 / §7](settings-server.md)。
 - 天気の地名 (`place`) と文字は東雲フォントにある文字だけ (JIS X 0208 第一・第二水準 + JIS X 0201。絵文字は `□`)。
 - ウィジェットの配置は 3 種類から選ぶだけ (400×96 前提)。
 - 背景の写真は SD のルートだけ (サブディレクトリは見ない)、8.3 名、最大 16 枚、非圧縮 24 / 32 bit BMP のみ。
@@ -507,3 +521,4 @@ OTA 確認 (同じ TLS の経路) より前に buy していたので、自分�
 | 0.4.0 | **写真の背景 + モダンな画面**。SD の BMP のスライドショー (§1.2、`slide` / `images` / `sdfast`)、ガラスの板・AA 数字の時計・天気アイコン・降水確率の錠剤 (§1、`layout`)、状態 3 行を必要なときだけ出す (§1.1、`status`)。描画を `src/ui/` に分けて PC のシミュレータ `tools/ui-sim` と共用 ([ui-sim.md](ui-sim.md))。バックバッファを RGB565 にして背景用の RAM を作った (§7) |
 | 0.4.1 | **固まる不具合の修正と自動復帰** (§7.1、§8)。0.4.0 は最初の HTTPS (天気) の TLS ハンドシェイクでスタックが溢れて固まっていた (ticker.txt とは無関係。無くても既定値で動く、§4)。取得を別タスクに分け、2 kB の URL の一時領域を無くし、スタックを SRAM8/9 まで伸ばし、使わないヒープを減らして、空き 27.4 kB → 39.5 kB、最深経路 35.1 kB → 24.9 kB。MSPLIM でスタック溢れを検出。buy の後もウォッチドッグ (8 s) を動かし、main / 取得 / 描画の生存確認が揃うときだけ再ロード。panic / HardFault / 停止は記録してリセットし、次の起動が `last reset: ...` と出す。接続後の最初の仕事を OTA 確認にし、写真の読み込みもその後。3 回続けて異常終了したら安全モード。状態行 2 にスタックの最大使用量 `stk` |
 | 0.4.2 | **OTA 到達保証** (§8): 壊れた版が届いても「ウォッチドッグで再起動 → 最新の版を確認 → 更新」まで必ず進む。(1) TBYB の buy 条件を Wi-Fi + DHCP + OTA の manifest 確認 (TLS + HTTP) + NTP / 天気 / 文字 / SD / 最初の写真の一巡 + 25 s の健全な稼働に強化 (締め切り 180 s、buy 待ちの OTA は manifest だけ)。(2) ウォッチドッグ (8 s) を main の最初から、どの起動でも。buy 待ちも生存確認つきで再ロード。SD の読み込みに期限 (カード無しで 25 s 止まっていた)。(3) 安全モードを **回復モード** に置き換え: 2 回続けて異常終了したら SD を使わず Wi-Fi + OTA だけ (資格情報は data 区画の写し)、60 s ごとに OTA、10 分後に通常モードを再試行。(4) 回復モードでも 3 回落ちたら他方区画を FLASH_UPDATE 起動し、戻った版はその版を入れない。(5) 試験用 `debug_crash=`。(6) ホストで起動の流れを模擬するテスト (`boot_sim`)。CI の build ジョブで実行し、Release もこれとスタックの検査に通った版だけ |
+| 0.5.0 | **設定ページ** ([settings-server.md](settings-server.md)): 同じ LAN のブラウザから地域 (都市の検索つき) / 表示 / 流れる文字 / 写真 (一覧、並べ替え、削除、400×96 に切り抜いて追加) を変え、SD の `ticker.txt` に書いてその場で反映する。アクセスコード (起動ごと、LCD に表示) + Host / Origin の確認 + 締め出し。サーバは取得タスクの中で OTA 確認の後に 1 要求ずつ動き、最初の OTA 確認が通ってから待ち受ける (回復モードでは動かない)。buy 条件の一巡に `web`、生存確認 `Who::Web` (20 s)。`ticker.txt` の `message=` (この端末で決める流れる文字)、上限 512 → 1,536 バイト。SD に書き込めるようにした |

@@ -1,5 +1,7 @@
-//! microSD (GPIO ビットバング SPI) と読み取り専用 FAT ボリューム
+//! microSD (GPIO ビットバング SPI) と FAT ボリューム
 //!
+//! 0.5.0 から書き込みもできる (設定ページが `ticker.txt` の保存と写真の追加 / 削除に使う、docs/settings-server.md)。
+//! それまでは読み取り専用だった。
 //! 基板配線 (CS=GP26, CMD/MOSI=GP27, CLK=GP28, DAT0/MISO=GP0) は
 //! ハードウェア SPI のピン組み合わせではないため GPIO で SPI を生成する。
 //! `sd_bmp_viewer` と同じ実装を bin 間で共有できるよう切り出したもの。
@@ -169,32 +171,54 @@ impl SpiDevice<u8> for BitBangSd {
 /// 速い読み出しの半周期 (CPU サイクル、150 MHz で ≈ 0.2 µs)
 const FAST_HALF_CLOCK_CYCLES: u32 = 30;
 
+/// 起動時点の現地時刻 (UNIX 秒 + 時差、0 = 未同期)。NTP が合ったら ticker が [`set_wall_clock`] で入れ、
+/// SD に書くファイルの日時に使う (0.5.0〜)
+static WALL_AT_BOOT: AtomicU32 = AtomicU32::new(0);
+
+/// 現地時刻 (UNIX 秒 + 時差) を知らせる。以後 [`FixedTime`] はそこから進めた時刻を返す
+pub fn set_wall_clock(local_unix_now: u64) {
+    let up = embassy_time::Instant::now().as_secs();
+    WALL_AT_BOOT.store(local_unix_now.saturating_sub(up) as u32, Ordering::Relaxed);
+}
+
+/// FAT の日時。時刻が分からなければ 1980-01-01 (FAT の最小値)
 pub struct FixedTime;
 
 impl TimeSource for FixedTime {
     fn get_timestamp(&self) -> Timestamp {
-        // 読み取り専用なのでタイムスタンプは使わない。
+        let base = WALL_AT_BOOT.load(Ordering::Relaxed);
+        if base == 0 {
+            return Timestamp {
+                year_since_1970: 10,
+                zero_indexed_month: 0,
+                zero_indexed_day: 0,
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+            };
+        }
+        let t = crate::ticker::civil::from_unix(i64::from(base) + embassy_time::Instant::now().as_secs() as i64, 0);
         Timestamp {
-            year_since_1970: 10,
-            zero_indexed_month: 0,
-            zero_indexed_day: 0,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
+            year_since_1970: (t.year - 1970).clamp(10, 255) as u8,
+            zero_indexed_month: t.month.saturating_sub(1),
+            zero_indexed_day: t.day.saturating_sub(1),
+            hours: t.hour,
+            minutes: t.minute,
+            seconds: t.second,
         }
     }
 }
 
 // embedded-sdmmc は MBR のあるカードだけを受け付ける。先頭セクタが
-// FAT ブートセクタのカードでは、読み取り専用の仮想 MBR を 1 セクタ挿入する。
-pub struct ReadOnlyVolumeDevice {
+// FAT ブートセクタのカードでは、読み取り専用の仮想 MBR を 1 セクタ挿入する (書き込みは 1 つずらす)。
+pub struct SdVolumeDevice {
     card: SdCard<BitBangSd, Delay>,
     card_blocks: u32,
     superfloppy: bool,
     fat32: bool,
 }
 
-impl BlockDevice for ReadOnlyVolumeDevice {
+impl BlockDevice for SdVolumeDevice {
     type Error = SdCardError;
 
     fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), Self::Error> {
@@ -221,8 +245,18 @@ impl BlockDevice for ReadOnlyVolumeDevice {
         }
     }
 
-    fn write(&self, _blocks: &[Block], _start: BlockIdx) -> Result<(), Self::Error> {
-        Err(SdCardError::WriteError)
+    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), Self::Error> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        if !self.superfloppy {
+            return self.card.write(blocks, start);
+        }
+        // 仮想 MBR (ブロック 0) には書かない
+        if start.0 == 0 {
+            return Err(SdCardError::WriteError);
+        }
+        self.card.write(blocks, BlockIdx(start.0 - 1))
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
@@ -257,8 +291,19 @@ pub fn volume_error(error: FsError<SdCardError>) -> &'static str {
     }
 }
 
-pub type SdFile<'a> = File<'a, ReadOnlyVolumeDevice, FixedTime, 4, 4, 1>;
-pub type SdVolumeManager = VolumeManager<ReadOnlyVolumeDevice, FixedTime>;
+pub type SdFile<'a> = File<'a, SdVolumeDevice, FixedTime, 4, 4, 1>;
+pub type SdVolumeManager = VolumeManager<SdVolumeDevice, FixedTime>;
+
+/// `f` を期限 `ms` 付きで行う (0.5.0〜、設定ページの SD 操作)。SD は GPIO SPI の同期処理で、その間は描画も
+/// 止まるので、1 回の操作ごとに短い期限を付ける (過ぎたら各転送が `BusTimeout` → embedded-sdmmc の
+/// `Transport` エラーになって必ず戻る)。前の期限は戻す
+pub fn with_deadline<R>(ms: u64, f: impl FnOnce() -> R) -> R {
+    let saved = DEADLINE_MS.load(Ordering::Relaxed);
+    set_deadline(Some(embassy_time::Instant::now() + embassy_time::Duration::from_millis(ms)));
+    let result = f();
+    DEADLINE_MS.store(saved, Ordering::Relaxed);
+    result
+}
 
 pub fn init_sd(
     miso: Peri<'static, PIN_0>,
@@ -283,7 +328,7 @@ pub fn init_sd(
 
     // GPIO SPI はカードの読み取りが安定していることを実機で確認するまで
     // 初期化時と同じ低速設定に保つ。
-    let device = ReadOnlyVolumeDevice {
+    let device = SdVolumeDevice {
         card: sdcard,
         card_blocks,
         superfloppy,
@@ -326,6 +371,37 @@ pub enum ReadError {
 /// `ticker` は wifi.txt / ticker.txt を低速で読んだあと、写真の読み込みだけを速くする。
 pub fn set_fast(volume_mgr: &SdVolumeManager, fast: bool) {
     volume_mgr.device(|dev| dev.card.spi(|bus| bus.slow = !fast));
+}
+
+/// SD ルートの `*.BMP` (スライドショーが使うもの、[`list_root_bmps`] と同じ規則) を 1 つずつ `f(名前, 大きさ)` に渡す
+/// (設定ページの写真の一覧、0.5.0〜。並べ替えはしない)
+pub fn for_each_root_bmp(volume_mgr: &SdVolumeManager, mut f: impl FnMut(&str, u32)) -> Result<(), &'static str> {
+    let volume = volume_mgr
+        .open_volume(embedded_sdmmc::VolumeIdx(0))
+        .map_err(volume_error)?;
+    let root = volume.open_root_dir().map_err(|_| "ROOT DIR ERROR")?;
+    root.iterate_dir(|entry| {
+        let attr = entry.attributes;
+        let ext = entry.name.extension();
+        let base = entry.name.base_name();
+        if !attr.is_directory()
+            && !attr.is_hidden()
+            && !attr.is_system()
+            && !attr.is_volume()
+            && ext.eq_ignore_ascii_case(b"BMP")
+            && !base.is_empty()
+            && base[0] != b'_'
+        {
+            let mut name: heapless::String<12> = heapless::String::new();
+            for &b in base.iter().chain(b".").chain(ext.iter()) {
+                let _ = name.push(b as char);
+            }
+            f(&name, entry.size);
+        }
+        core::ops::ControlFlow::Continue(())
+    })
+    .map_err(|_| "ROOT DIR READ ERROR")?;
+    Ok(())
 }
 
 /// SD ルートの `*.BMP` (8.3 形式の名前、ディレクトリ / 隠し / システム / `_` で始まる名前は除く) を

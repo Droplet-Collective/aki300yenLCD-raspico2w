@@ -21,4 +21,5 @@ pub mod supervisor;
 pub mod ticker;
 pub mod ui;
 pub mod usb_reset;
+pub mod web;
 pub mod wifi;

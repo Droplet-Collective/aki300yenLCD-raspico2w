@@ -14,7 +14,12 @@
 //! status=auto      # 状態 3 行の表示 auto (必要なときだけ) / full (常に) / compact (常に 1 行)
 //! sdfast=1         # 写真を読むときの SD の速さ 1 = 速い (読み誤りがあれば自動で 0 に戻す) / 0 = 起動時と同じ低速
 //! debug_crash=ota  # 試験用 (0.4.2〜): boot / ota / slideshow の場所でわざと panic する。既定は無し
+//! message=こんにちは  # 流れる文字をこの端末で決める (0.5.0〜)。行末までそのまま (# もコメントにしない)。
+//!                     # 空、または行が無ければ message_url から取得する
 //! ```
+//!
+//! 設定ページ (0.5.0〜、docs/settings-server.md) は [`rewrite`] でこのファイルを書き換える: 変えたキーの行だけを
+//! 置き換え、知らないキー / コメント / 空行 / 行の順番はそのまま残す (手で書いた内容と画面の設定を 1 つに保つ)。
 //!
 //! `debug_crash` は回復モード (docs/ticker.md §8) を確かめるためのもの。buy 済みの版の通常起動でだけ効き、
 //! TBYB の buy 待ち (OTA で届いたばかりの版) と回復モードでは無視する (回復モードは ticker.txt を読まない)。
@@ -23,6 +28,10 @@ use heapless::String;
 
 /// 地名の最大長 (バイト)
 pub const PLACE_MAX: usize = 32;
+/// `TICKER.TXT` の最大長 (バイト。0.5.0 で 512 → 1536、設定ページがコメントを残したまま書き足すため)
+pub const CONFIG_MAX: usize = 1536;
+/// `message=` (この端末で決める流れる文字) の最大長 (バイト。LCD の流れる文字の上限と同じ)
+pub const MESSAGE_MAX: usize = 512;
 /// message_url の最大長
 pub const URL_MAX: usize = 256;
 
@@ -88,6 +97,8 @@ pub struct TickerConfig {
     pub sd_fast: bool,
     /// 試験用にわざと落ちる場所 (既定 None)
     pub debug_crash: DebugCrash,
+    /// `message=` に文字がある (流れる文字を取得せず、その文字を出す。本文は [`message_text`] で取り出す)
+    pub local_message: bool,
 }
 
 impl Default for TickerConfig {
@@ -110,6 +121,7 @@ impl Default for TickerConfig {
             status: StatusMode::Auto,
             sd_fast: true,
             debug_crash: DebugCrash::None,
+            local_message: false,
         }
     }
 }
@@ -129,12 +141,17 @@ impl TickerConfig {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((key, value)) = line.split_once('=') else {
+            let Some((key, raw_value)) = line.split_once('=') else {
                 continue;
             };
-            let value = value.split('#').next().unwrap_or("").trim();
+            let value = raw_value.split('#').next().unwrap_or("").trim();
             let key = key.trim();
-            let ok = if key.eq_ignore_ascii_case("lat") {
+            let ok = if key.eq_ignore_ascii_case("message") {
+                // 行末まで (# もそのまま)。空なら取得に戻す
+                let text = raw_value.trim();
+                config.local_message = !text.is_empty() && text.len() <= MESSAGE_MAX;
+                text.len() <= MESSAGE_MAX
+            } else if key.eq_ignore_ascii_case("lat") {
                 parse_f32(value).filter(|v| (-90.0..=90.0).contains(v)).map(|v| config.lat = v).is_some()
             } else if key.eq_ignore_ascii_case("lon") {
                 parse_f32(value).filter(|v| (-180.0..=180.0).contains(v)).map(|v| config.lon = v).is_some()
@@ -266,6 +283,166 @@ pub fn load(source: ConfigSource<'_>) -> (TickerConfig, String<80>) {
         }
     };
     (config, note)
+}
+
+/// `message=` の文字 (最後の行。空 / 長すぎる / 無ければ None)。[`TickerConfig::parse`] と同じ規則
+pub fn message_text(bytes: &[u8]) -> Option<&str> {
+    let text = core::str::from_utf8(bytes).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("message")
+        {
+            let value = value.trim();
+            found = (!value.is_empty() && value.len() <= MESSAGE_MAX).then_some(value);
+        }
+    }
+    found
+}
+
+/// 設定ページが送った 1 つの値が `ticker.txt` の規則で正しいか (0.5.0〜)。`key=value` の 1 行として
+/// [`TickerConfig::parse`] に読ませ、受け付けられたら正しい (規則を 2 か所に書かない)。
+/// 改行と、`message` 以外の `#` (コメントの始まりとして値が切れてしまう) は受け付けない。
+pub fn valid_value(key: &str, value: &str) -> bool {
+    if value.contains(['\n', '\r']) || key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return false;
+    }
+    let is_message = key.eq_ignore_ascii_case("message");
+    if !is_message && value.contains('#') {
+        return false;
+    }
+    if is_message {
+        return value.trim().len() <= MESSAGE_MAX;
+    }
+    let mut line: String<{ URL_MAX + 32 }> = String::new();
+    if line.push_str(key).is_err() || line.push('=').is_err() || line.push_str(value).is_err() {
+        return false;
+    }
+    TickerConfig::parse(line.as_bytes()).1
+}
+
+/// [`rewrite`] に渡す変更: `Some(値)` で置き換え (無ければ末尾に足す)、`None` で行を消す
+pub type Update<'a> = (&'a str, Option<&'a str>);
+
+/// [`rewrite`] の失敗
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewriteError {
+    /// 書き換えた結果が `out` (または [`CONFIG_MAX`]) に収まらない
+    TooLong,
+    /// 元のファイルが UTF-8 でない
+    NotUtf8,
+}
+
+/// `ticker.txt` の `old` に `updates` を当てた内容を `out` へ書き、長さを返す (0.5.0〜、設定ページの保存)。
+///
+/// - `key=value` の行のうち、キー (大文字小文字は区別しない) が `updates` にあるものだけを書き換える。
+///   同じキーの行が複数あればすべて (読むときは最後の行が勝つので、1 つだけ直すと効かない)。
+///   キーの書き方、行頭の空白、値の後ろのコメント (`  # ...`、`message` 以外) は残す。
+/// - `None` の更新はその行を消す。ファイルに無いキーは末尾に `key=value` を足す。
+/// - コメント行、空行、知らないキー、行の順番、改行の種類 (CRLF / LF)、先頭の BOM はそのまま。
+pub fn rewrite(old: &[u8], updates: &[Update<'_>], out: &mut [u8]) -> Result<usize, RewriteError> {
+    let text = core::str::from_utf8(old).map_err(|_| RewriteError::NotUtf8)?;
+    let limit = out.len().min(CONFIG_MAX);
+    let mut w = Out { buf: &mut out[..limit], len: 0 };
+    let (bom, body) = match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
+    };
+    let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
+    w.push(bom)?;
+    let mut seen = [false; 16];
+    let find = |key: &str| updates.iter().position(|(k, _)| k.eq_ignore_ascii_case(key.trim()));
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (line, ending, next) = match rest.find('\n') {
+            Some(i) => {
+                let line = &rest[..i];
+                match line.strip_suffix('\r') {
+                    Some(l) => (l, "\r\n", &rest[i + 1..]),
+                    None => (line, "\n", &rest[i + 1..]),
+                }
+            }
+            None => (rest, "", ""),
+        };
+        rest = next;
+        let trimmed = line.trim_start();
+        let hit = if trimmed.starts_with('#') {
+            None
+        } else {
+            trimmed.split_once('=').and_then(|(key, value)| find(key).map(|i| (i, key, value)))
+        };
+        match hit {
+            None => {
+                w.push(line)?;
+                w.push(ending)?;
+            }
+            Some((i, key, value)) => {
+                if i < seen.len() {
+                    seen[i] = true;
+                }
+                let Some(new_value) = updates[i].1 else {
+                    continue; // 行を消す
+                };
+                let indent = &line[..line.len() - trimmed.len()];
+                w.push(indent)?;
+                w.push(key.trim_end())?;
+                w.push("=")?;
+                w.push(new_value)?;
+                // 値の後ろのコメントは残す (message は行末まで値なので、コメントは無い)
+                if !key.trim().eq_ignore_ascii_case("message")
+                    && let Some(pos) = value.find('#')
+                {
+                    let before = &value[..pos];
+                    let gap = &before[before.trim_end().len()..];
+                    w.push(if gap.is_empty() { " " } else { gap })?;
+                    w.push(&value[pos..])?;
+                }
+                w.push(ending)?;
+            }
+        }
+    }
+    for (i, (key, value)) in updates.iter().enumerate() {
+        if i < seen.len() && seen[i] {
+            continue;
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        if w.len > bom.len() && !w.ends_with_newline() {
+            w.push(newline)?;
+        }
+        w.push(key)?;
+        w.push("=")?;
+        w.push(value)?;
+        w.push(newline)?;
+    }
+    Ok(w.len)
+}
+
+struct Out<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl Out<'_> {
+    fn push(&mut self, s: &str) -> Result<(), RewriteError> {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(RewriteError::TooLong);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+
+    fn ends_with_newline(&self) -> bool {
+        self.len == 0 || self.buf[self.len - 1] == b'\n'
+    }
 }
 
 /// `images=` の値から 8.3 形式として正しい名前だけを順に返す (前後の空白は除く。大文字小文字はそのまま)

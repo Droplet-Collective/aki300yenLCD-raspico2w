@@ -16,6 +16,8 @@
 //! - WATCHDOG.SCRATCH0 / 1 (リセットで残る、電源断で消える)、SCRATCH5〜7 の記録 (FLASH_UPDATE で消える)。
 //! - ファームウェアの段階と所要時間、ウォッチドッグ (初期化中の停止は 8 s で記録なし、タスクの停止は 90 s で記録あり)、
 //!   OTA (60 s ごと、巻き戻った版の再試行 10 分後、ダウンロード 60 s)、回復モード (60 s ごとの確認、10 分で通常を再試行)。
+//! - 設定ページのサーバ (0.5.0〜、`St::Web`): 最初の OTA 確認が通った後に待ち受けを始める (一巡の 1 つ)。要求の処理で
+//!   止まると `Who::Web` の 20 s で記録してリセット。回復モードには無い。
 
 use crate::boot_policy::{
     self, BUY_DEADLINE_MS, BUY_SETTLE_MS, BootInputs, BootState, BuyGate, BuyInputs, BuyStep, CheckFailure, CheckOutcome,
@@ -35,6 +37,8 @@ pub enum St {
     Join,
     Dhcp,
     OtaTls,
+    /// 設定ページのサーバの待ち受け開始 (0.5.0〜)
+    Web,
     Ntp,
     Weather,
     Message,
@@ -42,13 +46,14 @@ pub enum St {
 }
 
 /// 通常モードの段階と所要時間 (ms)
-const NORMAL: [(St, u64); 10] = [
+const NORMAL: [(St, u64); 11] = [
     (St::Display, 100),
     (St::Sd, 800),
     (St::Cyw43, 1_500),
     (St::Join, 3_000),
     (St::Dhcp, 2_000),
     (St::OtaTls, 6_000),
+    (St::Web, 200),
     (St::Ntp, 1_000),
     (St::Weather, 3_000),
     (St::Message, 3_000),
@@ -66,6 +71,17 @@ const RECOVERY: [(St, u64); 5] = [
 /// 初期化中 (生存確認の監視が始まる前) の段階。ここで止まると 8 s でウォッチドッグ (記録なし)
 fn is_init(st: St) -> bool {
     matches!(st, St::Display | St::Sd)
+}
+
+/// 段階 `st` で止まったとき、生存確認がリセットするまでの時間 (ms)。設定ページの要求は `Who::Web` の上限、
+/// 他は取得 / main の上限 (`health::Limits::TICKER`、LCD のフレーム割り込みが 0.5 s ごとに確かめる)
+fn hang_limit(st: St) -> u64 {
+    let l = crate::health::Limits::TICKER;
+    let who = match st {
+        St::Web => crate::health::Who::Web,
+        _ => crate::health::Who::Jobs,
+    };
+    u64::from(l.ms[who as usize]) + 500
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,7 +341,7 @@ impl Board {
                 Reset::WdtTimer
             }
             Fail::Hang(_) => {
-                self.t = start + 90_000;
+                self.t = start + hang_limit(st);
                 self.trace = self.trace.map(|(v, _)| (v, true));
                 Reset::Force
             }
@@ -449,6 +465,7 @@ impl Board {
                         return End::Done;
                     }
                 },
+                St::Web => round.web = true,
                 St::Ntp => round.ntp = true,
                 St::Weather => round.weather = true,
                 St::Message => round.message = true,
@@ -686,6 +703,7 @@ fn stage_name(st: St) -> &'static str {
         St::Join => "join",
         St::Dhcp => "dhcp",
         St::OtaTls => "ota-tls",
+        St::Web => "web",
         St::Ntp => "ntp",
         St::Weather => "weather",
         St::Message => "message",
@@ -931,4 +949,54 @@ fn both_slots_broken_is_the_documented_limit() {
     assert!(b.proved_times().is_empty());
     // 他方区画へ戻そうとするのは 1 回だけ (空なので同じ版がまた起動し、以後は回復モードのまま)
     assert_eq!(b.log.iter().filter(|e| matches!(e, Ev::Fallback { .. })).count(), 1);
+}
+
+/// 設定ページのサーバ (0.5.0〜) が待ち受けの開始 / 最初の要求で落ちる / 止まる版: buy されず旧版へ戻り、
+/// 直した版で直る。止まった場合も `Who::Web` の 20 s で記録してリセットするので、締め切り (180 s) より早く戻る。
+/// サーバは最初の OTA 確認の後にしか動かないので、どの起動でも OTA 確認は先に済んでいる。回復モードには無い
+#[test]
+fn web_server_hang_or_crash_is_never_bought_and_ota_still_runs() {
+    assert!(!RECOVERY.iter().any(|(st, _)| *st == St::Web), "the web server must not run in recovery mode");
+    let ota_at = NORMAL.iter().position(|(st, _)| *st == St::OtaTls).unwrap();
+    let web_at = NORMAL.iter().position(|(st, _)| *st == St::Web).unwrap();
+    assert!(ota_at < web_at, "the server starts only after the first OTA check");
+    for fail in [Fail::Crash(St::Web), Fail::Hang(St::Web)] {
+        let v2 = Image {
+            version: V2,
+            fail: Some(fail),
+            recovery_fail: None,
+        };
+        let b = scenario(v2, |_| {});
+        assert!(!b.bought.contains(&V2), "{fail:?}: bought");
+        assert_eq!(b.running(), Some(V3), "{fail:?}");
+        // v2 の試行の起動ごとに OTA 確認が通っている (サーバより先)
+        let v2_boots: Vec<u64> = b
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Boot { t, version: V2, .. } => Some(*t),
+                _ => None,
+            })
+            .collect();
+        for boot in &v2_boots {
+            assert!(
+                b.log.iter().any(|e| matches!(e, Ev::Proved { t, version: V2, .. } if *t > *boot && *t < *boot + 60_000)),
+                "{fail:?}: v2 boot at {boot} reached no OTA check"
+            );
+        }
+        let gap = max_gap(&b, 0, 3 * HOUR);
+        assert!(gap <= 11 * MIN, "{fail:?}: gap {} s", gap / 1000);
+        println!("web {fail:?}: v2 tried {} times, max OTA gap {} s", v2_boots.len(), gap / 1000);
+    }
+    // buy の後 (2 分) で要求の処理が止まる / 落ちる (CrashAfter と同じ扱い): 2 回で回復モード (サーバ無し) に入り、
+    // OTA を 60 s ごとに確かめて直した版で直る
+    let v2 = Image {
+        version: V2,
+        fail: Some(Fail::CrashAfter(2 * MIN)),
+        recovery_fail: None,
+    };
+    let b = scenario(v2, |_| {});
+    assert!(b.bought.contains(&V2));
+    assert!(b.log.iter().any(|e| matches!(e, Ev::Boot { version: V2, mode: Mode::Recovery, .. })));
+    assert_eq!(b.running(), Some(V3));
 }
