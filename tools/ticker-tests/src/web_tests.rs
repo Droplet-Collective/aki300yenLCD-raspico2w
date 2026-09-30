@@ -199,6 +199,8 @@ fn settings_values_are_validated_by_the_ticker_txt_rules() {
         ("images", "A.BMP,IMG00001.BMP"),
         ("message_url", "https://example.com/m.txt"),
         ("message", "今日は #晴れ"),
+        ("show_settings", "0"),
+        ("show_settings", "1"),
     ] {
         assert!(config::valid_value(k, v), "{k}={v}");
     }
@@ -209,6 +211,8 @@ fn settings_values_are_validated_by_the_ticker_txt_rules() {
         ("layout", "grid"),
         ("slide", "3"),
         ("scroll", "9"),
+        ("show_settings", "2"),
+        ("show_settings", "yes"),
         ("images", "LONGNAME1.BMP"),
         ("message_url", "ftp://x"),
         ("place", "東#京"),

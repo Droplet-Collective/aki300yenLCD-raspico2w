@@ -54,6 +54,17 @@ const browser = await chromium.launch();
   await ctx.close();
 }
 
+// --- 流れる文字の欄 (0.5.1〜: 設定 URL とコードを流れる文字に入れるかの切り替えと、その注意) ---
+{
+  const { ctx, p } = await page(browser, { viewport: { width: 1280, height: 900 }, deviceScaleFactor: 2 });
+  // 保存の帯 (position: fixed) が欄に重ならないよう、窓をページ全体の高さにする
+  await p.setViewportSize({ width: 1280, height: await p.evaluate(() => document.documentElement.scrollHeight + 120) });
+  await p.locator('#panel-message').screenshot({ path: path.join(out, 'settings-message.png') });
+  await p.uncheck('#f-show_settings');
+  await p.locator('#panel-message').screenshot({ path: path.join(out, 'settings-message-off.png') });
+  await ctx.close();
+}
+
 // --- スマートフォン ---
 {
   const { ctx, p } = await page(browser, { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });

@@ -12,6 +12,7 @@ use super::background;
 use super::canvas::{Canvas, Clip, Panel};
 use super::color::{Color, palette, rgb};
 use super::icons;
+use super::scroll::{self, Ink, Line};
 use super::{HEIGHT, WIDTH};
 use crate::font::shinonome;
 
@@ -75,8 +76,9 @@ pub struct StatusView<'a> {
     pub version: &'a str,
 }
 
-/// 設定ページの案内 (0.5.0〜): サーバが待ち受けを始めてから 1 分と、設定ページが「LCD にコードを表示」を
-/// 押したときに出す。`url` は `http://192.168.x.y/`、`code` は 6 桁のアクセスコード
+/// 状態 3 行の行 1 に出す設定ページの案内 (0.5.0〜): 待ち受けを始めてから 1 分と、設定ページの
+/// 「LCD にコードを表示」から 1 分。`url` は `http://192.168.x.y/`、`code` は 6 桁のアクセスコード。
+/// ふだんの画面では流れる文字の中に出す (0.5.1〜、[`scroll`])
 #[derive(Clone, Copy, Debug)]
 pub struct Banner<'a> {
     pub url: &'a str,
@@ -90,12 +92,12 @@ pub struct View<'a> {
     pub place: &'a str,
     /// 取得前は None
     pub weather: Option<WeatherView<'a>>,
-    /// 流れる文字 (空なら帯ごと出さない)
-    pub message: &'a str,
-    /// 流れる文字の左端 (帯の左端からの px。帯の幅 → 負の文字幅へ動かす)
+    /// 流れる文字 (文字 + 設定ページの URL とコード、[`scroll::ScrollText::line`])。空なら文字を描かない
+    pub scroll: Line<'a>,
+    /// 流れる文字の先頭の位置 (範囲の左端からの px、[`scroll::advance`])
     pub scroll_x: i32,
     pub status: StatusView<'a>,
-    /// 設定ページの案内 (出す間だけ Some)。状態 3 行の表示中は行 1 に、ふだんは流れる文字の場所に出す
+    /// 状態 3 行の行 1 に出す設定ページの案内 (出す間だけ Some)
     pub banner: Option<Banner<'a>>,
 }
 
@@ -291,17 +293,6 @@ pub fn banner_line(b: &Banner) -> String<80> {
     line
 }
 
-/// ふだんの画面の案内 (東雲 14 px、1 行): 設定 http://192.168.x.y/ ... コード 123456。範囲 (x, y, w)
-fn draw_banner(c: &mut Canvas, b: &Banner, x: i32, y: i32, w: i32) {
-    let pen = c.jp("設定", x, y, palette::ACCENT) + 7;
-    c.jp(b.url, pen, y, palette::OFF_WHITE);
-    let code_w = shinonome::text_width(b.code) as i32;
-    let label_w = shinonome::text_width("コード") as i32;
-    let right = x + w;
-    c.jp(b.code, right - code_w, y, palette::CYAN);
-    c.jp("コード", right - code_w - 5 - label_w, y, palette::MUTED);
-}
-
 /// 3 行の状態表示 (板の中、上端 `y`、行の間隔 9 px、`FONT_6X10`)。案内があれば行 1 の代わりに出す
 fn draw_status_lines(c: &mut Canvas, s: &StatusView, banner: Option<Banner>, x: i32, y: i32, width: i32) {
     match banner {
@@ -322,10 +313,39 @@ fn draw_status_lines(c: &mut Canvas, s: &StatusView, banner: Option<Banner>, x: 
     c.small(s.ota, x, y + 18, tone_color(s.ota_tone));
 }
 
-/// 流れる文字を範囲 (x, y, w) に描く (東雲 14 px)
+/// 流れる文字の部分の色 (`text` は画面構成の文字の色)
+fn ink_color(ink: Ink, text: Color) -> Color {
+    match ink {
+        Ink::Message => text,
+        Ink::Sep => palette::ACCENT,
+        Ink::Label => palette::SOFT,
+        Ink::Value => palette::CYAN,
+        Ink::Note => palette::MUTED,
+    }
+}
+
+/// 流れる文字を範囲 (x, y, w) に描く (東雲 14 px)。設定の部分があれば `width` ごとに並べて切れ目なく流し、
+/// 見えない部分は飛ばす (長い文字でも 1 フレームの手間を増やさない)。目立たせる間は設定の部分に薄い板を敷く
 fn draw_scroll(c: &mut Canvas, view: &View, x: i32, y: i32, w: i32, color: Color) {
-    c.set_clip(Clip::new(x, y, w, shinonome::HEIGHT as i32));
-    c.jp(view.message, x + view.scroll_x, y, color);
+    let line = &view.scroll;
+    if line.is_empty() {
+        return;
+    }
+    c.set_clip(Clip::new(x, y - 1, w, shinonome::HEIGHT as i32 + 2));
+    for origin in scroll::copies(line, view.scroll_x, w) {
+        let base = x + origin;
+        if let Some((hx, hw)) = line.highlight {
+            c.pill(base + hx - 4, y - 1, hw + 8, shinonome::HEIGHT as i32 + 2, palette::CYAN, 9);
+        }
+        for span in line.spans {
+            let sx = base + span.x;
+            if sx >= x + w || sx + span.w <= x {
+                continue;
+            }
+            let text = line.text.get(span.start as usize..span.end as usize).unwrap_or("");
+            c.jp(text, sx, y, ink_color(span.ink, color));
+        }
+    }
     c.reset_clip();
 }
 
@@ -406,16 +426,10 @@ fn render_glass(c: &mut Canvas, view: &View) {
         let y = GLASS_CARD_Y + GLASS_CARD_H + 3;
         c.panel(2, y, WIDTH as i32 - 4, HEIGHT as i32 - y - 1, &STATUS_PANEL);
         draw_status_lines(c, &view.status, view.banner, 6, y + 3, WIDTH as i32 - 12);
-    } else if let Some(b) = view.banner {
-        // 案内の間は流れる文字と小さな状態の代わりに帯全体を使う
-        c.panel(GLASS_BAND_X, GLASS_BAND_Y, GLASS_BAND_W, GLASS_BAND_H, &GLASS_PANEL);
-        draw_banner(c, &b, GLASS_BAND_X + 6, GLASS_BAND_Y + 3, GLASS_BAND_W - 12);
     } else {
         c.panel(GLASS_BAND_X, GLASS_BAND_Y, GLASS_BAND_W, GLASS_BAND_H, &GLASS_PANEL);
-        if !view.message.is_empty() {
-            let (sx, sw) = Layout::Glass.scroll_area(false);
-            draw_scroll(c, view, sx, GLASS_BAND_Y + 3, sw, palette::OFF_WHITE);
-        }
+        let (sx, sw) = Layout::Glass.scroll_area(false);
+        draw_scroll(c, view, sx, GLASS_BAND_Y + 3, sw, palette::OFF_WHITE);
         // 流れる文字と状態の間の仕切り
         let chip_x = GLASS_BAND_X + GLASS_BAND_W - GLASS_CHIP_W;
         c.blend_rect(chip_x - 1, GLASS_BAND_Y + 4, 1, GLASS_BAND_H - 8, palette::WHITE, 6);
@@ -472,12 +486,8 @@ fn render_dock(c: &mut Canvas, view: &View) {
         }
     }
     c.blend_rect(DOCK_X + 6, DOCK_Y + 20, WIDTH as i32 - 2 * DOCK_X - 12, 1, palette::WHITE, 5);
-    if let Some(b) = view.banner {
-        draw_banner(c, &b, DOCK_X + 6, DOCK_Y + 23, WIDTH as i32 - 2 * DOCK_X - 12);
-    } else if !view.message.is_empty() {
-        let (sx, sw) = Layout::Dock.scroll_area(false);
-        draw_scroll(c, view, sx, DOCK_Y + 23, sw, palette::OFF_WHITE);
-    }
+    let (sx, sw) = Layout::Dock.scroll_area(false);
+    draw_scroll(c, view, sx, DOCK_Y + 23, sw, palette::OFF_WHITE);
 }
 
 fn forecast_width(w: &WeatherView) -> i32 {
@@ -550,10 +560,7 @@ fn render_classic(c: &mut Canvas, view: &View) {
     let dim = rgb(64, 64, 64);
     c.fill_rect(1, 50, WIDTH as i32 - 2, 1, dim);
     c.fill_rect(1, 67, WIDTH as i32 - 2, 1, dim);
-    if let Some(b) = view.banner {
-        draw_banner(c, &b, 4, 52, WIDTH as i32 - 8);
-    } else if !view.message.is_empty() {
-        draw_scroll(c, view, 1, 52, WIDTH as i32 - 2, rgb(255, 255, 192));
-    }
+    let (sx, sw) = Layout::Classic.scroll_area(false);
+    draw_scroll(c, view, sx, 52, sw, rgb(255, 255, 192));
     draw_status_lines(c, &view.status, view.banner, 2, 68, WIDTH as i32 - 4);
 }

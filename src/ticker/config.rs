@@ -16,6 +16,7 @@
 //! debug_crash=ota  # 試験用 (0.4.2〜): boot / ota / slideshow の場所でわざと panic する。既定は無し
 //! message=こんにちは  # 流れる文字をこの端末で決める (0.5.0〜)。行末までそのまま (# もコメントにしない)。
 //!                     # 空、または行が無ければ message_url から取得する
+//! show_settings=1  # 流れる文字に設定ページの URL とアクセスコードを入れる (0.5.1〜、既定 1)。0 で入れない
 //! ```
 //!
 //! 設定ページ (0.5.0〜、docs/settings-server.md) は [`rewrite`] でこのファイルを書き換える: 変えたキーの行だけを
@@ -99,6 +100,8 @@ pub struct TickerConfig {
     pub debug_crash: DebugCrash,
     /// `message=` に文字がある (流れる文字を取得せず、その文字を出す。本文は [`message_text`] で取り出す)
     pub local_message: bool,
+    /// 流れる文字に設定ページの URL とアクセスコードを入れる (`show_settings=`、0.5.1〜、既定 true)
+    pub show_settings: bool,
 }
 
 impl Default for TickerConfig {
@@ -122,6 +125,7 @@ impl Default for TickerConfig {
             sd_fast: true,
             debug_crash: DebugCrash::None,
             local_message: false,
+            show_settings: true,
         }
     }
 }
@@ -219,6 +223,18 @@ impl TickerConfig {
                     None
                 };
                 crash.map(|c| config.debug_crash = c).is_some()
+            } else if key.eq_ignore_ascii_case("show_settings") {
+                match value {
+                    "1" => {
+                        config.show_settings = true;
+                        true
+                    }
+                    "0" => {
+                        config.show_settings = false;
+                        true
+                    }
+                    _ => false,
+                }
             } else if key.eq_ignore_ascii_case("sdfast") {
                 match value {
                     "1" => {

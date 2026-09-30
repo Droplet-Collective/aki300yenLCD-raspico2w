@@ -81,7 +81,6 @@ use pico2w_300yen_lcd::boot_policy::{
     RECOVERY_OTA_INTERVAL_MS, Round,
 };
 use pico2w_300yen_lcd::boot_trace::{self, ResetReason, Stage, Trace};
-use pico2w_300yen_lcd::font::shinonome;
 use pico2w_300yen_lcd::image_def::{FIRMWARE_VERSION, IMAGE_DEF_MAJOR, IMAGE_DEF_MINOR, IMAGE_DEF_VERSION_WORD, TBYB};
 use pico2w_300yen_lcd::lcd::display::{BackBuffer, Display, DisplayPins, FrameIrqHandler};
 use pico2w_300yen_lcd::ota::app::{
@@ -105,6 +104,7 @@ use pico2w_300yen_lcd::ticker::weather::{self, Weather};
 use pico2w_300yen_lcd::ui::canvas::Canvas;
 use pico2w_300yen_lcd::ui::recovery::{self as recovery_ui, RecoveryView};
 use pico2w_300yen_lcd::ui::screen::{self, Banner, Clock, Layout, StatusView, Tone as UiTone, View, WeatherView};
+use pico2w_300yen_lcd::ui::scroll::{self, ScrollText, Settings};
 use pico2w_300yen_lcd::usb_reset::build_usb_device;
 use pico2w_300yen_lcd::web::auth;
 use pico2w_300yen_lcd::web::json::Json;
@@ -196,8 +196,13 @@ const SLIDESHOW_START_MAX: Duration = Duration::from_secs(45);
 const SD_BOOT_DEADLINE: Duration = Duration::from_secs(5);
 /// 流れる文字の最大長 (バイト。UTF-8 で日本語 ≈ 170 文字)
 const MESSAGE_MAX: usize = config::MESSAGE_MAX;
-/// 設定ページの案内 (URL とコード) を LCD に出す時間 (待ち受けの開始時 / ページの「LCD にコードを表示」)
+/// 状態 3 行の行 1 に設定ページの案内 (URL とコード) を出す時間 (待ち受けの開始時 / ページの「LCD にコードを表示」)。
+/// 「LCD にコードを表示」は `show_settings=0` でもこの間だけ流れる文字に設定の部分を入れる
 const BANNER_SHOW: Duration = Duration::from_secs(60);
+/// 「LCD にコードを表示」の後、流れる文字の設定の部分を目立たせる時間 (0.5.1〜)
+const HIGHLIGHT_SHOW: Duration = Duration::from_secs(12);
+// 流れる文字 (最大 MESSAGE_MAX) + 設定の部分が組み立ての領域に必ず入る
+const _: () = assert!(scroll::TEXT_MAX >= MESSAGE_MAX + scroll::SETTINGS_MAX);
 
 // ============================================================
 // static 配置のバッファ (BSS)
@@ -265,10 +270,22 @@ struct Shared {
     ssid: String<32>,
     /// 前回のリセット理由 (設定ページの状態表示)
     last_reset: String<80>,
-    /// 設定ページの URL / アクセスコード / 案内を出す期限 (0.5.0〜)
+    /// 設定ページの URL (IP が無ければ空) / アクセスコード / 状態行 1 に案内を出す期限 (0.5.0〜)
     web_url: String<24>,
     web_code: String<8>,
     banner_until: Option<Instant>,
+    /// 設定ページが待ち受けている (最初の OTA 確認の後。回復モードでは立たない)。URL / コードが変わるたびに `web_gen` を進める
+    web_listening: bool,
+    web_gen: u32,
+    /// 流れる文字に設定の部分を入れる (`show_settings=`、0.5.1〜)
+    show_settings: bool,
+    /// 「LCD にコードを表示」: この時刻まで設定の部分を入れる (`show_settings=0` でも) / 目立たせる期限 /
+    /// 設定の部分へ飛ぶ要求の世代
+    settings_forced_until: Option<Instant>,
+    highlight_until: Option<Instant>,
+    scroll_jump_gen: u32,
+    /// 組み立てた流れる文字 (render_task だけが書く。static に置くのでスタックを使わない)
+    scroll: ScrollText,
 }
 
 impl Shared {
@@ -308,6 +325,13 @@ impl Shared {
             web_url: String::new(),
             web_code: String::new(),
             banner_until: None,
+            web_listening: false,
+            web_gen: 0,
+            show_settings: true,
+            settings_forced_until: None,
+            highlight_until: None,
+            scroll_jump_gen: 0,
+            scroll: ScrollText::new(),
         }
     }
 }
@@ -477,7 +501,7 @@ fn draw_screen(frame: &mut BackBuffer, bg: &[u16], m: &Shared, scroll_x: i32) {
             min: w.min,
             rain_pct: w.rain_pct,
         }),
-        message: &m.message,
+        scroll: m.scroll.line(m.highlight_until.is_some_and(|t| now < t)),
         scroll_x,
         status: StatusView {
             expanded,
@@ -505,7 +529,43 @@ fn draw_screen(frame: &mut BackBuffer, bg: &[u16], m: &Shared, scroll_x: i32) {
     screen::render(&mut canvas, bg, slideshow::LEVEL.load(Ordering::Relaxed), &view, m.layout);
 }
 
-/// 設定ページの案内を出すか
+/// 流れる文字の設定の部分の状態 (render_task が変化を見て組み立て直す)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPart {
+    Hidden,
+    Waiting,
+    Ready,
+}
+
+fn settings_part(m: &Shared, now: Instant) -> SettingsPart {
+    let forced = m.settings_forced_until.is_some_and(|t| now < t);
+    if !m.web_listening || m.web_code.is_empty() || !(m.show_settings || forced) {
+        SettingsPart::Hidden
+    } else if m.web_url.is_empty() {
+        SettingsPart::Waiting
+    } else {
+        SettingsPart::Ready
+    }
+}
+
+/// 流れる文字を組み立て直す (共有モデルの static な領域の中で。スタックに文字列を置かない)
+fn compose_scroll(m: &mut Shared, part: SettingsPart) {
+    let Shared {
+        scroll,
+        message,
+        web_url,
+        web_code,
+        ..
+    } = m;
+    let settings = match part {
+        SettingsPart::Hidden => Settings::Hidden,
+        SettingsPart::Waiting => Settings::Waiting,
+        SettingsPart::Ready => Settings::Ready { url: web_url, code: web_code },
+    };
+    scroll.compose(message, settings);
+}
+
+/// 設定ページの案内を状態行 1 に出すか
 fn banner_of(m: &Shared, now: Instant) -> Option<Banner<'_>> {
     (m.banner_until.is_some_and(|t| now < t) && !m.web_url.is_empty()).then_some(Banner {
         url: &m.web_url,
@@ -517,10 +577,15 @@ fn banner_of(m: &Shared, now: Instant) -> Option<Banner<'_>> {
 ///
 /// 流れる文字の位置は LCD のフレーム番号で進める (SD の読み込みなどで描画が 1 フレーム遅れても、
 /// 速さは変わらず 2 px 飛ぶだけ)。描き終えるたびに `slideshow::FRAME_SLOT` で SD の読み込みに番を渡す。
+///
+/// 流れる文字 (0.5.1〜) は 文字 + 設定ページの URL とコード。入力 (文字の世代、URL / コードの世代、設定の部分の
+/// 状態) が変わったフレームだけ組み立て直す。文字が変わったら右端から入り直し、URL / コードだけが変わったときは
+/// 位置をそのままにする (流れている途中で飛ばない)。
 #[embassy_executor::task]
 async fn render_task(mut display: Display) {
     let mut message_gen = u32::MAX;
-    let mut message_width: i32 = 0;
+    let mut scroll_key = (u32::MAX, u32::MAX, SettingsPart::Hidden);
+    let mut jump_gen = 0u32;
     let mut scroll_x = 0;
     let mut last_frame = Display::frame_count();
     let mut render_us_max: u64 = 0;
@@ -532,19 +597,31 @@ async fn render_task(mut display: Display) {
         let elapsed_frames = frame_now.wrapping_sub(last_frame).clamp(1, 8) as i32;
         last_frame = frame_now;
         MODEL.lock(|cell| {
-            let m = cell.borrow();
+            let mut guard = cell.borrow_mut();
+            let m = &mut *guard;
+            let part = settings_part(m, Instant::now());
+            let key = (m.message_gen, m.web_gen, part);
+            if key != scroll_key {
+                scroll_key = key;
+                compose_scroll(m, part);
+            }
             let (_, scroll_w) = m.layout.scroll_area(false);
             if m.message_gen != message_gen {
                 message_gen = m.message_gen;
-                message_width = shinonome::text_width(&m.message) as i32;
                 scroll_x = scroll_w;
-            } else if message_width > 0 {
-                scroll_x -= i32::from(m.scroll_px.max(1)) * elapsed_frames;
-                if scroll_x + message_width < 0 {
-                    scroll_x = scroll_w;
+            } else {
+                let step = i32::from(m.scroll_px.max(1)) * elapsed_frames;
+                scroll_x = scroll::advance(scroll_x, step, m.scroll.width(), scroll_w, m.scroll.looped());
+            }
+            if m.scroll_jump_gen != jump_gen {
+                // 「LCD にコードを表示」: 設定の部分を範囲の左端 (+ 目立たせる板の余白 4 px) へ
+                jump_gen = m.scroll_jump_gen;
+                if let Some(x) = m.scroll.settings_scroll_x() {
+                    scroll_x = x + 4;
                 }
             }
-            slideshow::BG.lock(|bg| draw_screen(display.back(), &bg.borrow()[..], &m, scroll_x));
+            let m = &*m;
+            slideshow::BG.lock(|bg| draw_screen(display.back(), &bg.borrow()[..], m, scroll_x));
         });
         let spent = started.elapsed().as_micros();
         render_us_max = render_us_max.max(spent);
@@ -973,17 +1050,17 @@ struct Jobs {
 // 設定ページ (0.5.0〜、web::server が頼むこと)
 // ============================================================
 
-/// 設定ページの URL を共有モデルへ (IP が変わったら直す)
+/// 設定ページの URL を共有モデルへ (IP が変わったら直し、無くなったら空にする。流れる文字はすぐ組み直される)
 fn publish_web_url(stack: embassy_net::Stack<'static>) {
-    let Some(cfg) = stack.config_v4() else {
-        return;
-    };
-    let ip = cfg.address.address().octets();
     let mut url: String<24> = String::new();
-    let _ = write!(url, "http://{}.{}.{}.{}/", ip[0], ip[1], ip[2], ip[3]);
+    if let Some(cfg) = stack.config_v4() {
+        let ip = cfg.address.address().octets();
+        let _ = write!(url, "http://{}.{}.{}.{}/", ip[0], ip[1], ip[2], ip[3]);
+    }
     with_model(|m| {
         if m.web_url != url {
             m.web_url = url;
+            m.web_gen = m.web_gen.wrapping_add(1);
         }
     });
 }
@@ -1113,6 +1190,7 @@ impl web_server::App for WebHost<'_> {
             m.scroll_px = new.scroll_px;
             m.layout = layout;
             m.status_mode = new.status;
+            m.show_settings = new.show_settings;
             if let Some(text) = message.filter(|_| new.local_message) {
                 let text = message_from(text);
                 if m.message != text {
@@ -1139,8 +1217,16 @@ impl web_server::App for WebHost<'_> {
         defmt::info!("web: settings applied (layout {}, slide {} s, reload {})", layout.name(), new.slide_secs, reload);
     }
 
+    /// 「LCD にコードを表示」: 流れる文字を設定の部分へ進めて目立たせ、状態行 1 にも 1 分出す
+    /// (`show_settings=0` でもその 1 分は流れる文字に入れる)
     fn show_code(&mut self) {
-        with_model(|m| m.banner_until = Some(Instant::now() + BANNER_SHOW));
+        with_model(|m| {
+            let now = Instant::now();
+            m.banner_until = Some(now + BANNER_SHOW);
+            m.settings_forced_until = Some(now + BANNER_SHOW);
+            m.highlight_until = Some(now + HIGHLIGHT_SHOW);
+            m.scroll_jump_gen = m.scroll_jump_gen.wrapping_add(1);
+        });
     }
 
     fn reboot(&mut self) -> Result<(), &'static str> {
@@ -1237,6 +1323,9 @@ async fn jobs_task(work: NetWork) {
                         with_model(|m| {
                             m.web_code.clear();
                             let _ = write!(m.web_code, "{:06}", code);
+                            m.web_listening = true;
+                            m.web_gen = m.web_gen.wrapping_add(1);
+                            // 状態 3 行の表示中 (起動 60 s など) は行 1 にも 1 分出す
                             m.banner_until = Some(Instant::now() + BANNER_SHOW);
                         });
                     }
@@ -1956,6 +2045,7 @@ async fn main(spawner: Spawner) {
         m.tz_offset_secs = config.tz_offset_secs;
         m.place = config.place.clone();
         m.scroll_px = config.scroll_px;
+        m.show_settings = config.show_settings;
         m.layout = layout;
         m.status_mode = config.status;
         m.boot_at = Instant::now();

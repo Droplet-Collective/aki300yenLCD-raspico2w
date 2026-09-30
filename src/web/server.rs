@@ -74,7 +74,7 @@ pub trait App {
     fn write_local_message(&self, j: &mut Json<'_>);
     /// 保存した `ticker.txt` の内容をその場で反映する (`message` は `message=` の文字)
     fn apply(&mut self, new: &TickerConfig, message: Option<&str>);
-    /// LCD に案内 (URL とコード) を出す
+    /// LCD に URL とコードを出す (0.5.1〜: 流れる文字を設定の部分へ進めて目立たせ、1 分は `show_settings=0` でも入れる)
     fn show_code(&mut self);
     /// 再起動を頼む (TBYB の buy 待ちなどで断るときは理由)
     fn reboot(&mut self) -> Result<(), &'static str>;
@@ -915,8 +915,8 @@ impl Route {
 }
 
 /// 設定ページが送ってよい設定の名前 (ticker.txt のキー。debug_crash / sdfast は手で書くものなので受けない)
-const SETTING_KEYS: [&str; 11] = [
-    "place", "lat", "lon", "tz", "layout", "slide", "status", "scroll", "message", "message_url", "images",
+const SETTING_KEYS: [&str; 12] = [
+    "place", "lat", "lon", "tz", "layout", "slide", "status", "scroll", "message", "message_url", "images", "show_settings",
 ];
 
 /// 要求ヘッダから写した値 (本文を読む間、`w.head` を借りたままにしないため、位置だけを持つ)
@@ -1075,6 +1075,7 @@ fn write_settings(j: &mut Json<'_>, app: &impl App, sd: bool) {
         },
     );
     j.field_int("scroll", i64::from(c.scroll_px));
+    j.field_bool("show_settings", c.show_settings);
     j.field_str("message_url", &c.message_url);
     j.field_bool("local_message", c.local_message);
     j.key("message");

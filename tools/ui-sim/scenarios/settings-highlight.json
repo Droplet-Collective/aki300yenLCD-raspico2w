@@ -7,6 +7,7 @@
   "message": "こんにちは、おちょこさん。今日もいい一日を。",
   "status": { "expanded": false, "version": "v0.5.1" },
   "settings": { "url": "http://192.168.200.130/", "code": "482913" },
-  "scroll_to_settings": -35,
+  "scroll_to_settings": 4,
+  "highlight": true,
   "animation": { "duration_ms": 1000 }
 }
