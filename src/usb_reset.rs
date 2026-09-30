@@ -81,6 +81,9 @@ impl Handler for UsbResetHandler {
             && request.index == u8::from(self.interface) as u16
             && request.request == 0x01
         {
+            // 意図したリセットなので、boot_trace の記録 (0.4.1 の ticker は通常運転中も記録する) を消す。
+            // 消さないと次の起動が「記録の無いウォッチドッグ・リセット」と誤表示する。
+            crate::boot_trace::clear();
             embassy_rp::rom_data::reset_to_usb_boot(0, 0);
             Some(OutResponse::Accepted)
         } else {

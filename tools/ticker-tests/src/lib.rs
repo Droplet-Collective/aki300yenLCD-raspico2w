@@ -6,6 +6,8 @@ pub mod civil;
 pub mod config;
 #[path = "../../../src/ticker/digits.rs"]
 pub mod digits;
+#[path = "../../../src/ticker/health.rs"]
+pub mod health;
 #[path = "../../../src/ticker/sntp.rs"]
 pub mod sntp;
 #[path = "../../../src/ticker/weather.rs"]
@@ -235,5 +237,203 @@ mod tests {
             n += 1;
         });
         assert_eq!(n, 17);
+    }
+
+    // ---- 0.4.1: ticker.txt が無い / 空 / 読めない / SD が無い、はどれも東京の既定値で続ける ----
+
+    #[test]
+    fn config_load_missing_empty_unreadable_nocard() {
+        let default = config::TickerConfig::default();
+
+        let (c, note) = config::load(config::ConfigSource::NotFound);
+        assert_eq!(c, default);
+        assert!(note.starts_with("ticker.txt not found"), "{note}");
+
+        let (c, note) = config::load(config::ConfigSource::Read(b""));
+        assert_eq!(c, default);
+        assert_eq!(note.as_str(), "ticker.txt is empty, using Tokyo defaults");
+
+        let (c, note) = config::load(config::ConfigSource::Read(b"  \r\n\n"));
+        assert_eq!(c, default);
+        assert!(note.contains("empty"));
+
+        let (c, note) = config::load(config::ConfigSource::Read(b"# only a comment\nfoo=bar\n"));
+        assert_eq!(c, default);
+        assert!(note.contains("no valid keys"));
+
+        let (c, note) = config::load(config::ConfigSource::Read(&[0xff, 0xfe, 0x00, 0x80]));
+        assert_eq!(c, default);
+        assert!(note.contains("no valid keys"));
+
+        let (c, note) = config::load(config::ConfigSource::ReadFailed("read error"));
+        assert_eq!(c, default);
+        assert_eq!(note.as_str(), "ticker.txt: read error, using Tokyo defaults");
+
+        let (c, note) = config::load(config::ConfigSource::NoCard("SD INIT FAILED"));
+        assert_eq!(c, default);
+        assert_eq!(note.as_str(), "SD: SD INIT FAILED (ticker.txt skipped, using Tokyo)");
+
+        // 正常なファイルは注意なし
+        let (c, note) = config::load(config::ConfigSource::Read("place=大阪\nlat=34.7\n".as_bytes()));
+        assert_eq!(c.place.as_str(), "大阪");
+        assert!(note.is_empty());
+    }
+
+    // ---- 0.4.1: 生存確認 (ウォッチドッグの再ロード条件) ----
+
+    #[test]
+    fn health_stalled_detection() {
+        use health::{Limits, Who, stalled};
+        let l = Limits::TICKER;
+        // 全員さっき知らせた
+        assert_eq!(stalled(10_000, &[9_900, 9_000, 9_990], &l), None);
+        // 描画が 5 s を超えて止まった
+        assert_eq!(stalled(20_000, &[19_900, 19_000, 14_000], &l), Some((Who::Render, 6_000)));
+        // main が 90 s を超えて止まった (取得 / 描画は生きている)
+        assert_eq!(stalled(200_000, &[100_000, 199_000, 199_990], &l), Some((Who::Main, 100_000)));
+        // 取得タスク
+        assert_eq!(stalled(200_000, &[199_000, 100_000, 199_990], &l), Some((Who::Jobs, 100_000)));
+        // ちょうど上限は許す
+        assert_eq!(stalled(95_000, &[5_000, 5_000, 90_000], &l), None);
+        // 監視開始直後に書かれた「未来の」値 (割り込みとの競合) は 0 扱い
+        assert_eq!(stalled(1_000, &[1_004, 1_000, 1_002], &l), None);
+        // 49.7 日で u32 の ms が一周しても判定できる
+        let now = 5u32;
+        assert_eq!(stalled(now, &[u32::MAX - 100, u32::MAX - 100, u32::MAX - 10], &l), None);
+        assert_eq!(stalled(now, &[u32::MAX - 100, u32::MAX - 100, u32::MAX - 6_000], &l), Some((Who::Render, 6_006)));
+    }
+
+    /// 監視 (supervisor::on_frame と同じ判定) を 0.5 s ごとに回す簡単なシミュレーション。
+    /// ふだんの動き (描画 60 Hz、main 250 ms、取得は 20 s の TLS 待ちや 0.4 s のフラッシュ消去を含む) では
+    /// 一度もリセットせず、描画が止まったら 5〜5.5 s で、main が止まったら 90〜90.5 s でリセットする。
+    #[test]
+    fn health_supervisor_simulation() {
+        use health::{Limits, Who, stalled};
+        fn run(stop: Option<(Who, u32)>, until_ms: u32) -> Option<(u32, Who)> {
+            let limits = Limits::TICKER;
+            let mut last = [0u32; 3];
+            let mut t = 0u32;
+            while t <= until_ms {
+                let stopped = |who: Who| stop.is_some_and(|(w, at)| w == who && t >= at);
+                // 描画: 16.7 ms ごと。ただしフラッシュ消去 (割り込みも止まる 0.4 s) を 10 s ごとに
+                let erasing = (t % 10_000) < 400;
+                if !stopped(Who::Render) && !erasing && t.is_multiple_of(17) {
+                    last[Who::Render as usize] = t;
+                }
+                // main: 250 ms ごと。ただし join + DHCP 待ち (最長 25 s) を 60〜85 s に
+                if !stopped(Who::Main) && !(60_000..85_000).contains(&t) && t.is_multiple_of(250) {
+                    last[Who::Main as usize] = t;
+                }
+                // 取得: 250 ms ごと。ただし TLS の取得待ち (20 s で打ち切り) を 100〜120 s に
+                if !stopped(Who::Jobs) && !(100_000..120_000).contains(&t) && t.is_multiple_of(250) {
+                    last[Who::Jobs as usize] = t;
+                }
+                // 監視は割り込みなので、フラッシュ消去中は遅れる
+                if t.is_multiple_of(500) && !erasing
+                    && let Some((who, _)) = stalled(t, &last, &limits) {
+                        return Some((t, who));
+                    }
+                t += 1;
+            }
+            None
+        }
+        assert_eq!(run(None, 300_000), None);
+        let (at, who) = run(Some((Who::Render, 30_000)), 300_000).unwrap();
+        assert_eq!(who, Who::Render);
+        assert!((35_000..=35_600).contains(&at), "{at}");
+        let (at, who) = run(Some((Who::Main, 130_000)), 400_000).unwrap();
+        assert_eq!(who, Who::Main);
+        assert!((220_000..=220_600).contains(&at), "{at}");
+        let (at, who) = run(Some((Who::Jobs, 130_000)), 400_000).unwrap();
+        assert_eq!(who, Who::Jobs);
+        assert!((220_000..=220_600).contains(&at), "{at}");
+    }
+
+    // ---- 0.4.1: 前回のリセット理由の表示 ----
+
+    #[test]
+    fn health_last_reset_lines() {
+        use health::*;
+        let line = |r: LastReset<'_>, up: u32, streak: u32| {
+            let mut s: heapless::String<80> = heapless::String::new();
+            write_last_reset(&mut s, &r, up, streak);
+            assert!(s.len() <= 66, "too long for the status line: {s}");
+            s
+        };
+        let panic = decode(STAGE_PANIC, 123, 0x1004_0000, Some("src/ui/slide.rs")).unwrap();
+        assert_eq!(line(panic, 1234, 1).as_str(), "last reset: panic src/ui/slide.rs:123 @123s");
+        let long = "/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-tls-0.18.0/src/connection.rs";
+        let panic = decode(STAGE_PANIC, 77, 0, Some(long)).unwrap();
+        assert_eq!(line(panic, 50, 2).as_str(), "last reset: panic embedded-tls-0.18.0/connection.rs:77 @5s #2");
+        assert_eq!(
+            health::split_crate_path(long),
+            (Some("embedded-tls-0.18.0"), "connection.rs")
+        );
+        // 長い行番号 / 稼働時間でも 66 桁に収まる
+        let panic = decode(STAGE_PANIC, 12345, 0, Some(long)).unwrap();
+        let s = line(panic, 3_600_000, 12);
+        assert!(s.ends_with(":12345 @360000s #12"), "{s}");
+        let panic = decode(STAGE_PANIC, 77, 0, None).unwrap();
+        assert_eq!(line(panic, 50, 0).as_str(), "last reset: panic ?:77 @5s");
+        let hf = decode(STAGE_HARDFAULT, 0x1000_abcd, 0x1000_1235, None).unwrap();
+        assert_eq!(line(hf, 312, 1).as_str(), "last reset: HardFault pc=1000abcd lr=10001235 @31s");
+        let so = decode(STAGE_STACK_OVERFLOW, 0x1002_0000, 0, None).unwrap();
+        assert_eq!(line(so, 40, 3).as_str(), "last reset: STACK OVERFLOW pc=10020000 @4s #3");
+        let wdt = decode(STAGE_WDT_RENDER, 5_500, 0, None).unwrap();
+        assert_eq!(line(wdt, 3600, 1).as_str(), "last reset: wdt: render stalled 5s @360s");
+        let wdt = decode(STAGE_WDT_MAIN, 90_250, 0, None).unwrap();
+        assert_eq!(line(wdt, 3600, 1).as_str(), "last reset: wdt: main stalled 90s @360s");
+        let irq = decode(STAGE_UNHANDLED_IRQ, 17, 0, None).unwrap();
+        assert_eq!(line(irq, 10, 1).as_str(), "last reset: unhandled IRQ 17 @1s");
+        let none = LastReset::WatchdogNoRecord { stage: "running" };
+        assert_eq!(line(none, 36000, 1).as_str(), "last reset: wdt timeout (no record, running) @3600s");
+        // 異常終了以外の段階 (TBYB の進行など) は None
+        assert_eq!(decode(12, 0, 0, None), None);
+        assert_eq!(decode(0, 0, 0, None), None);
+        assert_eq!(wdt_stage(Who::Render), STAGE_WDT_RENDER);
+    }
+
+    #[test]
+    fn health_file_tail() {
+        assert_eq!(health::file_tail("src/ui/slide.rs", 30), "src/ui/slide.rs");
+        assert_eq!(health::file_tail("./src/bin/ticker.rs", 30), "src/bin/ticker.rs");
+        assert_eq!(health::file_tail("/a/very/long/path/to/some/crate-1.2.3/src/lib.rs", 20), "src/lib.rs");
+        let t = health::file_tail("/x/日本語のとても長いディレクトリ名/ファイル.rs", 20);
+        assert!(t.len() <= 20 && t.ends_with(".rs"), "{t}");
+    }
+
+    #[test]
+    fn health_streak_and_safe_mode() {
+        use health::*;
+        // 電源投入直後 (SCRATCH1 = 0) の通常起動
+        assert_eq!(streak_after_boot(false, 0), (0, STREAK_MAGIC));
+        // 異常終了が 3 回続くと安全モード
+        let (n1, w1) = streak_after_boot(true, 0);
+        let (n2, w2) = streak_after_boot(true, w1);
+        let (n3, _) = streak_after_boot(true, w2);
+        assert_eq!((n1, n2, n3), (1, 2, 3));
+        assert!(n2 < SAFE_MODE_STREAK && n3 >= SAFE_MODE_STREAK);
+        // 異常終了でない再起動 (OTA、電源断) で 0 に戻る
+        assert_eq!(streak_after_boot(false, w2), (0, STREAK_MAGIC));
+        // magic の無いごみは 0 から
+        assert_eq!(streak_after_boot(true, 0x1234_5678).0, 1);
+    }
+
+    #[test]
+    fn health_stack_paint_and_kib() {
+        use health::*;
+        let mut stack = [STACK_PAINT; 100];
+        assert_eq!(untouched_words(&stack), 100);
+        stack[60] = 0; // 最も深く使った位置 (下位側から 60 語目)
+        stack[99] = 1;
+        assert_eq!(untouched_words(&stack), 60);
+        let kib = |b: u32| {
+            let mut s: heapless::String<16> = heapless::String::new();
+            write_kib(&mut s, b);
+            s
+        };
+        assert_eq!(kib(40_452).as_str(), "39.5K");
+        assert_eq!(kib(23_654).as_str(), "23.1K");
+        assert_eq!(kib(0).as_str(), "0.0K");
     }
 }

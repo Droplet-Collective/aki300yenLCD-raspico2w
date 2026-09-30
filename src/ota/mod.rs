@@ -24,11 +24,14 @@ pub const MANIFEST_NAME: &str = "manifest.json";
 /// GitHub の署名付きリダイレクト先 URL (release-assets.githubusercontent.com は JWT 付きで 1 kB を超える)
 pub const URL_MAX: usize = 2048;
 
-/// `https://github.com/<REPO>/releases/latest/download/<name>`
-pub fn latest_asset_url(name: &str) -> String<URL_MAX> {
-    let mut url = String::new();
+/// `url` を `https://github.com/<REPO>/releases/latest/download/<name>` にする。
+///
+/// 0.4.1〜: 値で返さず呼び出し側のバッファへ直接書く。`String<URL_MAX>` (2 kB) を値で返すと、
+/// 呼び出しごとに main タスクの poll のスタックフレームに 2 kB の一時領域が取られていた
+/// (0.4.0 は 5 か所で計 10 kB、docs/ticker.md「スタック」)。
+pub fn set_latest_asset_url(url: &mut String<URL_MAX>, name: &str) {
+    url.clear();
     let _ = write!(url, "https://github.com/{}/releases/latest/download/{}", REPO, name);
-    url
 }
 
 /// OTA の失敗理由 (LCD に短く表示する)

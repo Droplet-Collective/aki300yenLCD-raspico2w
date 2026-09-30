@@ -12,6 +12,14 @@ MEMORY {
     SRAM5 : ORIGIN = 0x20081000, LENGTH = 4K
 }
 
+/*
+ * スタック (0.4.1〜): RAM の直後の SRAM8/SRAM9 (上の SRAM4/SRAM5、各 4 KB、アドレスは RAM と連続) まで
+ * 伸ばし、上端を 0x20082000 にする (pico-sdk の既定と同じ位置)。下端は cortex-m-rt の `_stack_end`
+ * (= .uninit の上端) のまま。0.4.0 までは 0x20080000 で、ticker の空きスタックは 27.4 KB しかなく、
+ * TLS ハンドシェイクで溢れていた (docs/ticker.md「スタック」)。
+ */
+_stack_start = ORIGIN(SRAM5) + LENGTH(SRAM5);
+
 SECTIONS {
     .start_block : ALIGN(4)
     {

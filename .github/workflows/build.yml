@@ -191,6 +191,12 @@ jobs:
           fi
           ls -l out/ticker* out/wifi_ota* out/manifest.json || true
 
+      # Worst-case stack depth of the OTA image (docs/ticker.md §7.1). 0.4.0 overflowed its stack in the
+      # first TLS handshake and froze; this fails the build if the deepest task path no longer fits.
+      - name: Stack depth check (ticker, scripts/stack-report.py)
+        if: inputs.bin == '' || inputs.bin == 'ticker'
+        run: python3 scripts/stack-report.py out/ticker.elf --path 6
+
       # A/B partition table (docs/ota-setup.md): installed once via BOOTSEL.
       - name: Create A/B partition table UF2
         run: |

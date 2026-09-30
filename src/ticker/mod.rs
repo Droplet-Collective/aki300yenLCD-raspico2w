@@ -5,13 +5,15 @@
 //! - [`weather`] — Open-Meteo の JSON の解釈と WMO 天気コードの日本語化
 //! - [`sntp`] — SNTP (RFC 4330) の 48 バイトパケットの組み立て / 解釈 (純粋)、[`sntp_net`]: embassy-net (UDP) での問い合わせ
 //! - [`digits`] — 時計用の大きな数字 (5×7 ドット、拡大描画)
+//! - [`health`] — 止まったタスクの判定、前回のリセット理由の表示、連続クラッシュの回数 (0.4.1〜、純粋)
 //!
-//! `civil` / `config` / `weather` / `digits` / `sntp` は `core` (+ heapless / serde) だけに
+//! `civil` / `config` / `weather` / `digits` / `sntp` / `health` は `core` (+ heapless / serde) だけに
 //! 依存し、`tools/ticker-tests` がホストでテストする。
 
 pub mod civil;
 pub mod config;
 pub mod digits;
+pub mod health;
 pub mod sntp;
 pub mod slideshow;
 pub mod sntp_net;

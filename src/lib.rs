@@ -14,6 +14,7 @@ pub mod lcd;
 pub mod ota;
 pub mod pins;
 pub mod sdcard;
+pub mod supervisor;
 pub mod ticker;
 pub mod ui;
 pub mod usb_reset;
