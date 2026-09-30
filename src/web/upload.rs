@@ -61,6 +61,13 @@ pub fn check_header(h: &[u8], content_length: u32) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// ヘッダと一緒に届いた本文 (長さ `pre_len`) のうち、BMP のヘッダ (54 B) の後ろで SD に書く範囲。
+/// 全体 `total` を超える分は書かない
+pub fn extra_range(pre_len: usize, total: usize) -> core::ops::Range<usize> {
+    let start = pre_len.min(HEADER);
+    start..pre_len.min(total).max(start)
+}
+
 /// 受け取る 8.3 形式の BMP の名前か (大文字小文字は問わない。`_` で始まる名前は macOS の `._` などと
 /// 紛れるのでスライドショーも使わない)
 pub fn is_bmp_name(name: &str) -> bool {

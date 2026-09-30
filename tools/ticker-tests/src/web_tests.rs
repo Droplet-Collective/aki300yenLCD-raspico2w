@@ -383,6 +383,42 @@ fn upload_bmp_header_is_checked() {
     assert_eq!(upload::check_header(&sample[..54], sample.len() as u32), Ok(()));
 }
 
+/// 写真の本文がヘッダと一緒に 1 回の読み込みで届いた (次の要求まで続けて届いた) 場合も、SD に書くのは
+/// ちょうど 115,254 B (Devin Review の指摘への確認)。サーバと同じ部品 (`body_prefix` → `extra_range` → 残りを読む) で数える
+#[test]
+fn upload_never_writes_more_than_the_bmp() {
+    let total = upload::UPLOAD_SIZE as usize;
+    let head = format!("POST /api/upload?name=a.png HTTP/1.1\r\nHost: 10.0.0.2\r\nContent-Length: {total}\r\nX-Ticker-Code: 123456\r\n\r\n");
+    for (extra_after, head_buf) in [(0usize, http::HEAD_MAX), (4096, http::HEAD_MAX), (4096, 200_000), (10, 150)] {
+        // 送られてきたもの: ヘッダ + BMP + (余計なもの)
+        let mut wire = head.clone().into_bytes();
+        wire.extend(page_bmp_header());
+        wire.resize(head.len() + total, 0xAB);
+        wire.extend(std::iter::repeat_n(0xCD, extra_after));
+        // サーバはまずヘッダの領域 (head_buf) まで読む
+        let received = wire.len().min(head_buf).max(head.len());
+        let h = http::parse_head(&wire[..received]).unwrap();
+        let pre = http::body_prefix(received, h.head_len, h.content_length.unwrap());
+        assert!(pre.end - h.head_len <= total, "pre-body beyond Content-Length");
+        let pre_len = pre.len();
+        let first = pre_len.min(upload::HEADER);
+        let extra = upload::extra_range(pre_len, total);
+        // 残りは total まで socket から読む (サーバのループの条件 written + fill < total)
+        let mut written = first + extra.len();
+        let from_socket = total - written.min(total);
+        written += from_socket;
+        assert_eq!(written, total, "extra {extra_after} head_buf {head_buf}");
+        assert!(extra.end <= total);
+    }
+    // 端の値
+    assert_eq!(http::body_prefix(100, 60, 1000), 60..100);
+    assert_eq!(http::body_prefix(100, 60, 10), 60..70);
+    assert_eq!(http::body_prefix(50, 60, 10), 50..50);
+    assert_eq!(upload::extra_range(30, total), 30..30);
+    assert_eq!(upload::extra_range(1000, total), 54..1000);
+    assert_eq!(upload::extra_range(total + 500, total), 54..total);
+}
+
 #[test]
 fn upload_names() {
     assert_eq!(upload::short_name_from("sunset.jpg").as_deref(), Some("SUNSET.BMP"));

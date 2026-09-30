@@ -144,6 +144,14 @@ pub fn parse_head(buf: &[u8]) -> Result<Head<'_>, HeadError> {
     Ok(head)
 }
 
+/// ヘッダと一緒に読んだ `received` バイトのうち、この要求の本文に当たる範囲 (`head_len` から、`content_length`
+/// を超えない)。後ろの余り (パイプライン化された次の要求など) は本文に含めない
+pub fn body_prefix(received: usize, head_len: usize, content_length: u32) -> core::ops::Range<usize> {
+    let start = head_len.min(received);
+    let end = received.min(head_len.saturating_add(content_length as usize)).max(start);
+    start..end
+}
+
 /// 10 進の u32 (先頭の 0 は可、符号や空白は不可)
 pub fn parse_u32(text: &str) -> Option<u32> {
     if text.is_empty() || text.len() > 10 || !text.bytes().all(|b| b.is_ascii_digit()) {
